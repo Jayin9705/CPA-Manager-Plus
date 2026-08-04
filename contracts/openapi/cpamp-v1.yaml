@@ -1,0 +1,180 @@
+openapi: 3.0.3
+info:
+  title: CPA Manager Plus API
+  version: v1
+  description: >-
+    Stable browser-facing contract for the separated CPA Manager Plus console.
+    The compatibility routes remain available during the migration window.
+servers:
+  - url: https://api.example.com
+    description: Replace with the deployment API origin.
+tags:
+  - name: meta
+  - name: auth
+  - name: compatibility
+paths:
+  /healthz:
+    get:
+      tags: [meta]
+      operationId: health
+      responses:
+        '200':
+          description: Service is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /readyz:
+    get:
+      tags: [meta]
+      operationId: readiness
+      responses:
+        '200':
+          description: Service is ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: A required backend dependency is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/v1/meta/capabilities:
+    get:
+      tags: [meta]
+      operationId: capabilities
+      responses:
+        '200':
+          description: Public build and compatibility metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Session created. The token is stored in an HttpOnly cookie.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '401': { description: Invalid credentials. }
+        '429': { description: Login rate limit exceeded. }
+  /api/v1/auth/session:
+    get:
+      tags: [auth]
+      operationId: session
+      security: [{ cookieSession: [] }]
+      responses:
+        '200':
+          description: Current session and in-memory CSRF token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '401': { description: No active session. }
+  /api/v1/auth/csrf:
+    get:
+      tags: [auth]
+      operationId: csrf
+      security: [{ cookieSession: [] }]
+      responses:
+        '200':
+          description: Current session and CSRF token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      security: [{ cookieSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204': { description: Session revoked. }
+  /usage-service/{resource}:
+    parameters:
+      - name: resource
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [compatibility]
+      summary: Compatibility route retained for the existing console client.
+      security: [{ cookieSession: [] }]
+      responses:
+        '200': { description: Resource-specific response. }
+    post:
+      tags: [compatibility]
+      security: [{ cookieSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '200': { description: Resource-specific response. }
+components:
+  securitySchemes:
+    cookieSession:
+      type: apiKey
+      in: cookie
+      name: cpamp_session
+  parameters:
+    CsrfToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema: { type: string }
+  schemas:
+    HealthResponse:
+      type: object
+      required: [ok, service]
+      properties:
+        ok: { type: boolean }
+        ready: { type: boolean, description: Present on /readyz responses. }
+        service: { type: string }
+    CapabilitiesResponse:
+      type: object
+      required: [apiVersion, service, csrfRequired]
+      properties:
+        apiVersion: { type: string, example: v1 }
+        service: { type: string }
+        serverVersion: { type: string }
+        serverCommit: { type: string }
+        serverBuildDate: { type: string }
+        csrfRequired: { type: boolean }
+        consoleOriginsConfigured: { type: boolean }
+        compatibility: { type: object, additionalProperties: true }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, format: password }
+        remember: { type: boolean }
+    SessionResponse:
+      type: object
+      required: [authenticated]
+      properties:
+        authenticated: { type: boolean }
+        csrfToken: { type: string }
+        expiresAt: { type: integer, format: int64 }
+        user:
+          type: object
+          properties:
+            id: { type: integer, format: int64 }
+            email: { type: string, format: email }

@@ -18,6 +18,7 @@ import (
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/cpa"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -36,6 +37,8 @@ const minCandidateScore = 0.55
 const minWeakCandidateScore = 0.34
 const defaultSyncSourceTimeout = 10 * time.Second
 const defaultSyncProxyResolutionTimeout = 5 * time.Second
+
+const modelPriceListCacheTTL = 30 * time.Second
 
 type UpdateRequest struct {
 	Prices map[string]store.ModelPrice `json:"prices"`
@@ -84,12 +87,22 @@ type SetupResolver interface {
 
 type Service struct {
 	store                 *store.Store
+	usageSummarySource    UsageSummarySource
 	syncSources           []priceSyncSource
 	syncSourceTimeout     time.Duration
 	syncProxyTimeout      time.Duration
 	setupResolver         SetupResolver
+	priceCacheMu          sync.Mutex
+	priceCache            map[string]store.ModelPrice
+	priceCacheAt          time.Time
+	priceCacheTTL         time.Duration
+	priceListFlight       singleflight.Group
 	notifierMu            sync.RWMutex
 	pricesChangedNotifier func()
+}
+
+type UsageSummarySource interface {
+	ModelUsageSummary(ctx context.Context, limit int) (store.ModelUsageSummary, error)
 }
 
 type modelPriceMatchMetadata struct {
@@ -263,18 +276,108 @@ func newMultiSource(
 		syncSourceTimeout: defaultSyncSourceTimeout,
 		syncProxyTimeout:  defaultSyncProxyResolutionTimeout,
 		setupResolver:     resolver,
+		priceCacheTTL:     modelPriceListCacheTTL,
 	}
 }
 
 func (s *Service) List(ctx context.Context) (map[string]store.ModelPrice, error) {
-	return s.store.LoadModelPrices(ctx)
+	if s == nil || s.store == nil {
+		return nil, errors.New("model price store is not configured")
+	}
+	if prices, ok := s.cachedPrices(time.Now(), false); ok {
+		return prices, nil
+	}
+	result, err, _ := s.priceListFlight.Do("list", func() (any, error) {
+		if prices, ok := s.cachedPrices(time.Now(), false); ok {
+			return prices, nil
+		}
+		prices, err := s.store.LoadModelPrices(ctx)
+		if err != nil {
+			return nil, err
+		}
+		s.storePrices(prices, time.Now())
+		return clonePrices(prices), nil
+	})
+	if err != nil {
+		if prices, ok := s.cachedPrices(time.Now(), true); ok {
+			return prices, nil
+		}
+		return nil, err
+	}
+	prices, ok := result.(map[string]store.ModelPrice)
+	if !ok {
+		return nil, errors.New("invalid model price cache result")
+	}
+	return clonePrices(prices), nil
+}
+
+func (s *Service) cachedPrices(now time.Time, allowStale bool) (map[string]store.ModelPrice, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.priceCacheMu.Lock()
+	defer s.priceCacheMu.Unlock()
+	ttl := s.priceCacheTTL
+	if ttl <= 0 {
+		ttl = modelPriceListCacheTTL
+	}
+	if s.priceCache == nil || s.priceCacheAt.IsZero() || (!allowStale && now.Sub(s.priceCacheAt) >= ttl) {
+		return nil, false
+	}
+	return clonePrices(s.priceCache), true
+}
+
+func (s *Service) storePrices(prices map[string]store.ModelPrice, now time.Time) {
+	if s == nil {
+		return
+	}
+	s.priceCacheMu.Lock()
+	s.priceCache = clonePrices(prices)
+	s.priceCacheAt = now
+	s.priceCacheMu.Unlock()
+}
+
+func (s *Service) invalidatePriceCache() {
+	if s == nil {
+		return
+	}
+	s.priceCacheMu.Lock()
+	s.priceCache = nil
+	s.priceCacheAt = time.Time{}
+	s.priceCacheMu.Unlock()
+}
+
+func clonePrices(prices map[string]store.ModelPrice) map[string]store.ModelPrice {
+	if prices == nil {
+		return nil
+	}
+	clone := make(map[string]store.ModelPrice, len(prices))
+	for model, price := range prices {
+		price.ContextTiers = append([]store.ModelPriceContextTier(nil), price.ContextTiers...)
+		price.ServiceTiers = append([]store.ModelPriceServiceTier(nil), price.ServiceTiers...)
+		clone[model] = price
+	}
+	return clone
 }
 
 func (s *Service) UsageSummary(ctx context.Context, limit int) (store.ModelUsageSummary, error) {
+	if s.usageSummarySource != nil {
+		return s.usageSummarySource.ModelUsageSummary(ctx, limit)
+	}
 	return s.store.ModelUsageSummary(ctx, limit)
 }
 
+func (s *Service) SetUsageSummarySource(source UsageSummarySource) {
+	if s == nil {
+		return
+	}
+	s.usageSummarySource = source
+}
+
 func (s *Service) SetPricesChangedNotifier(notifier func()) {
+	if s == nil {
+		return
+	}
 	s.notifierMu.Lock()
 	s.pricesChangedNotifier = notifier
 	s.notifierMu.Unlock()
@@ -296,8 +399,9 @@ func (s *Service) Replace(ctx context.Context, prices map[string]store.ModelPric
 	if err := s.store.SaveModelPrices(ctx, prices); err != nil {
 		return nil, err
 	}
+	s.invalidatePriceCache()
 	s.notifyPricesChanged()
-	return s.store.LoadModelPrices(ctx)
+	return s.List(ctx)
 }
 
 func (s *Service) Sync(ctx context.Context, req SyncRequest) (SyncResult, error) {
@@ -323,9 +427,10 @@ func (s *Service) Sync(ctx context.Context, req SyncRequest) (SyncResult, error)
 		return SyncResult{}, err
 	}
 	if result.Imported > 0 {
+		s.invalidatePriceCache()
 		s.notifyPricesChanged()
 	}
-	prices, err := s.store.LoadModelPrices(ctx)
+	prices, err := s.List(ctx)
 	if err != nil {
 		return SyncResult{}, err
 	}

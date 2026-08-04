@@ -706,3 +706,27 @@ export function IconSidebarSystem({ size = 20, ...props }: IconProps) {
     </svg>
   );
 }
+
+export function IconSidebarOperations({ size = 20, ...props }: IconProps) {
+  return (
+    <svg {...sidebarSvgProps} width={size} height={size} {...props}>
+      <rect x="4" y="3" width="16" height="7" rx="2" />
+      <rect x="4" y="14" width="16" height="7" rx="2" />
+      <circle cx="7.5" cy="6.5" r="1" fill="currentColor" stroke="none" />
+      <circle cx="7.5" cy="17.5" r="1" fill="currentColor" stroke="none" />
+      <path d="M11 6.5h6" />
+      <path d="M11 17.5h2l1.3-2.2 1.8 4 1.2-1.8H20" />
+    </svg>
+  );
+}
+
+export function IconSidebarPlayground({ size = 20, ...props }: IconProps) {
+  return (
+    <svg {...sidebarSvgProps} width={size} height={size} {...props}>
+      <path d="m15 3 1.35 4.65L21 9l-4.65 1.35L15 15l-1.35-4.65L9 9l4.65-1.35Z" />
+      <path d="m6 13 .75 2.25L9 16l-2.25.75L6 19l-.75-2.25L3 16l2.25-.75Z" />
+      <path d="M19 17v4" />
+      <path d="M17 19h4" />
+    </svg>
+  );
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/config"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/httpqueue"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/migration"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/resp"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
@@ -28,17 +30,24 @@ type Status struct {
 	TotalSkipped   int64  `json:"totalSkipped"`
 	DeadLetters    int64  `json:"deadLetters"`
 	LastError      string `json:"lastError,omitempty"`
+	Sink           string `json:"sink,omitempty"`
 }
 
 type RuntimeConfig struct {
-	CPAUpstreamURL string
-	ManagementKey  string
-	CollectorMode  string
-	Queue          string
-	PopSide        string
-	BatchSize      int
-	PollInterval   time.Duration
-	TLSSkipVerify  bool
+	CPAUpstreamURL     string
+	ManagementKey      string
+	CollectorMode      string
+	Queue              string
+	PopSide            string
+	BatchSize          int
+	PollInterval       time.Duration
+	TLSSkipVerify      bool
+	UsageSink          string
+	UsageRedisAddr     string
+	UsageRedisPassword string
+	UsageRedisDB       int
+	UsageRedisStream   string
+	UsageRedisGroup    string
 }
 
 type UsageEventHandler interface {
@@ -54,10 +63,12 @@ type Manager struct {
 	store             *store.Store
 	snapshotResolver  *authSnapshotResolver
 	usageEventHandler UsageEventHandler
+	usagePostgres     *migration.Postgres
 	mu                sync.Mutex
 	cancel            context.CancelFunc
 	status            Status
 	runtimeCfg        RuntimeConfig
+	usagePublisher    *migration.UsageRedisPublisher
 }
 
 func NewManager(base config.Config, store *store.Store) *Manager {
@@ -87,6 +98,7 @@ func (m *Manager) Start(ctx context.Context, cfg RuntimeConfig) {
 	m.status.Mode = collectorMode(valueOr(cfg.CollectorMode, m.base.CollectorMode))
 	m.status.Transport = ""
 	m.status.Queue = valueOr(cfg.Queue, m.base.Queue)
+	m.status.Sink = valueOr(cfg.UsageSink, m.base.UsageSink)
 	m.status.LastError = ""
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -126,6 +138,16 @@ func (m *Manager) SetUsageEventHandler(handler UsageEventHandler) {
 	}
 }
 
+// SetUsagePostgresFallback provides a loss-avoidance path for the narrow
+// window where CPA has already destructively delivered a batch but Redis XADD
+// fails. PostgreSQL event_hash idempotency makes a partially published batch
+// safe to insert in full.
+func (m *Manager) SetUsagePostgresFallback(postgres *migration.Postgres) {
+	m.mu.Lock()
+	m.usagePostgres = postgres
+	m.mu.Unlock()
+}
+
 func (m *Manager) setStatus(update func(*Status)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -133,6 +155,24 @@ func (m *Manager) setStatus(update func(*Status)) {
 }
 
 func (m *Manager) run(ctx context.Context, cfg RuntimeConfig) {
+	if strings.EqualFold(valueOr(cfg.UsageSink, m.base.UsageSink), "redis") {
+		publisher, err := m.openUsagePublisher(ctx, cfg)
+		if err != nil {
+			m.markError("redis-sink", err)
+			return
+		}
+		m.mu.Lock()
+		m.usagePublisher = publisher
+		m.mu.Unlock()
+		defer func() {
+			m.mu.Lock()
+			if m.usagePublisher == publisher {
+				m.usagePublisher = nil
+			}
+			m.mu.Unlock()
+			_ = publisher.Close()
+		}()
+	}
 	mode := collectorMode(valueOr(cfg.CollectorMode, m.base.CollectorMode))
 
 	if mode == "subscribe" {
@@ -150,6 +190,16 @@ func (m *Manager) run(ctx context.Context, cfg RuntimeConfig) {
 		return
 	}
 	m.runRESP(ctx, cfg)
+}
+
+func (m *Manager) openUsagePublisher(ctx context.Context, cfg RuntimeConfig) (*migration.UsageRedisPublisher, error) {
+	stream := valueOr(cfg.UsageRedisStream, m.base.UsageRedisStream)
+	group := valueOr(cfg.UsageRedisGroup, m.base.UsageRedisGroup)
+	return migration.NewUsageRedisPublisher(ctx, migration.RedisOptions{
+		Address:  valueOr(cfg.UsageRedisAddr, m.base.UsageRedisAddr),
+		Password: valueOr(cfg.UsageRedisPassword, m.base.UsageRedisPassword),
+		DB:       cfg.UsageRedisDB,
+	}, stream, group)
 }
 
 func (m *Manager) runSubscribe(ctx context.Context, cfg RuntimeConfig, mode string) bool {
@@ -418,15 +468,48 @@ func (m *Manager) processItems(ctx context.Context, cfg RuntimeConfig, items []s
 		}
 		event, err := usage.NormalizeRaw([]byte(payload))
 		if err != nil {
-			_ = m.store.AddDeadLetter(ctx, item, err)
+			if persistErr := m.store.AddDeadLetter(ctx, item, err); persistErr != nil {
+				return errors.Join(fmt.Errorf("normalize usage event: %w", err), fmt.Errorf("persist dead letter: %w", persistErr))
+			}
 			m.setStatus(func(status *Status) {
 				status.DeadLetters++
+				status.LastError = "normalize: " + err.Error()
 			})
 			continue
 		}
 		events = append(events, event)
 	}
 	m.enrichAccountSnapshots(ctx, cfg, events)
+	if m.usingRedisSink(cfg) {
+		m.mu.Lock()
+		publisher := m.usagePublisher
+		m.mu.Unlock()
+		if publisher == nil {
+			return errors.New("redis usage sink is not initialized")
+		}
+		if err := publisher.Publish(ctx, events); err != nil {
+			m.mu.Lock()
+			postgres := m.usagePostgres
+			m.mu.Unlock()
+			if postgres == nil {
+				return err
+			}
+			if _, postgresErr := postgres.InsertEvents(ctx, events); postgresErr != nil {
+				return errors.Join(fmt.Errorf("publish usage to redis: %w", err), fmt.Errorf("persist usage fallback to postgres: %w", postgresErr))
+			}
+			m.setStatus(func(status *Status) {
+				status.LastError = "redis publish failed; batch persisted directly to PostgreSQL: " + err.Error()
+			})
+		}
+		m.handleUsageEvents(ctx, cfg, events)
+		if len(events) > 0 {
+			m.setStatus(func(status *Status) {
+				status.LastInsertedAt = time.Now().UnixMilli()
+				status.TotalInserted += int64(len(events))
+			})
+		}
+		return nil
+	}
 	result, err := m.store.InsertEvents(ctx, events)
 	if err != nil {
 		return err
@@ -442,6 +525,10 @@ func (m *Manager) processItems(ctx context.Context, cfg RuntimeConfig, items []s
 		})
 	}
 	return nil
+}
+
+func (m *Manager) usingRedisSink(cfg RuntimeConfig) bool {
+	return strings.EqualFold(valueOr(cfg.UsageSink, m.base.UsageSink), "redis")
 }
 
 type usageControlPayload int

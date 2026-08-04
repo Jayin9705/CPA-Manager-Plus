@@ -434,7 +434,7 @@ export function DashboardPage() {
   });
 
   return (
-    <>
+    <div className={styles.page}>
       {/* 1. Header Section */}
       <header className={styles.header}>
         <div className={styles.headerLeft}>
@@ -647,6 +647,6 @@ export function DashboardPage() {
           </div>
         )}
       </section>
-    </>
+    </div>
   );
 }

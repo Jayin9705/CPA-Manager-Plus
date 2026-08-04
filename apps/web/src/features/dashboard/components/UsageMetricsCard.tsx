@@ -51,11 +51,15 @@ function MetricCard({ label, value, subValue, icon, color, loading }: MetricCard
     <div className={styles.metricCard} style={{ '--accent-color': color } as MetricStyle}>
       <div className={styles.metricHeader}>
         <div className={styles.metricIcon}>{icon}</div>
-        <span className={styles.metricLabel}>{label}</span>
+        <span className={`${styles.metricLabel} dashboard-metric-label`}>{label}</span>
       </div>
       <div className={styles.metricBody}>
-        <div className={styles.metricValue}>{loading ? '...' : value}</div>
-        {subValue && <div className={styles.metricSubValue}>{subValue}</div>}
+        <div className={`${styles.metricValue} dashboard-metric-value`}>
+          {loading ? '...' : value}
+        </div>
+        {subValue && (
+          <div className={`${styles.metricSubValue} dashboard-metric-subvalue`}>{subValue}</div>
+        )}
       </div>
       <div className={styles.metricBgChart}>
         <svg viewBox="0 0 100 30" preserveAspectRatio="none">
@@ -147,7 +151,7 @@ export function UsageMetricsCard({
   if (mode === 'metrics-only') {
     return (
       <>
-        <div className={styles.metricsGrid}>
+        <div className={`${styles.metricsGrid} dashboard-metrics-grid`}>
           {metrics.map((m) => (
             <MetricCard key={m.label} {...m} loading={loading} />
           ))}
@@ -159,7 +163,7 @@ export function UsageMetricsCard({
 
   if (mode === 'rank-only') {
     return (
-      <section className={styles.rankCard}>
+      <section className={`${styles.rankCard} dashboard-rank-card`}>
         <div className={styles.rankHeader}>
           <h3>{t('dashboard.model_cost_rank_today')}</h3>
         </div>

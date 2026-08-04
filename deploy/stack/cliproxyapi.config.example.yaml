@@ -1,0 +1,16 @@
+host: "0.0.0.0"
+port: 8317
+
+remote-management:
+  secret-key: "CHANGE_ME_LOCAL_SECRET"
+  allow-remote: true
+  disable-control-panel: false
+  disable-auto-update-panel: true
+  panel-github-repository: "https://github.com/seakee/CPA-Manager-Plus"
+
+usage-statistics-enabled: true
+redis-usage-queue-retention-seconds: 60
+auth-dir: "/root/.cli-proxy-api"
+
+api-keys:
+  - "CHANGE_ME_LOCAL_CLIENT_KEY"

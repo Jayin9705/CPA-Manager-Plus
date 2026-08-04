@@ -1,22 +1,24 @@
 package model
 
 type ModelPrice struct {
-	Prompt                  float64                 `json:"prompt"`
-	Completion              float64                 `json:"completion"`
-	Cache                   float64                 `json:"cache"`
-	CacheRead               float64                 `json:"cacheRead,omitempty"`
-	CacheCreation           float64                 `json:"cacheCreation,omitempty"`
-	PromptConfigured        bool                    `json:"promptConfigured,omitempty"`
-	CompletionConfigured    bool                    `json:"completionConfigured,omitempty"`
-	CacheReadConfigured     bool                    `json:"cacheReadConfigured,omitempty"`
-	CacheCreationConfigured bool                    `json:"cacheCreationConfigured,omitempty"`
-	Source                  string                  `json:"source,omitempty"`
-	SourceModelID           string                  `json:"sourceModelId,omitempty"`
-	RawJSON                 string                  `json:"rawJson,omitempty"`
-	ContextTiers            []ModelPriceContextTier `json:"contextTiers,omitempty"`
-	ServiceTiers            []ModelPriceServiceTier `json:"serviceTiers,omitempty"`
-	UpdatedAtMS             int64                   `json:"updatedAtMs,omitempty"`
-	SyncedAtMS              *int64                  `json:"syncedAtMs,omitempty"`
+	Prompt                  float64 `json:"prompt"`
+	Completion              float64 `json:"completion"`
+	Cache                   float64 `json:"cache"`
+	CacheRead               float64 `json:"cacheRead,omitempty"`
+	CacheCreation           float64 `json:"cacheCreation,omitempty"`
+	PromptConfigured        bool    `json:"promptConfigured,omitempty"`
+	CompletionConfigured    bool    `json:"completionConfigured,omitempty"`
+	CacheReadConfigured     bool    `json:"cacheReadConfigured,omitempty"`
+	CacheCreationConfigured bool    `json:"cacheCreationConfigured,omitempty"`
+	Source                  string  `json:"source,omitempty"`
+	SourceModelID           string  `json:"sourceModelId,omitempty"`
+	// RawJSON keeps the upstream synchronization record for server-side
+	// diagnostics. It can be large and is not part of the public price API.
+	RawJSON      string                  `json:"-"`
+	ContextTiers []ModelPriceContextTier `json:"contextTiers,omitempty"`
+	ServiceTiers []ModelPriceServiceTier `json:"serviceTiers,omitempty"`
+	UpdatedAtMS  int64                   `json:"updatedAtMs,omitempty"`
+	SyncedAtMS   *int64                  `json:"syncedAtMs,omitempty"`
 }
 
 type ModelPriceSyncResult struct {

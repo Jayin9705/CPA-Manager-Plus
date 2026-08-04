@@ -11,6 +11,7 @@ import {
   type QuotaAccountDisplayMode,
 } from '@/features/quota/quotaPageUiState';
 import type { AuthFileItem, ResolvedTheme, ThemeColors } from '@/types';
+import type { QuotaWeeklyUsageItem } from '@/services/api/usageService';
 import { TYPE_COLORS } from '@/utils/quota';
 import { resolveQuotaAccountDisplayText } from './quotaDisplay';
 import styles from '@/features/quota/QuotaPage.module.scss';
@@ -77,8 +78,34 @@ interface QuotaCardProps<TState extends QuotaStatusState> {
   onReset?: () => void;
   canReauth?: boolean;
   onReauth?: () => void;
+  weeklyUsage?: QuotaWeeklyUsageItem;
+  weeklyUsageLoading?: boolean;
+  weeklyUsageError?: string;
   renderQuotaItems: (quota: TState, t: TFunction, helpers: QuotaRenderHelpers) => ReactNode;
 }
+
+const formatWeeklyTokensM = (tokens: number, locale?: string): string =>
+  new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Math.max(0, tokens) / 1_000_000);
+
+const formatEstimatedUSD = (cost: number, locale?: string): string =>
+  new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: cost > 0 && cost < 0.01 ? 4 : 2,
+  }).format(Math.max(0, cost));
+
+const formatWeeklyPeriodDate = (timestampMs: number | undefined, locale?: string): string => {
+  if (!timestampMs || !Number.isFinite(timestampMs)) return '-';
+  return new Intl.DateTimeFormat(locale, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(timestampMs));
+};
 
 export function QuotaCard<TState extends QuotaStatusState>({
   item,
@@ -96,9 +123,12 @@ export function QuotaCard<TState extends QuotaStatusState>({
   onReset,
   canReauth = false,
   onReauth,
+  weeklyUsage,
+  weeklyUsageLoading = false,
+  weeklyUsageError = '',
   renderQuotaItems,
 }: QuotaCardProps<TState>) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
 
   const displayType = item.type || item.provider || defaultType;
   const typeColorKey = String(displayType).trim().toLowerCase().replace(/_/g, '-');
@@ -118,6 +148,13 @@ export function QuotaCard<TState extends QuotaStatusState>({
     ? `${i18nPrefix}.idle`
     : (cardIdleMessageKey ?? `${i18nPrefix}.idle`);
   const accountDisplay = resolveQuotaAccountDisplayText(item, accountDisplayMode);
+  const locale = i18n?.resolvedLanguage || i18n?.language || undefined;
+  const weeklyPeriodTitle = weeklyUsage
+    ? t('quota_management.weekly_usage_period', {
+        start: formatWeeklyPeriodDate(weeklyUsage.period_start_ms, locale),
+        end: formatWeeklyPeriodDate(weeklyUsage.reset_at_ms, locale),
+      })
+    : weeklyUsageError || t('quota_management.weekly_usage_unavailable');
 
   const getTypeLabel = (type: string): string => {
     const key = `auth_files.filter_${type}`;
@@ -185,6 +222,51 @@ export function QuotaCard<TState extends QuotaStatusState>({
         <span className={styles.fileName} title={accountDisplay.title}>
           {accountDisplay.primary}
         </span>
+      </div>
+
+      <div
+        className={styles.weeklyUsageSummary}
+        role="group"
+        aria-label={`${t('quota_management.weekly_usage_title')}. ${weeklyPeriodTitle}`}
+        aria-busy={weeklyUsageLoading}
+        title={weeklyPeriodTitle}
+      >
+        <div className={styles.weeklyUsageHeading}>
+          <span>{t('quota_management.weekly_usage_title')}</span>
+          <span className={styles.weeklyUsagePeriodBadge}>
+            {t(
+              weeklyUsage?.period_source === 'quota_week'
+                ? 'quota_management.weekly_usage_quota_period'
+                : 'quota_management.weekly_usage_calendar_period'
+            )}
+          </span>
+        </div>
+        <div className={styles.weeklyUsageMetrics}>
+          <div className={styles.weeklyUsageMetric}>
+            <span className={styles.weeklyUsageMetricLabel}>
+              {t('quota_management.weekly_usage_tokens')}
+            </span>
+            <span className={styles.weeklyUsageMetricValue}>
+              {weeklyUsageLoading
+                ? '—'
+                : weeklyUsage
+                  ? `${formatWeeklyTokensM(weeklyUsage.total_tokens, locale)} M`
+                  : '-- M'}
+            </span>
+          </div>
+          <div className={styles.weeklyUsageMetric}>
+            <span className={styles.weeklyUsageMetricLabel}>
+              {t('quota_management.weekly_usage_estimated_cost')}
+            </span>
+            <span className={styles.weeklyUsageMetricValue}>
+              {weeklyUsageLoading
+                ? '—'
+                : weeklyUsage
+                  ? `≈ $${formatEstimatedUSD(weeklyUsage.estimated_cost_usd, locale)}`
+                  : '--'}
+            </span>
+          </div>
+        </div>
       </div>
 
       <div className={styles.quotaSection}>

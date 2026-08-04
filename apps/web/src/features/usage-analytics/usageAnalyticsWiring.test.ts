@@ -311,9 +311,8 @@ const usageAnalyticsKeys = [
 
 describe('usage analytics app wiring', () => {
   it('registers /usage-analytics behind the request monitoring gate', () => {
-    expect(routesSource).toContain(
-      "import { UsageAnalyticsPage } from '@/pages/UsageAnalyticsPage';"
-    );
+    expect(routesSource).toContain("import('@/pages/UsageAnalyticsPage')");
+    expect(routesSource).toContain('const UsageAnalyticsPage = lazyRouteComponent(');
     const usageRouteIndex = routesSource.indexOf("path: '/usage-analytics'");
     const usageRouteSource = routesSource.slice(
       usageRouteIndex,
@@ -329,7 +328,7 @@ describe('usage analytics app wiring', () => {
   });
 
   it('places Usage Analytics in the top-level sidebar between dashboard and monitoring when monitoring is available', () => {
-    const dashboardIndex = layoutSource.indexOf("path: '/', label: t('nav.dashboard')");
+    const dashboardIndex = layoutSource.indexOf("path: '/dashboard', label: t('nav.dashboard')");
     const usageIndex = layoutSource.indexOf(
       '...(usageAnalyticsNavItem ? [usageAnalyticsNavItem] : [])'
     );

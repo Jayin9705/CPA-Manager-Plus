@@ -16,8 +16,10 @@ export const CACHE_EXPIRY_MS = 30 * 1000; // 与基线保持一致，减少管�
 export const DEFAULT_API_PORT = 8317;
 export const MANAGEMENT_API_PREFIX = '/v0/management';
 export const REQUEST_TIMEOUT_MS = 30 * 1000;
-export const VERSION_HEADER_KEYS = ['x-cpa-version', 'x-server-version'];
-export const BUILD_DATE_HEADER_KEYS = ['x-cpa-build-date', 'x-server-build-date'];
+// Prefer the Manager Server metadata when the panel is hosted by Plus. A
+// lightweight panel connected directly to CPA still falls back to the CPA headers.
+export const VERSION_HEADER_KEYS = ['x-server-version', 'x-cpa-version'];
+export const BUILD_DATE_HEADER_KEYS = ['x-server-build-date', 'x-cpa-build-date'];
 export const CPA_SUPPORT_PLUGIN_HEADER_KEYS = ['x-cpa-support-plugin'];
 export const STATUS_UPDATE_INTERVAL_MS = 1000;
 export const LOG_REFRESH_DELAY_MS = 500;

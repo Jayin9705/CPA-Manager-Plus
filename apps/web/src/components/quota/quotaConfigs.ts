@@ -445,6 +445,11 @@ const mergeCodexQuotaWindow = (
   observedWindow.limitWindowSeconds > 0
     ? { limitWindowSeconds: observedWindow.limitWindowSeconds }
     : {}),
+  ...(observedWindow.resetAtMs !== null &&
+  observedWindow.resetAtMs !== undefined &&
+  Number.isFinite(observedWindow.resetAtMs)
+    ? { resetAtMs: observedWindow.resetAtMs }
+    : {}),
 });
 
 const mergeCodexQuotaWindows = (
@@ -977,7 +982,12 @@ const renderClaudeItems = (
 
 export const CLAUDE_CONFIG: QuotaConfig<
   ClaudeQuotaState,
-  { windows: ClaudeQuotaWindow[]; extraUsage?: ClaudeExtraUsage | null; planType?: string | null }
+  {
+    windows: ClaudeQuotaWindow[];
+    extraUsage?: ClaudeExtraUsage | null;
+    planType?: string | null;
+    weeklyResetAtMs?: number | null;
+  }
 > = {
   type: 'claude',
   i18nPrefix: 'claude_quota',
@@ -992,6 +1002,7 @@ export const CLAUDE_CONFIG: QuotaConfig<
     windows: data.windows,
     extraUsage: data.extraUsage,
     planType: data.planType,
+    weeklyResetAtMs: data.weeklyResetAtMs,
   }),
   buildErrorState: (message, status) => ({
     status: 'error',

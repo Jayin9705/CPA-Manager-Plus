@@ -42,7 +42,7 @@ func (r *repository) LoadAll(ctx context.Context) (map[string]model.ModelPrice, 
 func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]model.ModelPrice, error) {
 	rows, err := tx.QueryContext(ctx, `select
 		model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m,
-		prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, source, source_model_id, raw_json,
+		prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, source, source_model_id,
 		updated_at_ms, synced_at_ms
 		from model_prices order by model`)
 	if err != nil {
@@ -53,7 +53,7 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 	for rows.Next() {
 		var modelID string
 		var price model.ModelPrice
-		var source, sourceModelID, rawJSON sql.NullString
+		var source, sourceModelID sql.NullString
 		var syncedAt sql.NullInt64
 		var promptConfigured, completionConfigured, cacheReadConfigured, cacheCreationConfigured int
 		if err := rows.Scan(
@@ -69,7 +69,6 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 			&cacheCreationConfigured,
 			&source,
 			&sourceModelID,
-			&rawJSON,
 			&price.UpdatedAtMS,
 			&syncedAt,
 		); err != nil {
@@ -81,7 +80,6 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 		price.CacheReadConfigured = cacheReadConfigured != 0
 		price.CacheCreationConfigured = cacheCreationConfigured != 0
 		price.SourceModelID = sourceModelID.String
-		price.RawJSON = rawJSON.String
 		if syncedAt.Valid {
 			value := syncedAt.Int64
 			price.SyncedAtMS = &value
@@ -202,6 +200,11 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 		_ = tx.Rollback()
 	}()
 
+	existingRawJSON, err := loadRawJSONByModel(ctx, tx)
+	if err != nil {
+		return err
+	}
+
 	normalizedPrices := make(map[string]model.ModelPrice, len(prices))
 	for modelID, price := range prices {
 		if err := model.ValidateModelPrice(modelID, price); err != nil {
@@ -253,6 +256,10 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 
 	now := time.Now().UnixMilli()
 	for modelID, price := range normalizedPrices {
+		rawJSON := price.RawJSON
+		if rawJSON == "" {
+			rawJSON = existingRawJSON[modelID]
+		}
 		if _, err := stmt.ExecContext(
 			ctx,
 			modelID,
@@ -261,13 +268,13 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 			price.Cache,
 			price.CacheRead,
 			price.CacheCreation,
-			price.PromptConfigured,
-			price.CompletionConfigured,
-			price.CacheReadConfigured,
-			price.CacheCreationConfigured,
+			boolInt(price.PromptConfigured),
+			boolInt(price.CompletionConfigured),
+			boolInt(price.CacheReadConfigured),
+			boolInt(price.CacheCreationConfigured),
 			nullString(price.Source),
 			nullString(price.SourceModelID),
-			nullString(price.RawJSON),
+			nullString(rawJSON),
 			now,
 			nullInt(price.SyncedAtMS),
 		); err != nil {
@@ -281,6 +288,24 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 		}
 	}
 	return tx.Commit()
+}
+
+func loadRawJSONByModel(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
+	rows, err := tx.QueryContext(ctx, `select model, raw_json from model_prices where raw_json is not null`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	rawJSONByModel := map[string]string{}
+	for rows.Next() {
+		var modelID, rawJSON string
+		if err := rows.Scan(&modelID, &rawJSON); err != nil {
+			return nil, err
+		}
+		rawJSONByModel[modelID] = rawJSON
+	}
+	return rawJSONByModel, rows.Err()
 }
 
 func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.ModelPrice) (model.ModelPriceSyncResult, error) {
@@ -373,10 +398,10 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 			price.Cache,
 			price.CacheRead,
 			price.CacheCreation,
-			price.PromptConfigured,
-			price.CompletionConfigured,
-			price.CacheReadConfigured,
-			price.CacheCreationConfigured,
+			boolInt(price.PromptConfigured),
+			boolInt(price.CompletionConfigured),
+			boolInt(price.CacheReadConfigured),
+			boolInt(price.CacheCreationConfigured),
 			nullString(price.Source),
 			nullString(price.SourceModelID),
 			nullString(price.RawJSON),
@@ -423,11 +448,11 @@ func insertContextTiers(ctx context.Context, stmt *sql.Stmt, modelID string, tie
 			tier.Cache,
 			tier.CacheRead,
 			tier.CacheCreation,
-			tier.PromptConfigured,
-			tier.CompletionConfigured,
-			tier.CacheConfigured,
-			tier.CacheReadConfigured,
-			tier.CacheCreationConfigured,
+			boolInt(tier.PromptConfigured),
+			boolInt(tier.CompletionConfigured),
+			boolInt(tier.CacheConfigured),
+			boolInt(tier.CacheReadConfigured),
+			boolInt(tier.CacheCreationConfigured),
 		); err != nil {
 			return err
 		}
@@ -454,11 +479,11 @@ func insertServiceTiers(ctx context.Context, stmt *sql.Stmt, modelID string, tie
 			tier.Cache,
 			tier.CacheRead,
 			tier.CacheCreation,
-			tier.PromptConfigured,
-			tier.CompletionConfigured,
-			tier.CacheConfigured,
-			tier.CacheReadConfigured,
-			tier.CacheCreationConfigured,
+			boolInt(tier.PromptConfigured),
+			boolInt(tier.CompletionConfigured),
+			boolInt(tier.CacheConfigured),
+			boolInt(tier.CacheReadConfigured),
+			boolInt(tier.CacheCreationConfigured),
 		); err != nil {
 			return err
 		}
@@ -478,4 +503,11 @@ func nullInt(value *int64) any {
 		return nil
 	}
 	return *value
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

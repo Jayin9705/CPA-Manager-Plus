@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -54,74 +53,9 @@ func newCompatHandler(t *testing.T, cfg config.Config, setup *store.Setup) (http
 		}
 	}
 	manager := collector.NewManager(cfg, db)
-	return New(cfg, db, manager).Handler(), db
-}
-
-func TestServerCompatHealthInfoAndPanel(t *testing.T) {
-	cfg := testutil.NewConfig(t)
-	handler, _ := newCompatHandler(t, cfg, nil)
-
-	healthRR := testutil.Request(t, handler, http.MethodGet, "/health", "", "")
-	testutil.RequireStatus(t, healthRR, http.StatusOK)
-	var health struct {
-		OK      bool   `json:"ok"`
-		Service string `json:"service"`
-	}
-	testutil.DecodeJSON(t, healthRR, &health)
-	if !health.OK || health.Service == "" {
-		t.Fatalf("health response = %#v", health)
-	}
-
-	infoRR := testutil.Request(t, handler, http.MethodGet, "/usage-service/info", "", "")
-	testutil.RequireStatus(t, infoRR, http.StatusOK)
-	var info struct {
-		Service    string `json:"service"`
-		Mode       string `json:"mode"`
-		StartedAt  int64  `json:"startedAt"`
-		Configured bool   `json:"configured"`
-	}
-	testutil.DecodeJSON(t, infoRR, &info)
-	if info.Service != serviceID || info.Mode != "embedded" || info.StartedAt <= 0 || info.Configured {
-		t.Fatalf("info response = %#v", info)
-	}
-
-	rootRR := testutil.Request(t, handler, http.MethodGet, "/", "", "")
-	testutil.RequireStatus(t, rootRR, http.StatusTemporaryRedirect)
-	if rootRR.Header().Get("Location") != "/management.html" {
-		t.Fatalf("root location = %q", rootRR.Header().Get("Location"))
-	}
-
-	panelRR := testutil.Request(t, handler, http.MethodGet, "/management.html", "", "")
-	testutil.RequireStatus(t, panelRR, http.StatusOK)
-	if !strings.Contains(panelRR.Header().Get("Content-Type"), "text/html") {
-		t.Fatalf("panel content type = %q", panelRR.Header().Get("Content-Type"))
-	}
-	if !strings.Contains(strings.ToLower(panelRR.Body.String()), "<html") {
-		t.Fatalf("panel body does not look like html")
-	}
-	if got, want := panelRR.Header().Get("Content-Length"), strconv.Itoa(panelRR.Body.Len()); got != want {
-		t.Fatalf("panel content length = %q, want %q", got, want)
-	}
-}
-
-func TestServerCompatPanelPathOverridesEmbeddedPanel(t *testing.T) {
-	cfg := testutil.NewConfig(t)
-	panelPath := filepath.Join(t.TempDir(), "management.html")
-	customPanel := "<html><body>custom panel</body></html>"
-	if err := osWriteFile(panelPath, []byte(customPanel)); err != nil {
-		t.Fatalf("write panel: %v", err)
-	}
-	cfg.PanelPath = panelPath
-	handler, _ := newCompatHandler(t, cfg, nil)
-
-	rr := testutil.Request(t, handler, http.MethodGet, "/management.html", "", "")
-	testutil.RequireStatus(t, rr, http.StatusOK)
-	if rr.Body.String() != customPanel {
-		t.Fatalf("panel body = %q", rr.Body.String())
-	}
-	if got, want := rr.Header().Get("Content-Length"), strconv.Itoa(len(customPanel)); got != want {
-		t.Fatalf("panel content length = %q, want %q", got, want)
-	}
+	server := New(cfg, db, manager)
+	installTestAdminAuth(t, server)
+	return server.Handler(), db
 }
 
 func TestServerCompatSetupConfigAndEnvLock(t *testing.T) {
@@ -245,6 +179,7 @@ func TestServerCompatAccountProcessingPolicyPatchReloadsRuntime(t *testing.T) {
 	manager := collector.NewManager(cfg, db)
 	runtime := &recordingAutomationRuntimeService{}
 	server := New(cfg, db, manager, runtime)
+	installTestAdminAuth(t, server)
 	handler := server.Handler()
 
 	body := `{"codexQuotaCooldownEnabled":true,"authIssueQueueEnabled":true,"authIssueAutoDisableEnabled":true}`
@@ -291,7 +226,9 @@ func TestServerCompatAccountProcessingPolicyPatchRejectsEnvLockedField(t *testin
 	cfg := testutil.NewConfig(t)
 	cfg.QuotaCooldownEnvSet = true
 	db := testutil.NewStore(t, cfg)
-	handler := New(cfg, db, collector.NewManager(cfg, db)).Handler()
+	server := New(cfg, db, collector.NewManager(cfg, db))
+	installTestAdminAuth(t, server)
+	handler := server.Handler()
 
 	rr := testutil.Request(t, handler, http.MethodPatch, "/usage-service/account-processing-policy", `{"codexQuotaCooldownEnabled":true}`, testutil.AdminKey)
 	testutil.RequireStatus(t, rr, http.StatusConflict)
@@ -306,7 +243,7 @@ func TestServerCompatCPAPanelKeyCannotUseManagerOnlyRoutes(t *testing.T) {
 	handler, db := newCompatHandler(t, cfg, nil)
 
 	openConfigRR := testutil.Request(t, handler, http.MethodGet, "/usage-service/config", "", "")
-	testutil.RequireStatus(t, openConfigRR, http.StatusOK)
+	testutil.RequireStatus(t, openConfigRR, http.StatusUnauthorized)
 
 	configBody := `{"config":{"cpaConnection":{"cpaBaseUrl":"` + cpa.URL() + `","managementKey":"management-key"},"collector":{"enabled":false,"collectorMode":"auto","queue":"usage","popSide":"right","batchSize":100,"pollIntervalMs":500,"queryLimit":50000},"externalUsageService":{"enabled":true,"serviceBase":"http://usage.local"}}}`
 	saveRR := testutil.Request(t, handler, http.MethodPut, "/usage-service/config", configBody, testutil.AdminKey)
@@ -318,7 +255,7 @@ func TestServerCompatCPAPanelKeyCannotUseManagerOnlyRoutes(t *testing.T) {
 
 	cpaKeyConfigRR := testutil.Request(t, handler, http.MethodGet, "/usage-service/config", "", "management-key")
 	testutil.RequireStatus(t, cpaKeyConfigRR, http.StatusUnauthorized)
-	if !strings.Contains(cpaKeyConfigRR.Body.String(), `"code":"invalid_admin_key"`) {
+	if !strings.Contains(cpaKeyConfigRR.Body.String(), `"code":"invalid_session"`) {
 		t.Fatalf("CPA key config body = %s", cpaKeyConfigRR.Body.String())
 	}
 
@@ -334,7 +271,7 @@ func TestServerCompatCPAPanelKeyCannotUseManagerOnlyRoutes(t *testing.T) {
 	}
 	usageRR := testutil.Request(t, handler, http.MethodGet, "/v0/management/usage", "", "management-key")
 	testutil.RequireStatus(t, usageRR, http.StatusUnauthorized)
-	if !strings.Contains(usageRR.Body.String(), `"code":"invalid_admin_key"`) {
+	if !strings.Contains(usageRR.Body.String(), `"code":"invalid_session"`) {
 		t.Fatalf("usage body = %s", usageRR.Body.String())
 	}
 	importSessionRR := testutil.Request(
@@ -346,13 +283,13 @@ func TestServerCompatCPAPanelKeyCannotUseManagerOnlyRoutes(t *testing.T) {
 		"management-key",
 	)
 	testutil.RequireStatus(t, importSessionRR, http.StatusUnauthorized)
-	if !strings.Contains(importSessionRR.Body.String(), `"code":"invalid_admin_key"`) {
+	if !strings.Contains(importSessionRR.Body.String(), `"code":"invalid_session"`) {
 		t.Fatalf("usage import session body = %s", importSessionRR.Body.String())
 	}
 
 	proxyRR := testutil.Request(t, handler, http.MethodGet, "/v0/management/config", "", "management-key")
 	testutil.RequireStatus(t, proxyRR, http.StatusUnauthorized)
-	if !strings.Contains(proxyRR.Body.String(), `"code":"invalid_admin_key"`) {
+	if !strings.Contains(proxyRR.Body.String(), `"code":"invalid_session"`) {
 		t.Fatalf("proxy body = %s", proxyRR.Body.String())
 	}
 }
@@ -674,7 +611,7 @@ func TestServerCompatModelPricesAndAliases(t *testing.T) {
 
 	priceRR := testutil.Request(t, handler, http.MethodPut, "/v0/management/model-prices", `{"prices":{"gpt-test":{"prompt":1,"completion":2,"cache":0.5}}}`, testutil.AdminKey)
 	testutil.RequireStatus(t, priceRR, http.StatusOK)
-	loadPriceRR := testutil.Request(t, handler, http.MethodGet, "/v0/management/model-prices", "", testutil.AdminKey)
+	loadPriceRR := testutil.Request(t, handler, http.MethodGet, "/api/v1/model-prices", "", testutil.AdminKey)
 	testutil.RequireStatus(t, loadPriceRR, http.StatusOK)
 	if !strings.Contains(loadPriceRR.Body.String(), `"gpt-test"`) ||
 		!strings.Contains(loadPriceRR.Body.String(), `"prompt":1`) {
@@ -845,7 +782,7 @@ func TestServerCompatPluginProxyRoutes(t *testing.T) {
 		http.MethodGet,
 		"/v0/management/codex-invite/accounts",
 		"",
-		"plugin-management-key",
+		testutil.AdminKey,
 		map[string]string{
 			"Origin":                "http://localhost:18317",
 			"X-Codex-Invite-Origin": "http://localhost:18317",
@@ -855,7 +792,7 @@ func TestServerCompatPluginProxyRoutes(t *testing.T) {
 	assertObserved("/v0/management/codex-invite/accounts", observedRequest{
 		method:            http.MethodGet,
 		path:              "/v0/management/codex-invite/accounts",
-		authorization:     "Bearer plugin-management-key",
+		authorization:     "Bearer management-key",
 		codexInviteOrigin: upstream.URL,
 		origin:            "http://localhost:18317",
 	})
@@ -864,7 +801,7 @@ func TestServerCompatPluginProxyRoutes(t *testing.T) {
 		http.MethodPost,
 		"/v0/management/codex-invite/invite",
 		`{"management_origin":"http://localhost:18317","refresh":true}`,
-		"plugin-management-key",
+		testutil.AdminKey,
 		map[string]string{
 			"Content-Type":          "application/json",
 			"X-Codex-Invite-Origin": "http://localhost:18317",
@@ -874,7 +811,7 @@ func TestServerCompatPluginProxyRoutes(t *testing.T) {
 	assertObserved("/v0/management/codex-invite/invite", observedRequest{
 		method:            http.MethodPost,
 		path:              "/v0/management/codex-invite/invite",
-		authorization:     "Bearer plugin-management-key",
+		authorization:     "Bearer management-key",
 		codexInviteOrigin: upstream.URL,
 		body:              `{"management_origin":"` + upstream.URL + `","refresh":true}`,
 	})
@@ -887,12 +824,7 @@ func TestServerCompatPluginProxyRoutes(t *testing.T) {
 		`{"managementKey":"plugin-key"}`,
 		"",
 	)
-	testutil.RequireStatus(t, resourcePostNoAuthRR, http.StatusOK)
-	assertObserved("/v0/resource/plugins/codex-invite/invite", observedRequest{
-		method: http.MethodPost,
-		path:   "/v0/resource/plugins/codex-invite/invite",
-		body:   `{"managementKey":"plugin-key"}`,
-	})
+	testutil.RequireStatus(t, resourcePostNoAuthRR, http.StatusUnauthorized)
 
 	resourcePostCallerAuthRR := requestWithHeaders(
 		http.MethodPost,
@@ -903,14 +835,7 @@ func TestServerCompatPluginProxyRoutes(t *testing.T) {
 			"X-Codex-Invite-Origin": "http://localhost:18317",
 		},
 	)
-	testutil.RequireStatus(t, resourcePostCallerAuthRR, http.StatusOK)
-	assertObserved("/v0/resource/plugins/codex-invite/invite", observedRequest{
-		method:            http.MethodPost,
-		path:              "/v0/resource/plugins/codex-invite/invite",
-		authorization:     "Bearer plugin-management-key",
-		codexInviteOrigin: upstream.URL,
-		body:              `{"refresh":true}`,
-	})
+	testutil.RequireStatus(t, resourcePostCallerAuthRR, http.StatusUnauthorized)
 
 	resourcePostRR := testutil.Request(
 		t,
@@ -1041,8 +966,4 @@ func compatEvent(hash string, offset int64) usage.Event {
 		TotalTokens:  3,
 		CreatedAtMS:  1_778_000_000_100 + offset,
 	}
-}
-
-func osWriteFile(path string, data []byte) error {
-	return os.WriteFile(path, data, 0o644)
 }

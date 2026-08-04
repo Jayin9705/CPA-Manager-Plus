@@ -51,10 +51,12 @@ describe('buildMonitoringCenterAnalyticsInclude', () => {
     before_id: 42,
   };
 
-  it('loads compact account aggregates with the bounded shared event page', () => {
+  it('loads compact account aggregates and selectors in one bounded request', () => {
     expect(buildMonitoringCenterAnalyticsInclude('accounts', 'day', eventsPage)).toEqual({
       summary: true,
       summary_profile: 'compact',
+      filter_options: true,
+      filter_selectors: true,
       account_stats: true,
       events_page: {
         limit: 500,
@@ -65,10 +67,12 @@ describe('buildMonitoringCenterAnalyticsInclude', () => {
     });
   });
 
-  it('loads compact API key aggregates with the bounded shared event page', () => {
+  it('loads compact API key aggregates and selectors in one bounded request', () => {
     expect(buildMonitoringCenterAnalyticsInclude('apiKeys', 'hour', eventsPage)).toEqual({
       summary: true,
       summary_profile: 'compact',
+      filter_options: true,
+      filter_selectors: true,
       api_key_stats: true,
       events_page: {
         limit: 500,
@@ -83,6 +87,8 @@ describe('buildMonitoringCenterAnalyticsInclude', () => {
     expect(buildMonitoringCenterAnalyticsInclude('realtime', 'hour', eventsPage)).toEqual({
       summary: true,
       summary_profile: 'compact',
+      filter_options: true,
+      filter_selectors: true,
       events_page: eventsPage,
       granularity: 'hour',
     });

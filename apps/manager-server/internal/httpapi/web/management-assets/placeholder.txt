@@ -1,0 +1,1 @@
+This directory is populated by the split management panel build.

@@ -139,6 +139,15 @@ func fromExisting(
 		MaxSessions:    cfg.UsageImportMaxSessions,
 		TTL:            cfg.UsageImportSessionTTL,
 	}))
+	var monitoringCache *monitoringsvc.RedisCache
+	if cfg.MonitoringCacheEnabled {
+		monitoringCache = monitoringsvc.NewRedisCache(
+			cfg.UsageRedisAddr,
+			cfg.UsageRedisPassword,
+			cfg.UsageRedisDB,
+			cfg.MonitoringCacheTTL,
+		)
+	}
 	authFileMutationCoordinator := cpaauthfiles.NewMutationCoordinator()
 	return &Context{
 		Config:               cfg,
@@ -157,7 +166,7 @@ func fromExisting(
 			managerConfigService,
 			codexinspectionsvc.ServiceOptions{AuthFileMutationCoordinator: authFileMutationCoordinator},
 		),
-		MonitoringService:  monitoringsvc.New(st, cfg.DashboardHourlyRollupEnabled),
+		MonitoringService:  monitoringsvc.NewWithCache(st, monitoringCache, cfg.DashboardHourlyRollupEnabled),
 		ModelPriceService:  modelpricesvc.NewMultiSourceWithModelsDev(st, modelsDevModelPriceSyncURL, modelPriceSyncURL, openRouterModelPriceSyncURL, managerConfigService),
 		APIKeyAliasService: apikeyaliassvc.New(st),
 		AccountActionService: accountactionsvc.NewWithMutationCoordinator(

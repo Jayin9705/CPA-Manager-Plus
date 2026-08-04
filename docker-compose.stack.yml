@@ -1,0 +1,301 @@
+name: ${COMPOSE_PROJECT_NAME:-cpamp}
+
+x-cpamp-build: &cpamp-build
+  context: .
+  dockerfile: Dockerfile.manager-server-api
+  args:
+    VERSION: ${CPAMP_API_VERSION:-dev}
+    COMMIT: ${CPAMP_API_COMMIT:-local}
+    BUILD_DATE: ${CPAMP_API_BUILD_DATE:-unknown}
+
+x-usage-environment: &usage-environment
+  CPAMP_USAGE_PG_DSN_FILE: /run/secrets/usage_pg_dsn
+  CPAMP_USAGE_REDIS_ADDR: redis:6379
+  CPAMP_USAGE_REDIS_PASSWORD_FILE: /run/secrets/redis_password
+  CPAMP_USAGE_REDIS_DB: '0'
+  CPAMP_USAGE_REDIS_STREAM: cpamp:usage:v1
+  CPAMP_USAGE_REDIS_GROUP: cpamp-persist-v1
+
+x-usage-secrets: &usage-secrets
+  - usage_pg_dsn
+  - redis_password
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cpamp
+      POSTGRES_DB: cpamp
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ:-Asia/Shanghai}
+    secrets:
+      - postgres_password
+    volumes:
+      # PostgreSQL 18+ keeps version-specific clusters below this directory.
+      - cpamp-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U cpamp -d cpamp']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - backend
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$(cat /run/secrets/redis_password)"
+    secrets:
+      - redis_password
+    volumes:
+      - cpamp-redis-data:/data
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'REDISCLI_AUTH=$$(cat /run/secrets/redis_password) redis-cli ping | grep -q PONG',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - backend
+
+  cli-proxy-api:
+    image: ${CPA_IMAGE:-eceasy/cli-proxy-api:latest}
+    restart: unless-stopped
+    ports:
+      - '${CPA_BIND_ADDRESS:-127.0.0.1}:${CPA_PORT:-8317}:8317'
+    volumes:
+      - ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/cliproxyapi/config.yaml:/CLIProxyAPI/config.yaml:ro
+      - ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/cliproxyapi/auths:/root/.cli-proxy-api
+      - ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/cliproxyapi/logs:/CLIProxyAPI/logs
+    networks:
+      - backend
+
+  cpamp-auth-init:
+    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    restart: 'no'
+    entrypoint: ['/bin/sh', '/opt/cpamp/init-auth.sh']
+    environment:
+      PGHOST: postgres
+      PGPORT: '5432'
+      PGUSER: cpamp
+      PGDATABASE: cpamp
+      CPAMP_ADMIN_EMAIL: ${CPAMP_ADMIN_EMAIL:-admin@localhost}
+    secrets:
+      - postgres_password
+      - cpamp_admin_password
+    volumes:
+      - ./deploy/stack/init-auth.sh:/opt/cpamp/init-auth.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  cpamp-usage-init:
+    image: ${CPAMP_API_IMAGE:-cpa-manager-plus-api:local}
+    build: *cpamp-build
+    restart: 'no'
+    entrypoint: ['/bin/sh', '-ec']
+    command:
+      - |
+        /usr/local/bin/cpamp-migration init
+        exec /usr/local/bin/cpamp-migration init-stream
+    environment: *usage-environment
+    secrets: *usage-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  cpamp-api:
+    image: ${CPAMP_API_IMAGE:-cpa-manager-plus-api:local}
+    build: *cpamp-build
+    restart: unless-stopped
+    ports:
+      - '${CPAMP_API_BIND_ADDRESS:-127.0.0.1}:${CPAMP_API_PORT:-18318}:18317'
+    environment:
+      HTTP_ADDR: 0.0.0.0:18317
+      USAGE_DATA_DIR: /data
+      CPA_MANAGER_DATA_KEY_PATH: /data/data.key
+      CPA_MANAGER_DATA_KEY_FILE: /run/secrets/cpamp_data_key
+      CPA_MANAGER_ADMIN_KEY_FILE: /run/secrets/cpamp_admin_key
+      CPAMP_PERSISTENCE_BACKEND: postgres
+      CPAMP_CORE_PG_DSN_FILE: /run/secrets/core_pg_dsn
+      CPAMP_USAGE_PG_DSN_FILE: /run/secrets/usage_pg_dsn
+      CPAMP_AUTH_PG_DSN_FILE: /run/secrets/auth_pg_dsn
+      CPAMP_USAGE_SINK: redis
+      CPAMP_USAGE_REDIS_ADDR: redis:6379
+      CPAMP_USAGE_REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      CPAMP_USAGE_REDIS_DB: '0'
+      CPAMP_USAGE_REDIS_STREAM: cpamp:usage:v1
+      CPAMP_USAGE_REDIS_GROUP: cpamp-persist-v1
+      CPAMP_AUTH_REDIS_ADDR: redis:6379
+      CPAMP_AUTH_REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      CPAMP_AUTH_REDIS_DB: '1'
+      CPAMP_MONITORING_CACHE_ENABLED: 'true'
+      CPAMP_USAGE_SQLITE_HOURLY_ROLLUP_ENABLED: 'false'
+      CPAMP_USAGE_SQLITE_ACCOUNT_ROLLUP_ENABLED: 'false'
+      CPA_UPSTREAM_URL: http://cli-proxy-api:8317
+      CPA_MANAGEMENT_KEY_FILE: /run/secrets/cpa_management_key
+      USAGE_COLLECTOR_MODE: auto
+      USAGE_RESP_QUEUE: usage
+      USAGE_RESP_POP_SIDE: right
+      USAGE_BATCH_SIZE: '100'
+      USAGE_POLL_INTERVAL_MS: '500'
+      USAGE_QUERY_LIMIT: '50000'
+      USAGE_CORS_ORIGINS: ${CPAMP_CONSOLE_ORIGIN:-http://localhost:18080}
+      CPAMP_CONSOLE_ORIGINS: ${CPAMP_CONSOLE_ORIGIN:-http://localhost:18080}
+      CPAMP_PUBLIC_API_ORIGIN: ${CPAMP_PUBLIC_API_ORIGIN:-http://localhost:18318}
+      CPAMP_PUBLIC_CONSOLE_ORIGIN: ${CPAMP_CONSOLE_ORIGIN:-http://localhost:18080}
+      CPAMP_CSRF_ENABLED: 'true'
+      CPAMP_COOKIE_SECURE: ${CPAMP_COOKIE_SECURE:-false}
+      CPAMP_METRICS_PROC_DIR: /host/proc
+      CPAMP_METRICS_ETC_DIR: /host/etc
+      CPAMP_METRICS_DISK_PATH: /data
+      TZ: ${TZ:-Asia/Shanghai}
+    secrets:
+      - core_pg_dsn
+      - usage_pg_dsn
+      - auth_pg_dsn
+      - redis_password
+      - cpa_management_key
+      - cpamp_admin_key
+      - cpamp_data_key
+    volumes:
+      - cpamp-manager-data:/data
+      # Aggregate, read-only host facts used by the Operations page. No host
+      # process directories, command lines, or environment files are mounted.
+      - /proc/stat:/host/proc/stat:ro
+      - /proc/meminfo:/host/proc/meminfo:ro
+      - /proc/loadavg:/host/proc/loadavg:ro
+      - /proc/uptime:/host/proc/uptime:ro
+      - /proc/net/dev:/host/proc/net/dev:ro
+      - /etc/hostname:/host/etc/hostname:ro
+      - /etc/os-release:/host/etc/os-release:ro
+    depends_on:
+      cli-proxy-api:
+        condition: service_started
+      cpamp-auth-init:
+        condition: service_completed_successfully
+      cpamp-usage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:18317/readyz']
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    networks:
+      - backend
+
+  cpamp-usage-persist:
+    image: ${CPAMP_API_IMAGE:-cpa-manager-plus-api:local}
+    build: *cpamp-build
+    restart: unless-stopped
+    entrypoint: ['/usr/local/bin/cpamp-migration']
+    command:
+      - persist
+      - --follow
+      - --max-batches=0
+      - --batch-size=100
+      - --delete-after-ack=true
+    environment:
+      <<: *usage-environment
+      CPAMP_USAGE_REDIS_CONSUMER: cpamp-persist-1
+    secrets: *usage-secrets
+    depends_on:
+      cpamp-usage-init:
+        condition: service_completed_successfully
+    networks:
+      - backend
+
+  cpamp-rollup-hourly:
+    image: ${CPAMP_API_IMAGE:-cpa-manager-plus-api:local}
+    build: *cpamp-build
+    restart: unless-stopped
+    entrypoint: ['/usr/local/bin/cpamp-migration']
+    command: ['rollup', '--kind=hourly', '--follow', '--max-batches=0', '--batch-size=500']
+    environment: *usage-environment
+    secrets: *usage-secrets
+    depends_on:
+      cpamp-usage-init:
+        condition: service_completed_successfully
+    networks:
+      - backend
+
+  cpamp-rollup-daily:
+    image: ${CPAMP_API_IMAGE:-cpa-manager-plus-api:local}
+    build: *cpamp-build
+    restart: unless-stopped
+    entrypoint: ['/usr/local/bin/cpamp-migration']
+    command: ['rollup', '--kind=daily', '--follow', '--max-batches=0', '--batch-size=500']
+    environment: *usage-environment
+    secrets: *usage-secrets
+    depends_on:
+      cpamp-usage-init:
+        condition: service_completed_successfully
+    networks:
+      - backend
+
+  cpamp-console:
+    image: ${CPAMP_CONSOLE_IMAGE:-cpa-manager-plus-console:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        VERSION: ${CPAMP_WEB_VERSION:-dev}
+    restart: unless-stopped
+    ports:
+      - '${CPAMP_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${CPAMP_CONSOLE_PORT:-18080}:8080'
+    volumes:
+      - ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/runtime-config.json:/usr/share/nginx/html/runtime-config.json:ro
+    depends_on:
+      cpamp-api:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/']
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    networks:
+      - backend
+
+volumes:
+  cpamp-postgres-data:
+  cpamp-redis-data:
+  cpamp-manager-data:
+
+networks:
+  backend:
+
+secrets:
+  postgres_password:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/postgres-password
+  redis_password:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/redis-password
+  cpamp_admin_password:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/cpamp-admin-password
+  cpa_management_key:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/cpa-management-key
+  cpamp_admin_key:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/cpamp-admin-key
+  cpamp_data_key:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/cpamp-data-key
+  core_pg_dsn:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/core-pg-dsn
+  usage_pg_dsn:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/usage-pg-dsn
+  auth_pg_dsn:
+    file: ${CPAMP_RUNTIME_DIR:-./deploy/stack/runtime}/secrets/auth-pg-dsn

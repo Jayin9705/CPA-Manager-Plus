@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,27 +24,65 @@ const (
 	DefaultUsageImportDiskQuotaBytes int64 = 16 * 1024 * 1024 * 1024
 	DefaultUsageImportMaxSessions          = 2
 	DefaultUsageImportSessionTTL           = 24 * time.Hour
+	DefaultAuthPostgresDSN                 = "user=cpa-manager-plus dbname=sub2api host=/var/run/postgresql"
+	DefaultAuthSessionTTL                  = 12 * time.Hour
+	DefaultAuthLoginLimit                  = 10
+	DefaultAuthLoginWindow                 = 5 * time.Minute
 )
 
 type Config struct {
-	HTTPAddr                     string
-	DataDir                      string
-	DBPath                       string
-	CPAUpstreamURL               string
-	ManagementKey                string
-	AdminKey                     string
-	DataKey                      string
-	DataKeyPath                  string
-	CollectorMode                string
-	Queue                        string
-	PopSide                      string
-	BatchSize                    int
-	PollInterval                 time.Duration
-	QueryLimit                   int
-	PprofAddr                    string
-	PanelPath                    string
-	CORSOrigins                  []string
+	HTTPAddr string
+	// APIShadowMode keeps a separated API process safe to run beside the
+	// existing Manager during a validation window. It disables process-local
+	// collector/automation/scheduled-inspection workers; normal production
+	// runs leave this false so one Manager owns those workers.
+	APIShadowMode      bool
+	DataDir            string
+	DBPath             string
+	PersistenceBackend string
+	CorePostgresDSN    string
+	CPAUpstreamURL     string
+	ManagementKey      string
+	AdminKey           string
+	DataKey            string
+	DataKeyPath        string
+	CollectorMode      string
+	Queue              string
+	PopSide            string
+	BatchSize          int
+	PollInterval       time.Duration
+	QueryLimit         int
+	PprofAddr          string
+	PanelPath          string
+	CORSOrigins        []string
+	// ConsoleOrigins is the exact browser allow-list used by the separated
+	// console. CORSOrigins remains available for legacy CPA/lightweight panel
+	// clients; when ConsoleOrigins is set it takes precedence for browser
+	// requests and wildcard origins are rejected during configuration loading.
+	ConsoleOrigins               []string
+	PublicAPIOrigin              string
+	PublicConsoleOrigin          string
+	CSRFEnabled                  bool
+	CookieSecure                 bool
 	TLSSkipVerify                bool
+	UsageSink                    string
+	UsageRedisAddr               string
+	UsageRedisPassword           string
+	UsageRedisDB                 int
+	UsageRedisStream             string
+	UsageRedisGroup              string
+	UsagePostgresDSN             string
+	AuthPostgresDSN              string
+	AuthRedisAddr                string
+	AuthRedisPassword            string
+	AuthRedisDB                  int
+	AuthSessionTTL               time.Duration
+	AuthLoginLimit               int
+	AuthLoginWindow              time.Duration
+	MonitoringCacheEnabled       bool
+	MonitoringCacheTTL           time.Duration
+	SQLiteHourlyRollupEnabled    bool
+	SQLiteAccountRollupEnabled   bool
 	QuotaCooldownEnabled         bool
 	AccountActionsEnabled        bool
 	AccountActionsAutoDisable    bool
@@ -79,7 +118,19 @@ type fileConfig struct {
 	PprofAddr                 string   `json:"pprofAddr,omitempty"`
 	PanelPath                 string   `json:"panelPath,omitempty"`
 	CORSOrigins               []string `json:"corsOrigins,omitempty"`
+	ConsoleOrigins            []string `json:"consoleOrigins,omitempty"`
+	PublicAPIOrigin           string   `json:"publicApiOrigin,omitempty"`
+	PublicConsoleOrigin       string   `json:"publicConsoleOrigin,omitempty"`
+	CSRFEnabled               *bool    `json:"csrfEnabled,omitempty"`
+	CookieSecure              *bool    `json:"cookieSecure,omitempty"`
 	TLSSkipVerify             bool     `json:"tlsSkipVerify,omitempty"`
+	UsageSink                 string   `json:"usageSink,omitempty"`
+	UsageRedisAddr            string   `json:"usageRedisAddr,omitempty"`
+	UsageRedisDB              int      `json:"usageRedisDb,omitempty"`
+	UsageRedisStream          string   `json:"usageRedisStream,omitempty"`
+	UsageRedisGroup           string   `json:"usageRedisGroup,omitempty"`
+	MonitoringCacheEnabled    bool     `json:"monitoringCacheEnabled,omitempty"`
+	MonitoringCacheTTLSeconds int      `json:"monitoringCacheTTLSeconds,omitempty"`
 	QuotaCooldownEnabled      bool     `json:"quotaCooldownEnabled,omitempty"`
 	AccountActionsEnabled     bool     `json:"accountActionsEnabled,omitempty"`
 	AccountActionsAutoDisable bool     `json:"accountActionsAutoDisable,omitempty"`
@@ -135,10 +186,73 @@ func LoadWithOptions(options LoadOptions) (Config, error) {
 		dataKeyPath = filepath.Join(dataDir, "data.key")
 	}
 
+	usageSink := strings.ToLower(strings.TrimSpace(env("CPAMP_USAGE_SINK", stringFallback(cfgFile.UsageSink, "sqlite"))))
+	persistenceBackend := strings.ToLower(strings.TrimSpace(env("CPAMP_PERSISTENCE_BACKEND", "sqlite")))
+	if persistenceBackend != "sqlite" && persistenceBackend != "postgres" {
+		return Config{}, fmt.Errorf("CPAMP_PERSISTENCE_BACKEND must be sqlite or postgres")
+	}
+	corePostgresDSN := readSecret("CPAMP_CORE_PG_DSN", "CPAMP_CORE_PG_DSN_FILE", "")
+	usagePostgresDSN := readSecret("CPAMP_USAGE_PG_DSN", "CPAMP_USAGE_PG_DSN_FILE", "")
+	usageRedisAddr := env("CPAMP_USAGE_REDIS_ADDR", stringFallback(cfgFile.UsageRedisAddr, "127.0.0.1:6379"))
+	usageRedisPassword := readSecret("CPAMP_USAGE_REDIS_PASSWORD", "CPAMP_USAGE_REDIS_PASSWORD_FILE", "")
+	usageRedisDB := envInt("CPAMP_USAGE_REDIS_DB", cfgFile.UsageRedisDB)
+	monitoringCacheEnabled := envBool("CPAMP_MONITORING_CACHE_ENABLED", usageSink == "redis")
+	monitoringCacheTTLSeconds := envInt(
+		"CPAMP_MONITORING_CACHE_TTL_SECONDS",
+		intFallback(cfgFile.MonitoringCacheTTLSeconds, 5),
+	)
+	if monitoringCacheTTLSeconds < 1 {
+		monitoringCacheTTLSeconds = 1
+	}
+	sqliteHourlyRollupEnabled := envBool("CPAMP_USAGE_SQLITE_HOURLY_ROLLUP_ENABLED", true)
+	sqliteAccountRollupEnabled := envBool("CPAMP_USAGE_SQLITE_ACCOUNT_ROLLUP_ENABLED", true)
+	if persistenceBackend == "postgres" {
+		if corePostgresDSN == "" {
+			return Config{}, fmt.Errorf("CPAMP_CORE_PG_DSN is required for PostgreSQL persistence")
+		}
+		if usagePostgresDSN == "" {
+			return Config{}, fmt.Errorf("CPAMP_USAGE_PG_DSN is required for PostgreSQL persistence")
+		}
+		if usageSink != "redis" {
+			return Config{}, fmt.Errorf("CPAMP_USAGE_SINK must be redis for PostgreSQL persistence")
+		}
+		if sqliteHourlyRollupEnabled || sqliteAccountRollupEnabled {
+			return Config{}, fmt.Errorf("SQLite usage rollup workers must be disabled for PostgreSQL persistence")
+		}
+	}
+	authSessionTTLSeconds := envInt("CPAMP_AUTH_SESSION_TTL_SECONDS", int(DefaultAuthSessionTTL/time.Second))
+	if authSessionTTLSeconds < 1 {
+		authSessionTTLSeconds = int(DefaultAuthSessionTTL / time.Second)
+	}
+	authLoginLimit := envInt("CPAMP_AUTH_LOGIN_LIMIT", DefaultAuthLoginLimit)
+	if authLoginLimit < 1 {
+		authLoginLimit = DefaultAuthLoginLimit
+	}
+	authLoginWindowSeconds := envInt("CPAMP_AUTH_LOGIN_WINDOW_SECONDS", int(DefaultAuthLoginWindow/time.Second))
+	if authLoginWindowSeconds < 1 {
+		authLoginWindowSeconds = int(DefaultAuthLoginWindow / time.Second)
+	}
+
+	consoleOrigins := normalizeConsoleOrigins(splitCSV(env("CPAMP_CONSOLE_ORIGINS", strings.Join(cfgFile.ConsoleOrigins, ","))))
+	if err := validateConsoleOrigins(consoleOrigins); err != nil {
+		return Config{}, err
+	}
+	csrfEnabled := envBool("CPAMP_CSRF_ENABLED", len(consoleOrigins) > 0)
+	if cfgFile.CSRFEnabled != nil && !hasEnv("CPAMP_CSRF_ENABLED") {
+		csrfEnabled = *cfgFile.CSRFEnabled
+	}
+	cookieSecure := envBool("CPAMP_COOKIE_SECURE", false)
+	if cfgFile.CookieSecure != nil && !hasEnv("CPAMP_COOKIE_SECURE") {
+		cookieSecure = *cfgFile.CookieSecure
+	}
+
 	return Config{
 		HTTPAddr:                     env("HTTP_ADDR", stringFallback(cfgFile.HTTPAddr, "0.0.0.0:18317")),
+		APIShadowMode:                envBool("CPAMP_API_SHADOW_MODE", false),
 		DataDir:                      dataDir,
 		DBPath:                       env("USAGE_DB_PATH", dbPathFallback),
+		PersistenceBackend:           persistenceBackend,
+		CorePostgresDSN:              corePostgresDSN,
 		CPAUpstreamURL:               env("CPA_UPSTREAM_URL", cfgFile.CPAUpstreamURL),
 		ManagementKey:                readSecret("CPA_MANAGEMENT_KEY", "CPA_MANAGEMENT_KEY_FILE", managementKeyFile),
 		AdminKey:                     readSecret("CPA_MANAGER_ADMIN_KEY", "CPA_MANAGER_ADMIN_KEY_FILE", adminKeyFile),
@@ -153,7 +267,30 @@ func LoadWithOptions(options LoadOptions) (Config, error) {
 		PprofAddr:                    env("CPA_MANAGER_PPROF_ADDR", cfgFile.PprofAddr),
 		PanelPath:                    env("PANEL_PATH", resolveConfigPath(cfgFile.PanelPath, cfgDir)),
 		CORSOrigins:                  splitCSV(env("USAGE_CORS_ORIGINS", strings.Join(sliceFallback(cfgFile.CORSOrigins, []string{"*"}), ","))),
+		ConsoleOrigins:               consoleOrigins,
+		PublicAPIOrigin:              strings.TrimRight(strings.TrimSpace(env("CPAMP_PUBLIC_API_ORIGIN", cfgFile.PublicAPIOrigin)), "/"),
+		PublicConsoleOrigin:          strings.TrimRight(strings.TrimSpace(env("CPAMP_PUBLIC_CONSOLE_ORIGIN", cfgFile.PublicConsoleOrigin)), "/"),
+		CSRFEnabled:                  csrfEnabled,
+		CookieSecure:                 cookieSecure,
 		TLSSkipVerify:                envBool("USAGE_RESP_TLS_SKIP_VERIFY", cfgFile.TLSSkipVerify),
+		UsageSink:                    usageSink,
+		UsageRedisAddr:               usageRedisAddr,
+		UsageRedisPassword:           usageRedisPassword,
+		UsageRedisDB:                 usageRedisDB,
+		UsageRedisStream:             env("CPAMP_USAGE_REDIS_STREAM", stringFallback(cfgFile.UsageRedisStream, "cpamp:usage:v1")),
+		UsageRedisGroup:              env("CPAMP_USAGE_REDIS_GROUP", stringFallback(cfgFile.UsageRedisGroup, "cpamp-persist-v1")),
+		UsagePostgresDSN:             usagePostgresDSN,
+		AuthPostgresDSN:              readSecretOrFallback("CPAMP_AUTH_PG_DSN", "CPAMP_AUTH_PG_DSN_FILE", DefaultAuthPostgresDSN),
+		AuthRedisAddr:                env("CPAMP_AUTH_REDIS_ADDR", usageRedisAddr),
+		AuthRedisPassword:            readSecretOrFallback("CPAMP_AUTH_REDIS_PASSWORD", "CPAMP_AUTH_REDIS_PASSWORD_FILE", usageRedisPassword),
+		AuthRedisDB:                  envInt("CPAMP_AUTH_REDIS_DB", usageRedisDB),
+		AuthSessionTTL:               time.Duration(authSessionTTLSeconds) * time.Second,
+		AuthLoginLimit:               authLoginLimit,
+		AuthLoginWindow:              time.Duration(authLoginWindowSeconds) * time.Second,
+		MonitoringCacheEnabled:       monitoringCacheEnabled,
+		MonitoringCacheTTL:           time.Duration(monitoringCacheTTLSeconds) * time.Second,
+		SQLiteHourlyRollupEnabled:    sqliteHourlyRollupEnabled,
+		SQLiteAccountRollupEnabled:   sqliteAccountRollupEnabled,
 		QuotaCooldownEnabled:         envBool("USAGE_QUOTA_COOLDOWN_ENABLED", cfgFile.QuotaCooldownEnabled),
 		AccountActionsEnabled:        envBool("USAGE_ACCOUNT_ACTIONS_ENABLED", cfgFile.AccountActionsEnabled),
 		AccountActionsAutoDisable:    envBool("USAGE_ACCOUNT_ACTIONS_AUTO_DISABLE", cfgFile.AccountActionsAutoDisable),
@@ -361,6 +498,39 @@ func splitCSV(value string) []string {
 	return result
 }
 
+func validateConsoleOrigins(origins []string) error {
+	for _, origin := range origins {
+		trimmed := strings.TrimSpace(origin)
+		if trimmed == "" {
+			continue
+		}
+		if trimmed == "*" {
+			return fmt.Errorf("CPAMP_CONSOLE_ORIGINS must contain exact origins, not wildcard")
+		}
+		parsed, err := url.Parse(trimmed)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+			return fmt.Errorf("invalid console origin %q: use an exact http(s) origin without path", trimmed)
+		}
+	}
+	return nil
+}
+
+func normalizeConsoleOrigins(origins []string) []string {
+	normalized := make([]string, 0, len(origins))
+	for _, origin := range origins {
+		trimmed := strings.TrimSpace(origin)
+		if strings.HasSuffix(trimmed, "/") {
+			trimmed = strings.TrimSuffix(trimmed, "/")
+		}
+		if trimmed != "" {
+			normalized = append(normalized, trimmed)
+		}
+	}
+	return normalized
+}
+
 func readSecret(envKey string, fileEnvKey string, defaultFile string) string {
 	if value := strings.TrimSpace(os.Getenv(envKey)); value != "" {
 		return value
@@ -370,9 +540,19 @@ func readSecret(envKey string, fileEnvKey string, defaultFile string) string {
 	if path == "" {
 		path = defaultFile
 	}
+	if path == "" {
+		return ""
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func readSecretOrFallback(envKey string, fileEnvKey string, fallback string) string {
+	if hasEnv(envKey) || hasEnv(fileEnvKey) {
+		return readSecret(envKey, fileEnvKey, "")
+	}
+	return fallback
 }

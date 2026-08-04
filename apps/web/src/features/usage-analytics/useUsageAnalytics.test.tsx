@@ -292,8 +292,9 @@ describe('useUsageAnalytics request orchestration', () => {
     expect(latestResult?.error).toBe('');
     expect(latestResult?.filterOptions).toBeUndefined();
 
-    act(() => {
+    await act(async () => {
       latestResult?.refresh();
+      await Promise.resolve();
     });
     expect(mainRefresh).toHaveBeenCalledTimes(1);
     expect(selectorRefresh).toHaveBeenCalledTimes(1);

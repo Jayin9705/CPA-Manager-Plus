@@ -55,7 +55,7 @@ export function CollectorStatusCard({
   ];
 
   return (
-    <section className={styles.dataCard}>
+    <section className={`${styles.dataCard} dashboard-data-card dashboard-collector-card`}>
       <div className={styles.cardHeader}>
         <h3>{t('dashboard.collector_status_title')}</h3>
       </div>

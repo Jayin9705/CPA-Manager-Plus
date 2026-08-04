@@ -34,9 +34,17 @@ func (e *ImportPersistenceError) Unwrap() error {
 
 type Service struct {
 	store                  *store.Store
+	postgresSource         PostgresUsageSource
 	notifierMu             sync.RWMutex
 	eventsInsertedNotifier func()
 	importSessions         *importSessionManager
+}
+
+type PostgresUsageSource interface {
+	InsertEvents(ctx context.Context, events []usageparser.Event) (store.InsertResult, error)
+	WriteCompatibleUsage(ctx context.Context, writer io.Writer, limit int) error
+	WriteExportJSONL(ctx context.Context, writer io.Writer, limit int) error
+	CountUsageEvents(ctx context.Context) (int64, error)
 }
 
 const importBatchSize = 256
@@ -57,6 +65,13 @@ func New(store *store.Store, options ...Option) *Service {
 	return service
 }
 
+func (s *Service) SetPostgresSource(source PostgresUsageSource) {
+	if s == nil {
+		return
+	}
+	s.postgresSource = source
+}
+
 func (s *Service) SetEventsInsertedNotifier(notifier func()) {
 	s.notifierMu.Lock()
 	s.eventsInsertedNotifier = notifier
@@ -73,10 +88,16 @@ func (s *Service) notifyEventsInserted() {
 }
 
 func (s *Service) WriteCompatibleUsage(ctx context.Context, writer io.Writer, limit int) error {
+	if s.postgresSource != nil {
+		return s.postgresSource.WriteCompatibleUsage(ctx, writer, limit)
+	}
 	return s.store.WriteCompatibleUsage(ctx, writer, limit)
 }
 
 func (s *Service) WriteExport(ctx context.Context, writer io.Writer, limit int) error {
+	if s.postgresSource != nil {
+		return s.postgresSource.WriteExportJSONL(ctx, writer, limit)
+	}
 	return s.store.WriteExportJSONL(ctx, writer, limit)
 }
 
@@ -88,7 +109,13 @@ func (s *Service) Import(ctx context.Context, reader io.Reader) (ImportResult, *
 		contextualReader = &contextReadSeeker{ctx: ctx, reader: seeker}
 	}
 	parsed, err := usageparser.StreamImportPayload(contextualReader, importBatchSize, func(events []usageparser.Event) error {
-		result, err := s.store.InsertEvents(ctx, events)
+		var result store.InsertResult
+		var err error
+		if s.postgresSource != nil {
+			result, err = s.postgresSource.InsertEvents(ctx, events)
+		} else {
+			result, err = s.store.InsertEvents(ctx, events)
+		}
 		if err != nil {
 			return &ImportPersistenceError{err: err}
 		}
@@ -115,6 +142,17 @@ func (s *Service) Import(ctx context.Context, reader io.Reader) (ImportResult, *
 }
 
 func (s *Service) Counts(ctx context.Context) (events int64, deadLetters int64, err error) {
+	if s.postgresSource != nil {
+		events, err = s.postgresSource.CountUsageEvents(ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+		deadLetters, err = s.store.DeadLetters.Count(ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+		return events, deadLetters, nil
+	}
 	return s.store.Counts(ctx)
 }
 

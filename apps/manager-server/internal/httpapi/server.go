@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"embed"
 	"net/http"
 	"time"
 
@@ -11,9 +10,6 @@ import (
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/router"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
 )
-
-//go:embed web/management.html
-var embeddedPanel embed.FS
 
 const serviceID = "cpa-manager-plus"
 
@@ -27,6 +23,17 @@ type Server struct {
 }
 
 func New(cfg config.Config, store *store.Store, collector *collector.Manager, automationRuntimeService ...app.AutomationRuntimeService) *Server {
+	return newServer(cfg, store, collector, !IsAPIOnly(), automationRuntimeService...)
+}
+
+// NewAPI is the pure Go API constructor used by the separated backend image.
+// It intentionally omits the embedded panel routes; the normal New constructor
+// keeps rollback-compatible behavior while api_only builds remain panel-free.
+func NewAPI(cfg config.Config, store *store.Store, collector *collector.Manager, automationRuntimeService ...app.AutomationRuntimeService) *Server {
+	return newServer(cfg, store, collector, false, automationRuntimeService...)
+}
+
+func newServer(cfg config.Config, store *store.Store, collector *collector.Manager, includePanel bool, automationRuntimeService ...app.AutomationRuntimeService) *Server {
 	startedAt := time.Now().UnixMilli()
 	appCtx := app.FromExistingWithModelsDev(
 		cfg,
@@ -40,8 +47,12 @@ func New(cfg config.Config, store *store.Store, collector *collector.Manager, au
 		serviceID,
 		automationRuntimeService...,
 	)
+	handler := router.New(appCtx)
+	if !includePanel {
+		handler = router.NewAPI(appCtx)
+	}
 	return &Server{
-		handler: router.New(appCtx),
+		handler: handler,
 		appCtx:  appCtx,
 	}
 }

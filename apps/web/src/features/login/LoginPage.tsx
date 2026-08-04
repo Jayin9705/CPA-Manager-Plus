@@ -1,6 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Navigate, useLocation, useNavigate } from 'react-router-dom';
-import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
@@ -16,19 +14,13 @@ import {
   IconSun,
   IconTimer,
 } from '@/components/ui/icons';
-import {
-  useAuthStore,
-  useLanguageStore,
-  useNotificationStore,
-  useThemeStore,
-  useUsageServiceStore,
-} from '@/stores';
+import { useThemeStore } from '@/stores/useThemeStore';
 import {
   LEGACY_USAGE_SERVICE_LAST_CPA_BASE_KEY,
   USAGE_SERVICE_LAST_CPA_BASE_KEY,
   getUsageServiceErrorCode,
-  usageServiceApi,
-} from '@/services/api/usageService';
+  loginServiceApi,
+} from './loginApi';
 import {
   detectApiBaseFromLocation,
   normalizeApiBase,
@@ -36,14 +28,44 @@ import {
 } from '@/utils/connection';
 import { LANGUAGE_LABEL_KEYS, LANGUAGE_ORDER } from '@/utils/constants';
 import { isSupportedLanguage } from '@/utils/language';
-import { INLINE_LOGO_JPEG } from '@/assets/logoInline';
 import type { ApiError } from '@/types';
+import { isSeparatedSite } from '@/config/runtimeConfig';
 import { resolveUsageServiceLoginMode } from './loginMode';
+import { loadAuthStore, readStoredLoginState } from './loginRuntime';
+import { useLoginLanguage } from './useLoginLanguage';
 import styles from './LoginPage.module.scss';
 
-type RedirectState = { from?: { pathname?: string } };
 type UsageSetupStep = 'admin' | 'connection' | 'cpaKey' | 'monitoring' | 'polling' | 'review';
 const CONFIG_TAB_STORAGE_KEY = 'config-management:tab';
+const LOGIN_REDIRECT_STORAGE_KEY = 'config-management:login-redirect';
+
+const readLoginRedirect = () => {
+  try {
+    const redirect = sessionStorage.getItem(LOGIN_REDIRECT_STORAGE_KEY);
+    sessionStorage.removeItem(LOGIN_REDIRECT_STORAGE_KEY);
+    return redirect?.startsWith('/') && redirect !== '/' ? redirect : '/dashboard';
+  } catch {
+    return '/dashboard';
+  }
+};
+
+const navigateFromLogin = (path: string) => {
+  if (typeof window === 'undefined') return;
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  const nextHash = `#${normalizedPath}`;
+
+  // HashRouter listens for the browser's native hashchange event. Updating the
+  // URL with history.replaceState requires a synthetic event and can leave the
+  // lightweight login shell mounted while the address already points elsewhere.
+  if (window.location.hash === nextHash) {
+    window.dispatchEvent(new Event('hashchange'));
+    return;
+  }
+
+  window.location.replace(
+    `${window.location.pathname}${window.location.search}${nextHash}`
+  );
+};
 
 function getLocalizedErrorMessage(
   error: unknown,
@@ -102,55 +124,41 @@ function getLocalizedErrorMessage(
 }
 
 export function LoginPage() {
-  const { t } = useTranslation();
-  const navigate = useNavigate();
-  const location = useLocation();
-  const { showNotification } = useNotificationStore();
-  const language = useLanguageStore((state) => state.language);
-  const setLanguage = useLanguageStore((state) => state.setLanguage);
+  const { language, setLanguage, t } = useLoginLanguage();
   const theme = useThemeStore((state) => state.theme);
   const cycleTheme = useThemeStore((state) => state.cycleTheme);
-  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
-  const login = useAuthStore((state) => state.login);
-  const restoreSession = useAuthStore((state) => state.restoreSession);
-  const storedBase = useAuthStore((state) => state.apiBase);
-  const storedKey = useAuthStore((state) => state.managementKey);
-  const storedRememberPassword = useAuthStore((state) => state.rememberPassword);
-  const setUsageServiceConfig = useUsageServiceStore((state) => state.setUsageServiceConfig);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
 
-  const [apiBase, setApiBase] = useState('');
-  const [adminKey, setAdminKey] = useState('');
-  const [cpaManagementKey, setCPAManagementKey] = useState('');
+  const detectedBase = useMemo(() => detectApiBaseFromLocation(), []);
+  const storedLoginState = useMemo(readStoredLoginState, []);
+  const storedBase = storedLoginState.apiBase;
+  const storedKey = storedLoginState.managementKey;
+  const storedRememberPassword = storedLoginState.rememberPassword;
+  const [apiBase, setApiBase] = useState(() => storedBase || detectedBase);
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [cpaManagementKey, setCPAManagementKey] = useState(() => storedKey || '');
   const [showCustomBase, setShowCustomBase] = useState(false);
-  const [showAdminKey, setShowAdminKey] = useState(false);
+  const [showAdminPassword, setShowAdminPassword] = useState(false);
   const [showCPAManagementKey, setShowCPAManagementKey] = useState(false);
-  const [rememberCredential, setRememberCredential] = useState(false);
+  const [rememberCredential, setRememberCredential] = useState(
+    () => storedRememberPassword || Boolean(storedKey)
+  );
   const [requestMonitoringEnabled, setRequestMonitoringEnabled] = useState(true);
   const [pollIntervalMs, setPollIntervalMs] = useState('500');
   const [loading, setLoading] = useState(false);
-  const [autoLoading, setAutoLoading] = useState(true);
   const [autoLoginSuccess, setAutoLoginSuccess] = useState(false);
   const [error, setError] = useState('');
-  const [hostedByUsageService, setHostedByUsageService] = useState(false);
+  // The separated console is always backed by Manager Server. Start in that
+  // mode so a slow/temporarily unavailable info probe cannot render the
+  // unrelated CPA management-key form.
+  const [hostedByUsageService, setHostedByUsageService] = useState(() => isSeparatedSite());
   const [usageServiceNeedsSetup, setUsageServiceNeedsSetup] = useState(false);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
-  const [hasHistoricalData, setHasHistoricalData] = useState(false);
-  const [migrationStatus, setMigrationStatus] = useState('');
   const [usageSetupStep, setUsageSetupStep] = useState<UsageSetupStep>('admin');
+  const loginRedirect = useMemo(() => readLoginRedirect(), []);
 
-  const detectedBase = useMemo(() => detectApiBaseFromLocation(), []);
   const isManagerServerMode = hostedByUsageService;
-  const loginCredential = isManagerServerMode ? adminKey : cpaManagementKey;
-  const loginCredentialLabel = isManagerServerMode
-    ? t('login.admin_key_label')
-    : t('login.cpa_management_key_label');
-  const loginCredentialPlaceholder = isManagerServerMode
-    ? t('login.admin_key_placeholder')
-    : t('login.cpa_management_key_placeholder');
-  const loginCredentialHint = isManagerServerMode
-    ? t('login.admin_key_hint')
-    : t('login.cpa_management_key_hint');
 
   const usageSetupSteps = useMemo<UsageSetupStep[]>(
     () => [
@@ -168,7 +176,7 @@ export function LoginPage() {
   const usageSetupIsLastStep = usageSetupStep === 'review';
   const usageSetupStepLabels = useMemo<Record<UsageSetupStep, string>>(
     () => ({
-      admin: t('login.step_admin_key'),
+      admin: t('login.step_admin_account'),
       connection: t('login.step_connection'),
       cpaKey: t('login.step_cpa_key'),
       monitoring: t('login.step_monitoring'),
@@ -221,85 +229,68 @@ export function LoginPage() {
 
   useEffect(() => {
     const init = async () => {
+      let detectedUsageService = false;
+      let detectedUsageServiceConfigured = false;
       try {
-        let detectedUsageService = false;
-        let detectedUsageServiceConfigured = false;
-        try {
-          const info = await usageServiceApi.getInfo(detectedBase);
-          const mode = resolveUsageServiceLoginMode(info);
-          detectedUsageService = mode.hostedByUsageService;
-          detectedUsageServiceConfigured = detectedUsageService && !mode.usageServiceNeedsSetup;
-          setHostedByUsageService(mode.hostedByUsageService);
-          setUsageServiceNeedsSetup(mode.usageServiceNeedsSetup);
-          setHasHistoricalData(Boolean(info.hasHistoricalData));
-          setMigrationStatus(info.migrationStatus || '');
-        } catch {
-          detectedUsageService = false;
-          detectedUsageServiceConfigured = false;
-          setHostedByUsageService(false);
-          setUsageServiceNeedsSetup(false);
-          setHasHistoricalData(false);
-          setMigrationStatus('');
-        }
+        const info = await loginServiceApi.getInfo(detectedBase, 5000);
+        const mode = resolveUsageServiceLoginMode(info);
+        detectedUsageService = mode.hostedByUsageService;
+        detectedUsageServiceConfigured = detectedUsageService && !mode.usageServiceNeedsSetup;
+        setHostedByUsageService(mode.hostedByUsageService);
+        setUsageServiceNeedsSetup(mode.usageServiceNeedsSetup);
+      } catch {
+        detectedUsageService = false;
+        detectedUsageServiceConfigured = false;
+        setHostedByUsageService(false);
+        setUsageServiceNeedsSetup(false);
+      }
 
-        const hostedManagementPage =
-          typeof window !== 'undefined' && /\/management\.html$/i.test(window.location.pathname);
-        const autoLoginExpectedPanelBase =
-          detectedUsageService || hostedManagementPage ? detectedBase : undefined;
-        const autoLoggedIn = await restoreSession({
+      // Do not pull the full authenticated application into the first paint.
+      // A manager session must still be checked, while a fresh external-panel
+      // login can remain completely local until the user submits the form.
+      const hasStoredExternalSession = Boolean(storedKey);
+      if (detectedUsageService || hasStoredExternalSession) {
+        const authStore = await loadAuthStore();
+        const autoLoggedIn = await authStore.getState().restoreSession({
           expectedMode: detectedUsageService ? 'manager_embedded' : 'external_panel',
-          expectedPanelBase: autoLoginExpectedPanelBase,
+          expectedPanelBase: detectedUsageService ? detectedBase : undefined,
         });
-        if (detectedUsageService) {
-          setUsageServiceConfig(
-            { enabled: true, serviceBase: detectedBase },
-            { panelBase: detectedBase, panelHostMode: 'manager_embedded' }
-          );
-        }
         if (autoLoggedIn) {
           setAutoLoginSuccess(true);
-          setTimeout(() => {
-            const redirect =
-              autoLoggedIn.recoveryMode === 'manager_config'
-                ? '/config'
-                : (location.state as RedirectState | null)?.from?.pathname || '/';
-            if (autoLoggedIn.recoveryMode === 'manager_config') {
-              localStorage.setItem(CONFIG_TAB_STORAGE_KEY, 'manager');
-            }
-            navigate(redirect, { replace: true });
-          }, 1500);
+          const redirect =
+            autoLoggedIn.recoveryMode === 'manager_config' ? '/config' : loginRedirect;
+          if (autoLoggedIn.recoveryMode === 'manager_config') {
+            localStorage.setItem(CONFIG_TAB_STORAGE_KEY, 'manager');
+          }
+          navigateFromLogin(redirect);
           return;
         }
-
-        const lastCPAForUsageService =
-          localStorage.getItem(USAGE_SERVICE_LAST_CPA_BASE_KEY) ||
-          localStorage.getItem(LEGACY_USAGE_SERVICE_LAST_CPA_BASE_KEY) ||
-          '';
-        const defaultCPAConnectionBase = resolveDefaultCPAConnectionBase({
-          hostedByUsageService: detectedUsageService,
-          currentBase: detectedBase,
-        });
-        setApiBase(
-          detectedUsageService
-            ? detectedUsageServiceConfigured
-              ? detectedBase
-              : lastCPAForUsageService || defaultCPAConnectionBase
-            : storedBase || detectedBase
-        );
-        setShowCustomBase(detectedUsageService && !detectedUsageServiceConfigured);
-        if (detectedUsageService) {
-          setAdminKey(storedKey || '');
-          setCPAManagementKey('');
-        } else {
-          setAdminKey('');
-          setCPAManagementKey(storedKey || '');
-        }
-        setRememberCredential(storedRememberPassword || Boolean(storedKey));
-      } finally {
-        if (!autoLoginSuccess) {
-          setAutoLoading(false);
-        }
       }
+
+      const lastCPAForUsageService =
+        localStorage.getItem(USAGE_SERVICE_LAST_CPA_BASE_KEY) ||
+        localStorage.getItem(LEGACY_USAGE_SERVICE_LAST_CPA_BASE_KEY) ||
+        '';
+      const defaultCPAConnectionBase = resolveDefaultCPAConnectionBase({
+        hostedByUsageService: detectedUsageService,
+        currentBase: detectedBase,
+      });
+      setApiBase(
+        detectedUsageService
+          ? detectedUsageServiceConfigured
+            ? detectedBase
+            : lastCPAForUsageService || defaultCPAConnectionBase
+          : storedBase || detectedBase
+      );
+      setShowCustomBase(detectedUsageService && !detectedUsageServiceConfigured);
+      if (detectedUsageService) {
+        setCPAManagementKey('');
+      } else {
+        setCPAManagementKey(storedKey || '');
+      }
+      setRememberCredential(
+        storedRememberPassword || (!detectedUsageService && Boolean(storedKey))
+      );
     };
 
     init();
@@ -314,9 +305,15 @@ export function LoginPage() {
 
   const validateUsageSetupStep = useCallback(
     (step: UsageSetupStep) => {
-      if (step === 'admin' && !adminKey.trim()) {
-        setError(t('login.admin_key_required'));
-        return false;
+      if (step === 'admin') {
+        if (!adminEmail.trim()) {
+          setError(t('login.email_required'));
+          return false;
+        }
+        if (!adminPassword) {
+          setError(t('login.password_required'));
+          return false;
+        }
       }
       if (step === 'connection' && !apiBase.trim()) {
         setError(t('login.cpa_address_required'));
@@ -340,7 +337,7 @@ export function LoginPage() {
       setError('');
       return true;
     },
-    [adminKey, apiBase, cpaManagementKey, pollIntervalMs, t]
+    [adminEmail, adminPassword, apiBase, cpaManagementKey, pollIntervalMs, t]
   );
 
   const handleUsageSetupNext = useCallback(() => {
@@ -363,13 +360,17 @@ export function LoginPage() {
       return;
     }
 
-    const trimmedAdminKey = adminKey.trim();
+    const trimmedAdminEmail = adminEmail.trim();
     const trimmedCPAKey = cpaManagementKey.trim();
     const baseToUse = apiBase ? normalizeApiBase(apiBase) : detectedBase;
 
     if (usageServiceNeedsSetup) {
-      if (!trimmedAdminKey) {
-        setError(t('login.admin_key_required'));
+      if (!trimmedAdminEmail) {
+        setError(t('login.email_required'));
+        return;
+      }
+      if (!adminPassword) {
+        setError(t('login.password_required'));
         return;
       }
       if (!apiBase.trim()) {
@@ -381,8 +382,12 @@ export function LoginPage() {
         return;
       }
     } else if (isManagerServerMode) {
-      if (!trimmedAdminKey) {
-        setError(t('login.admin_key_required'));
+      if (!trimmedAdminEmail) {
+        setError(t('login.email_required'));
+        return;
+      }
+      if (!adminPassword) {
+        setError(t('login.password_required'));
         return;
       }
     } else if (!trimmedCPAKey) {
@@ -406,64 +411,58 @@ export function LoginPage() {
     setError('');
     try {
       if (usageServiceNeedsSetup) {
-        await usageServiceApi.setup(
-          detectedBase,
-          {
-            cpaBaseUrl: baseToUse,
-            cpaManagementKey: trimmedCPAKey,
-            pollIntervalMs: requestMonitoringEnabled ? parsedPollIntervalMs : undefined,
-            ensureUsageStatisticsEnabled: requestMonitoringEnabled,
-            requestMonitoringEnabled,
-          },
-          trimmedAdminKey
-        );
-        setUsageServiceConfig(
-          { enabled: true, serviceBase: detectedBase },
-          { panelBase: detectedBase, panelHostMode: 'manager_embedded' }
-        );
+        // Setup is protected by the same HttpOnly session as the rest of the
+        // Manager UI, so authenticate before sending any deployment settings.
+        await loginServiceApi.login(detectedBase, {
+          email: trimmedAdminEmail,
+          password: adminPassword,
+          remember: rememberCredential,
+        });
+        await loginServiceApi.setup(detectedBase, {
+          cpaBaseUrl: baseToUse,
+          cpaManagementKey: trimmedCPAKey,
+          pollIntervalMs: requestMonitoringEnabled ? parsedPollIntervalMs : undefined,
+          ensureUsageStatisticsEnabled: requestMonitoringEnabled,
+          requestMonitoringEnabled,
+        });
         localStorage.setItem(USAGE_SERVICE_LAST_CPA_BASE_KEY, baseToUse);
-      } else if (isManagerServerMode) {
-        setUsageServiceConfig(
-          { enabled: true, serviceBase: detectedBase },
-          { panelBase: detectedBase, panelHostMode: 'manager_embedded' }
-        );
       }
 
-      const loginResult = await login({
+      const authStore = await loadAuthStore();
+      const loginResult = await authStore.getState().login({
         apiBase: isManagerServerMode ? detectedBase : baseToUse,
-        managementKey: isManagerServerMode ? trimmedAdminKey : trimmedCPAKey,
+        managementKey: isManagerServerMode ? undefined : trimmedCPAKey,
+        email: isManagerServerMode ? trimmedAdminEmail : undefined,
+        password: isManagerServerMode ? adminPassword : undefined,
         rememberPassword: rememberCredential,
         sessionMode: isManagerServerMode ? 'manager_embedded' : 'external_panel',
         sessionPanelBase: detectedBase,
+        managerSessionEstablished: usageServiceNeedsSetup,
       });
-      showNotification(t('common.connected_status'), 'success');
+      setAdminPassword('');
       if (loginResult.recoveryMode === 'manager_config') {
         localStorage.setItem(CONFIG_TAB_STORAGE_KEY, 'manager');
-        navigate('/config', { replace: true });
+        navigateFromLogin('/config');
       } else {
-        navigate('/', { replace: true });
+        navigateFromLogin('/dashboard');
       }
     } catch (err: unknown) {
       const message = getLocalizedErrorMessage(err, t);
       setError(message);
-      showNotification(`${t('notification.login_failed')}: ${message}`, 'error');
     } finally {
       setLoading(false);
     }
   }, [
-    adminKey,
+    adminEmail,
+    adminPassword,
     apiBase,
     cpaManagementKey,
     detectedBase,
     handleUsageSetupNext,
     isManagerServerMode,
-    login,
-    navigate,
     pollIntervalMs,
     rememberCredential,
     requestMonitoringEnabled,
-    setUsageServiceConfig,
-    showNotification,
     t,
     usageServiceNeedsSetup,
     usageSetupIsLastStep,
@@ -479,24 +478,47 @@ export function LoginPage() {
     [handleSubmit, loading]
   );
 
-  if (isAuthenticated && !autoLoading && !autoLoginSuccess) {
-    const redirect = (location.state as RedirectState | null)?.from?.pathname || '/';
-    return <Navigate to={redirect} replace />;
-  }
+  const handleCardPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const card = event.currentTarget;
+    const bounds = card.getBoundingClientRect();
+    const x = ((event.clientX - bounds.left) / bounds.width) * 100;
+    const y = ((event.clientY - bounds.top) / bounds.height) * 100;
+    card.style.setProperty('--pointer-x', `${Math.max(0, Math.min(100, x))}%`);
+    card.style.setProperty('--pointer-y', `${Math.max(0, Math.min(100, y))}%`);
+    card.style.setProperty('--card-rotate-x', `${((50 - y) * 0.07).toFixed(2)}deg`);
+    card.style.setProperty('--card-rotate-y', `${((x - 50) * 0.07).toFixed(2)}deg`);
+  }, []);
 
-  const showSplash = autoLoading || autoLoginSuccess;
+  const handleCardPointerLeave = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const card = event.currentTarget;
+    card.style.setProperty('--pointer-x', '50%');
+    card.style.setProperty('--pointer-y', '0%');
+    card.style.setProperty('--card-rotate-x', '0deg');
+    card.style.setProperty('--card-rotate-y', '0deg');
+  }, []);
 
-  const renderKeyToggle = (visible: boolean, toggle: () => void) => (
-    <button
-      type="button"
-      className="btn btn-ghost btn-xs btn-icon-only"
-      onClick={toggle}
-      aria-label={visible ? t('login.hide_key') : t('login.show_key')}
-      title={visible ? t('login.hide_key') : t('login.show_key')}
-    >
-      {visible ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-    </button>
-  );
+  const showSplash = autoLoginSuccess;
+
+  const renderSecretToggle = (
+    visible: boolean,
+    toggle: () => void,
+    kind: 'key' | 'password' = 'key'
+  ) => {
+    const label = visible
+      ? t(kind === 'password' ? 'login.hide_password' : 'login.hide_key')
+      : t(kind === 'password' ? 'login.show_password' : 'login.show_key');
+    return (
+      <button
+        type="button"
+        className="btn btn-ghost btn-xs btn-icon-only"
+        onClick={toggle}
+        aria-label={label}
+        title={label}
+      >
+        {visible ? <IconEyeOff size={16} /> : <IconEye size={16} />}
+      </button>
+    );
+  };
 
   return (
     <div className={styles.container}>
@@ -523,11 +545,7 @@ export function LoginPage() {
             <IconLanguages size={17} />
           </button>
           {languageMenuOpen && (
-            <div
-              className={styles.languagePopover}
-              role="menu"
-              aria-label={t('language.switch')}
-            >
+            <div className={styles.languagePopover} role="menu" aria-label={t('language.switch')}>
               {LANGUAGE_ORDER.map((lang) => (
                 <button
                   key={lang}
@@ -547,12 +565,25 @@ export function LoginPage() {
         </div>
       </div>
 
+      <div className={styles.techDecor} aria-hidden="true">
+        <span className={`${styles.techOrb} ${styles.techOrbPrimary}`} />
+        <span className={`${styles.techOrb} ${styles.techOrbSecondary}`} />
+        <span className={`${styles.techOrb} ${styles.techOrbTertiary}`} />
+        <span className={styles.techCrosshair} />
+        <span className={`${styles.orbitRing} ${styles.orbitRingPrimary}`} />
+        <span className={`${styles.orbitRing} ${styles.orbitRingSecondary}`} />
+        <span className={`${styles.dataStream} ${styles.dataStreamA}`} />
+        <span className={`${styles.dataStream} ${styles.dataStreamB}`} />
+        <span className={`${styles.dataStream} ${styles.dataStreamC}`} />
+        <span className={`${styles.techParticle} ${styles.techParticleA}`} />
+        <span className={`${styles.techParticle} ${styles.techParticleB}`} />
+        <span className={`${styles.techParticle} ${styles.techParticleC}`} />
+        <span className={`${styles.techParticle} ${styles.techParticleD}`} />
+      </div>
+
       <div className={styles.formPanel}>
         {showSplash ? (
-          <div className={styles.splashContent}>
-            <img src={INLINE_LOGO_JPEG} alt="CPAMP" className={styles.splashLogo} />
-            <h1 className={styles.splashTitle}>{t('splash.title')}</h1>
-            <p className={styles.splashSubtitle}>{t('splash.subtitle')}</p>
+          <div className={styles.splashContent} role="status" aria-label={t('common.loading')}>
             <div className={styles.splashLoader}>
               <div className={styles.splashLoaderBar} />
             </div>
@@ -563,17 +594,13 @@ export function LoginPage() {
               usageServiceNeedsSetup ? styles.setupFormContent : ''
             }`}
           >
-            <div className={`${styles.loginCard} ${usageServiceNeedsSetup ? styles.setupCard : ''}`}>
+            <div
+              className={`${styles.loginCard} ${usageServiceNeedsSetup ? styles.setupCard : ''}`}
+              onPointerMove={handleCardPointerMove}
+              onPointerLeave={handleCardPointerLeave}
+            >
               <div className={styles.cardBranding}>
-                <img src={INLINE_LOGO_JPEG} alt="CPA Manager Plus" className={styles.logo} />
-                <h1>CPA Manager Plus</h1>
-                <p>
-                  {usageServiceNeedsSetup
-                    ? t('login.docker_setup_subtitle')
-                    : isManagerServerMode
-                      ? t('login.docker_login_subtitle')
-                      : t('login.subtitle')}
-                </p>
+                <h1>{usageServiceNeedsSetup ? t('login.setup_title') : t('common.login')}</h1>
               </div>
 
               {usageServiceNeedsSetup && (
@@ -612,31 +639,29 @@ export function LoginPage() {
 
                     {usageSetupStep === 'admin' && (
                       <div className={styles.stepFields}>
-                        <div className={styles.connectionBox}>
-                          <div className={styles.connectionIcon}>
-                            <IconShield size={18} />
-                          </div>
-                          <div className={styles.connectionCopy}>
-                            <div className={styles.label}>{t('login.usage_service_address')}</div>
-                            <div className={styles.value}>{detectedBase}</div>
-                            <div className={styles.hint}>
-                              {hasHistoricalData || migrationStatus
-                                ? t('login.migration_detected_hint')
-                                : t('login.admin_key_setup_hint')}
-                            </div>
-                          </div>
-                        </div>
                         <Input
                           autoFocus
-                          label={t('login.admin_key_label')}
-                          placeholder={t('login.admin_key_placeholder')}
-                          type={showAdminKey ? 'text' : 'password'}
-                          value={adminKey}
-                          onChange={(event) => setAdminKey(event.target.value)}
+                          label={t('login.email_label')}
+                          placeholder={t('login.email_placeholder')}
+                          type="email"
+                          autoComplete="username"
+                          value={adminEmail}
+                          onChange={(event) => setAdminEmail(event.target.value)}
                           onKeyDown={handleSubmitKeyDown}
-                          hint={t('login.admin_key_hint')}
-                          rightElement={renderKeyToggle(showAdminKey, () =>
-                            setShowAdminKey((prev) => !prev)
+                          hint={t('login.admin_account_hint')}
+                        />
+                        <Input
+                          label={t('login.password_label')}
+                          placeholder={t('login.password_placeholder')}
+                          type={showAdminPassword ? 'text' : 'password'}
+                          autoComplete="current-password"
+                          value={adminPassword}
+                          onChange={(event) => setAdminPassword(event.target.value)}
+                          onKeyDown={handleSubmitKeyDown}
+                          rightElement={renderSecretToggle(
+                            showAdminPassword,
+                            () => setShowAdminPassword((prev) => !prev),
+                            'password'
                           )}
                         />
                       </div>
@@ -667,7 +692,7 @@ export function LoginPage() {
                           onChange={(event) => setCPAManagementKey(event.target.value)}
                           onKeyDown={handleSubmitKeyDown}
                           hint={t('login.cpa_management_key_hint')}
-                          rightElement={renderKeyToggle(showCPAManagementKey, () =>
+                          rightElement={renderSecretToggle(showCPAManagementKey, () =>
                             setShowCPAManagementKey((prev) => !prev)
                           )}
                         />
@@ -715,8 +740,8 @@ export function LoginPage() {
                           <SelectionCheckbox
                             checked={rememberCredential}
                             onChange={setRememberCredential}
-                            ariaLabel={t('login.remember_credential_label')}
-                            label={t('login.remember_credential_label')}
+                            ariaLabel={t('login.remember_session_label')}
+                            label={t('login.remember_session_label')}
                             labelClassName={styles.toggleLabel}
                           />
                         </div>
@@ -725,14 +750,21 @@ export function LoginPage() {
                             <span className={styles.reviewIcon}>
                               <IconShield size={18} />
                             </span>
-                            <span>{t('login.admin_key_label')}</span>
-                            <strong>{adminKey ? '************' : '-'}</strong>
+                            <span>{t('login.email_label')}</span>
+                            <strong>{adminEmail || '-'}</strong>
+                          </div>
+                          <div>
+                            <span className={styles.reviewIcon}>
+                              <IconShield size={18} />
+                            </span>
+                            <span>{t('login.password_label')}</span>
+                            <strong>{adminPassword ? '************' : '-'}</strong>
                           </div>
                           <div>
                             <span className={styles.reviewIcon}>
                               <IconKey size={18} />
                             </span>
-                            <span>{t('login.remember_credential_label')}</span>
+                            <span>{t('login.remember_session_label')}</span>
                             <strong>
                               {rememberCredential ? t('common.enabled') : t('common.disabled')}
                             </strong>
@@ -810,16 +842,6 @@ export function LoginPage() {
 
               {!usageServiceNeedsSetup && (
                 <div className={styles.loginForm}>
-                  <div className={styles.connectionBox}>
-                    <div className={styles.label}>{t('login.connection_current')}</div>
-                    <div className={styles.value}>{apiBase || detectedBase}</div>
-                    <div className={styles.hint}>
-                      {isManagerServerMode
-                        ? t('login.usage_service_configured_hint')
-                        : t('login.connection_auto_hint')}
-                    </div>
-                  </div>
-
                   {!isManagerServerMode && (
                     <>
                       <div className={styles.toggleAdvanced}>
@@ -844,36 +866,63 @@ export function LoginPage() {
                     </>
                   )}
 
-                  <Input
-                    autoFocus
-                    label={loginCredentialLabel}
-                    placeholder={loginCredentialPlaceholder}
-                    type={
-                      (isManagerServerMode ? showAdminKey : showCPAManagementKey) ? 'text' : 'password'
-                    }
-                    value={loginCredential}
-                    onChange={(event) =>
-                      isManagerServerMode
-                        ? setAdminKey(event.target.value)
-                        : setCPAManagementKey(event.target.value)
-                    }
-                    onKeyDown={handleSubmitKeyDown}
-                    hint={loginCredentialHint}
-                    rightElement={renderKeyToggle(
-                      isManagerServerMode ? showAdminKey : showCPAManagementKey,
-                      () =>
-                        isManagerServerMode
-                          ? setShowAdminKey((prev) => !prev)
-                          : setShowCPAManagementKey((prev) => !prev)
-                    )}
-                  />
+                  {isManagerServerMode ? (
+                    <>
+                      <Input
+                        autoFocus
+                        label={t('login.email_label')}
+                        placeholder={t('login.email_placeholder')}
+                        type="email"
+                        autoComplete="username"
+                        value={adminEmail}
+                        onChange={(event) => setAdminEmail(event.target.value)}
+                        onKeyDown={handleSubmitKeyDown}
+                        hint={t('login.admin_account_hint')}
+                      />
+                      <Input
+                        label={t('login.password_label')}
+                        placeholder={t('login.password_placeholder')}
+                        type={showAdminPassword ? 'text' : 'password'}
+                        autoComplete="current-password"
+                        value={adminPassword}
+                        onChange={(event) => setAdminPassword(event.target.value)}
+                        onKeyDown={handleSubmitKeyDown}
+                        rightElement={renderSecretToggle(
+                          showAdminPassword,
+                          () => setShowAdminPassword((prev) => !prev),
+                          'password'
+                        )}
+                      />
+                    </>
+                  ) : (
+                    <Input
+                      autoFocus
+                      label={t('login.management_key_label')}
+                      placeholder={t('login.management_key_placeholder')}
+                      type={showCPAManagementKey ? 'text' : 'password'}
+                      value={cpaManagementKey}
+                      onChange={(event) => setCPAManagementKey(event.target.value)}
+                      onKeyDown={handleSubmitKeyDown}
+                      rightElement={renderSecretToggle(showCPAManagementKey, () =>
+                        setShowCPAManagementKey((prev) => !prev)
+                      )}
+                    />
+                  )}
 
                   <div className={styles.toggleAdvanced}>
                     <SelectionCheckbox
                       checked={rememberCredential}
                       onChange={setRememberCredential}
-                      ariaLabel={t('login.remember_credential_label')}
-                      label={t('login.remember_credential_label')}
+                      ariaLabel={t(
+                        isManagerServerMode
+                          ? 'login.remember_session_label'
+                          : 'login.remember_credential_label'
+                      )}
+                      label={t(
+                        isManagerServerMode
+                          ? 'login.remember_session_label'
+                          : 'login.remember_credential_label'
+                      )}
                       labelClassName={styles.toggleLabel}
                     />
                   </div>

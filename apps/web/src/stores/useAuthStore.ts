@@ -23,6 +23,8 @@ import { useQuotaStore } from './useQuotaStore';
 import { useUsageServiceStore } from './useUsageServiceStore';
 import { detectApiBaseFromLocation, normalizeApiBase } from '@/utils/connection';
 import { sha256Hex } from '@/utils/apiKeyHash';
+import { normalizeServerMetadataValue } from '@/utils/serverMetadata';
+import { clearCsrfToken } from '@/services/security/csrf';
 
 interface AuthStoreState extends AuthState {
   sessionMode: AuthSessionMode | '';
@@ -32,7 +34,7 @@ interface AuthStoreState extends AuthState {
 
   // 操作
   login: (credentials: LoginCredentials) => Promise<LoginResult>;
-  logout: () => void;
+  logout: () => Promise<void>;
   checkAuth: () => Promise<boolean>;
   restoreSession: (options?: RestoreSessionOptions) => Promise<RestoreSessionResult>;
   updateServerVersion: (version: string | null, buildDate?: string | null) => void;
@@ -70,6 +72,50 @@ const sessionMatchesExpectedRuntime = ({
   return true;
 };
 
+const configureApiClient = (
+  apiBase: string,
+  sessionMode: AuthSessionMode | '',
+  managementKey: string
+) => {
+  const managerSession = sessionMode === 'manager_embedded';
+  apiClient.setConfig({
+    apiBase,
+    managementKey: managerSession ? '' : managementKey,
+    withCredentials: managerSession,
+  });
+};
+
+const validateAuthenticatedConnection = async ({
+  apiBase,
+  sessionMode,
+  sessionPanelBase,
+}: {
+  apiBase: string;
+  sessionMode: AuthSessionMode | '';
+  sessionPanelBase: string;
+}): Promise<LoginResult> => {
+  try {
+    await useConfigStore.getState().fetchConfig(undefined, true);
+    return {};
+  } catch (error) {
+    if (sessionMode !== 'manager_embedded') throw error;
+
+    await usageServiceApi.getManagerConfig(apiBase);
+    useConfigStore.getState().clearCache();
+    useUsageServiceStore.getState().setUsageServiceConfig(
+      {
+        enabled: true,
+        serviceBase: apiBase,
+      },
+      {
+        panelBase: sessionPanelBase || apiBase,
+        panelHostMode: 'manager_embedded',
+      }
+    );
+    return { recoveryMode: 'manager_config' };
+  }
+};
+
 export const useAuthStore = create<AuthStoreState>()(
   persist(
     (set, get) => ({
@@ -99,20 +145,35 @@ export const useAuthStore = create<AuthStoreState>()(
             obfuscatedStorage.getItem<string>('apiUrl', { encrypt: true });
           const legacyKey = obfuscatedStorage.getItem<string>('managementKey');
 
-          const { apiBase, managementKey, rememberPassword, sessionMode } = get();
-          const resolvedBase = normalizeApiBase(apiBase || legacyBase || detectApiBaseFromLocation());
-          const resolvedKey = managementKey || legacyKey || '';
-          const resolvedRememberPassword = rememberPassword || Boolean(managementKey) || Boolean(legacyKey);
+          const current = get();
+          const expectedPanelBase = normalizeApiBase(options?.expectedPanelBase || '');
+          const resolvedMode = options?.expectedMode ?? current.sessionMode;
+          let resolvedBase = normalizeApiBase(
+            resolvedMode === 'manager_embedded' && expectedPanelBase
+              ? expectedPanelBase
+              : current.apiBase || legacyBase || expectedPanelBase || detectApiBaseFromLocation()
+          );
+          let resolvedKey =
+            resolvedMode === 'manager_embedded'
+              ? ''
+              : current.managementKey || legacyKey || '';
+          let resolvedRememberPassword =
+            resolvedMode === 'manager_embedded'
+              ? current.rememberPassword
+              : current.rememberPassword || Boolean(current.managementKey) || Boolean(legacyKey);
 
           if (
             !sessionMatchesExpectedRuntime({
               expectedMode: options?.expectedMode,
               expectedPanelBase: options?.expectedPanelBase,
               resolvedBase,
-              sessionMode,
+              sessionMode: current.sessionMode,
             })
           ) {
             const fallbackBase = normalizeApiBase(options?.expectedPanelBase || detectApiBaseFromLocation());
+            resolvedBase = fallbackBase;
+            resolvedKey = '';
+            resolvedRememberPassword = false;
             set({
               apiBase: fallbackBase,
               managementKey: '',
@@ -120,28 +181,63 @@ export const useAuthStore = create<AuthStoreState>()(
               sessionMode: options?.expectedMode ?? '',
               sessionPanelBase: normalizeApiBase(options?.expectedPanelBase || ''),
             });
-            apiClient.setConfig({ apiBase: fallbackBase, managementKey: '' });
+            configureApiClient(fallbackBase, options?.expectedMode ?? '', '');
             localStorage.removeItem('isLoggedIn');
-            return false;
+            if (options?.expectedMode !== 'manager_embedded') return false;
           }
 
           set({
             apiBase: resolvedBase,
             managementKey: resolvedKey,
             rememberPassword: resolvedRememberPassword,
-            sessionMode: options?.expectedMode ?? sessionMode,
+            sessionMode: resolvedMode,
             sessionPanelBase: normalizeApiBase(options?.expectedPanelBase || get().sessionPanelBase)
           });
-          apiClient.setConfig({ apiBase: resolvedBase, managementKey: resolvedKey });
+          configureApiClient(resolvedBase, resolvedMode, resolvedKey);
+
+          if (resolvedMode === 'manager_embedded' && resolvedBase) {
+            try {
+              await usageServiceApi.getSession(resolvedBase);
+              const sessionPanelBase = normalizeApiBase(
+                options?.expectedPanelBase || get().sessionPanelBase || resolvedBase
+              );
+              const result = await validateAuthenticatedConnection({
+                apiBase: resolvedBase,
+                sessionMode: resolvedMode,
+                sessionPanelBase,
+              });
+              useQuotaStore
+                .getState()
+                .activateQuotaCacheScope(sha256Hex(`${resolvedBase}\u0000manager-session`));
+              useUsageServiceStore.getState().setUsageServiceConfig(
+                { enabled: true, serviceBase: resolvedBase },
+                { panelBase: sessionPanelBase, panelHostMode: 'manager_embedded' }
+              );
+              set({
+                isAuthenticated: true,
+                apiBase: resolvedBase,
+                managementKey: '',
+                sessionMode: resolvedMode,
+                sessionPanelBase,
+                connectionStatus: 'connected',
+                connectionError: null,
+              });
+              localStorage.removeItem('isLoggedIn');
+              return result.recoveryMode ? result : {};
+            } catch (error) {
+              console.warn('Manager session restore failed:', error);
+              set({ isAuthenticated: false, connectionStatus: 'disconnected' });
+              return false;
+            }
+          }
 
           if (wasLoggedIn && resolvedBase && resolvedKey) {
             try {
-              const restoredSessionMode = options?.expectedMode ?? (sessionMode || undefined);
               const result = await get().login({
                 apiBase: resolvedBase,
                 managementKey: resolvedKey,
                 rememberPassword: resolvedRememberPassword,
-                sessionMode: restoredSessionMode,
+                sessionMode: resolvedMode || undefined,
                 sessionPanelBase: options?.expectedPanelBase || get().sessionPanelBase,
               });
               return result.recoveryMode ? result : {};
@@ -160,15 +256,18 @@ export const useAuthStore = create<AuthStoreState>()(
       // 登录
       login: async (credentials) => {
         const apiBase = normalizeApiBase(credentials.apiBase);
-        const managementKey = credentials.managementKey.trim();
         const rememberPassword = credentials.rememberPassword ?? get().rememberPassword ?? false;
         const sessionMode = credentials.sessionMode ?? get().sessionMode;
         const sessionPanelBase = normalizeApiBase(credentials.sessionPanelBase || get().sessionPanelBase);
-        const quotaCacheScope = sha256Hex(`${apiBase}\u0000${managementKey}`);
+        const managerSession = sessionMode === 'manager_embedded';
+        const managementKey = managerSession ? '' : (credentials.managementKey || '').trim();
+        const quotaCacheScope = sha256Hex(
+          `${apiBase}\u0000${managerSession ? 'manager-session' : managementKey}`
+        );
 
         const markAuthenticated = (result: LoginResult = {}) => {
           useQuotaStore.getState().activateQuotaCacheScope(quotaCacheScope);
-          apiClient.setConfig({ apiBase, managementKey });
+          configureApiClient(apiBase, sessionMode, managementKey);
           set({
             isAuthenticated: true,
             apiBase,
@@ -179,7 +278,7 @@ export const useAuthStore = create<AuthStoreState>()(
             connectionStatus: 'connected',
             connectionError: null
           });
-          if (rememberPassword) {
+          if (!managerSession && rememberPassword) {
             localStorage.setItem('isLoggedIn', 'true');
           } else {
             localStorage.removeItem('isLoggedIn');
@@ -189,38 +288,39 @@ export const useAuthStore = create<AuthStoreState>()(
 
         try {
           set({ connectionStatus: 'connecting', supportsPlugin: false });
+          set({ serverVersion: null, serverBuildDate: null });
           useModelsStore.getState().clearCache();
 
-          // 配置 API 客户端
-          apiClient.setConfig({
-            apiBase,
-            managementKey
-          });
-
-          // 测试连接 - 获取配置
-          try {
-            await useConfigStore.getState().fetchConfig(undefined, true);
-          } catch (error) {
-            if (sessionMode !== 'manager_embedded') {
-              throw error;
+          if (managerSession) {
+            const email = (credentials.email || '').trim();
+            const password = credentials.password || '';
+            if (!credentials.managerSessionEstablished) {
+              if (!email || !password) throw new Error('Email and password are required');
+              await usageServiceApi.login(apiBase, {
+                email,
+                password,
+                remember: rememberPassword,
+              });
             }
-            await usageServiceApi.getManagerConfig(apiBase, managementKey);
-            useConfigStore.getState().clearCache();
             useUsageServiceStore.getState().setUsageServiceConfig(
-              {
-                enabled: true,
-                serviceBase: apiBase,
-              },
-              {
-                panelBase: sessionPanelBase || apiBase,
-                panelHostMode: 'manager_embedded',
-              }
+              { enabled: true, serviceBase: apiBase },
+              { panelBase: sessionPanelBase || apiBase, panelHostMode: 'manager_embedded' }
             );
-            return markAuthenticated({ recoveryMode: 'manager_config' });
+          } else if (!managementKey) {
+            throw new Error('Management key is required');
+          } else {
+            // A bearer-key lightweight panel must never reuse a CSRF token
+            // derived from a different Manager Server session.
+            clearCsrfToken();
           }
 
-          // 登录成功
-          return markAuthenticated();
+          configureApiClient(apiBase, sessionMode, managementKey);
+          const result = await validateAuthenticatedConnection({
+            apiBase,
+            sessionMode,
+            sessionPanelBase,
+          });
+          return markAuthenticated(result);
         } catch (error: unknown) {
           const message =
             error instanceof Error
@@ -233,48 +333,70 @@ export const useAuthStore = create<AuthStoreState>()(
             connectionError: message || 'Connection failed',
             supportsPlugin: false
           });
+          if (managerSession && !credentials.managerSessionEstablished) {
+            void usageServiceApi.logout(apiBase).catch(() => undefined);
+          }
           throw error;
         }
       },
 
       // 登出
-      logout: () => {
+      logout: async () => {
+        const { apiBase, sessionMode } = get();
         restoreSessionPromise = null;
-        useConfigStore.getState().clearCache();
-        useModelsStore.getState().clearCache();
-        useQuotaStore.getState().clearQuotaCache();
-        useUsageServiceStore.getState().clearUsageServiceConfig();
-        apiClient.setConfig({ apiBase: '', managementKey: '' });
-        set({
-          isAuthenticated: false,
-          apiBase: '',
-          managementKey: '',
-          serverVersion: null,
-          serverBuildDate: null,
-          supportsPlugin: false,
-          sessionMode: '',
-          sessionPanelBase: '',
-          connectionStatus: 'disconnected',
-          connectionError: null
-        });
-        localStorage.removeItem('isLoggedIn');
+        try {
+          // Wait for the HttpOnly Manager session to be revoked before the
+          // login route is rendered. Otherwise its startup restore can race
+          // this request and immediately authenticate the user again.
+          if (sessionMode === 'manager_embedded' && apiBase) {
+            await usageServiceApi.logout(apiBase);
+          }
+        } catch {
+          // Local logout must still complete when the server is unavailable.
+        } finally {
+          useConfigStore.getState().clearCache();
+          useModelsStore.getState().clearCache();
+          useQuotaStore.getState().clearQuotaCache();
+          useUsageServiceStore.getState().clearUsageServiceConfig();
+          clearCsrfToken();
+          configureApiClient('', '', '');
+          set({
+            isAuthenticated: false,
+            apiBase: '',
+            managementKey: '',
+            rememberPassword: false,
+            serverVersion: null,
+            serverBuildDate: null,
+            supportsPlugin: false,
+            sessionMode: '',
+            sessionPanelBase: '',
+            connectionStatus: 'disconnected',
+            connectionError: null
+          });
+          localStorage.removeItem('isLoggedIn');
+        }
       },
 
       // 检查认证状态
       checkAuth: async () => {
-        const { managementKey, apiBase } = get();
+        const { managementKey, apiBase, sessionMode, sessionPanelBase } = get();
 
-        if (!managementKey || !apiBase) {
+        if (!apiBase || (sessionMode !== 'manager_embedded' && !managementKey)) {
           return false;
         }
 
         try {
-          // 重新配置客户端
-          apiClient.setConfig({ apiBase, managementKey });
+          configureApiClient(apiBase, sessionMode, managementKey);
           set({ supportsPlugin: false });
 
-          // 验证连接
-          await useConfigStore.getState().fetchConfig();
+          if (sessionMode === 'manager_embedded') {
+            await usageServiceApi.getSession(apiBase);
+          }
+          await validateAuthenticatedConnection({
+            apiBase,
+            sessionMode,
+            sessionPanelBase,
+          });
 
           set({
             isAuthenticated: true,
@@ -294,7 +416,14 @@ export const useAuthStore = create<AuthStoreState>()(
 
       // 更新服务器版本
       updateServerVersion: (version, buildDate) => {
-        set({ serverVersion: version || null, serverBuildDate: buildDate || null });
+        const normalizedVersion = normalizeServerMetadataValue(version);
+        const normalizedBuildDate = normalizeServerMetadataValue(buildDate);
+        set((state) => ({
+          // A response may contain only one metadata header. Keep the other
+          // value from the same connection instead of erasing it.
+          serverVersion: normalizedVersion ?? state.serverVersion,
+          serverBuildDate: normalizedBuildDate ?? state.serverBuildDate,
+        }));
       },
 
       updateServerPluginSupport: (supportsPlugin) => {
@@ -325,7 +454,9 @@ export const useAuthStore = create<AuthStoreState>()(
       })),
       partialize: (state) => ({
         apiBase: state.apiBase,
-        ...(state.rememberPassword ? { managementKey: state.managementKey } : {}),
+        ...(state.sessionMode !== 'manager_embedded' && state.rememberPassword
+          ? { managementKey: state.managementKey }
+          : {}),
         rememberPassword: state.rememberPassword,
         serverVersion: state.serverVersion,
         serverBuildDate: state.serverBuildDate,
@@ -339,7 +470,7 @@ export const useAuthStore = create<AuthStoreState>()(
 // 监听全局未授权事件
 if (typeof window !== 'undefined') {
   window.addEventListener('unauthorized', () => {
-    useAuthStore.getState().logout();
+    void useAuthStore.getState().logout();
   });
 
   window.addEventListener(

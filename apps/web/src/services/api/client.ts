@@ -9,7 +9,7 @@ import {
   BUILD_DATE_HEADER_KEYS,
   CPA_SUPPORT_PLUGIN_HEADER_KEYS,
   REQUEST_TIMEOUT_MS,
-  VERSION_HEADER_KEYS
+  VERSION_HEADER_KEYS,
 } from '@/utils/constants';
 import { computeApiUrl } from '@/utils/connection';
 import {
@@ -18,18 +18,20 @@ import {
   handleDemoRawRequest,
 } from '@/features/demo/demoApi';
 import { isDemoMode } from '@/features/demo/demoMode';
+import { csrfHeaders, clearCsrfToken, setCsrfToken } from '@/services/security/csrf';
 
 class ApiClient {
   private instance: AxiosInstance;
   private apiBase: string = '';
   private managementKey: string = '';
+  private withCredentials: boolean = false;
 
   constructor() {
     this.instance = axios.create({
       timeout: REQUEST_TIMEOUT_MS,
       headers: {
-        'Content-Type': 'application/json'
-      }
+        'Content-Type': 'application/json',
+      },
     });
 
     this.setupInterceptors();
@@ -40,7 +42,8 @@ class ApiClient {
    */
   setConfig(config: ApiClientConfig): void {
     this.apiBase = computeApiUrl(config.apiBase);
-    this.managementKey = config.managementKey;
+    this.managementKey = config.managementKey || '';
+    this.withCredentials = config.withCredentials === true;
 
     if (config.timeout) {
       this.instance.defaults.timeout = config.timeout;
@@ -49,16 +52,15 @@ class ApiClient {
     }
   }
 
-  private readHeader(
-    headers: Record<string, unknown> | undefined,
-    keys: string[]
-  ): string | null {
+  private readHeader(headers: Record<string, unknown> | undefined, keys: string[]): string | null {
     if (!headers) return null;
 
     const normalizeValue = (value: unknown): string | null => {
       if (value === undefined || value === null) return null;
       if (Array.isArray(value)) {
-        const first = value.find((entry) => entry !== undefined && entry !== null && String(entry).trim());
+        const first = value.find(
+          (entry) => entry !== undefined && entry !== null && String(entry).trim()
+        );
         return first !== undefined ? String(first) : null;
       }
       const text = String(value);
@@ -115,19 +117,32 @@ class ApiClient {
           config.url = config.url.replace(/\/generative-language-api-key\b/g, '/gemini-api-key');
         }
 
-        // 添加认证头
+        // External CPA panels use a management-key Bearer token. Manager-hosted panels
+        // authenticate with an HttpOnly session cookie instead.
+        config.withCredentials = this.withCredentials;
         if (this.managementKey) {
           config.headers.Authorization = `Bearer ${this.managementKey}`;
+        } else {
+          delete config.headers.Authorization;
         }
+
+        Object.assign(config.headers, csrfHeaders(config.method || 'GET'));
 
         return config;
       },
-      (error) => Promise.reject(this.handleError(error))
+      (error) => {
+        if (axios.isAxiosError(error) && error.response?.status === 401) clearCsrfToken();
+        return Promise.reject(this.handleError(error));
+      }
     );
 
     // 响应拦截器
     this.instance.interceptors.response.use(
       (response) => {
+        const responseData = response.data;
+        if (responseData && typeof responseData === 'object' && 'csrfToken' in responseData) {
+          setCsrfToken((responseData as { csrfToken?: unknown }).csrfToken);
+        }
         const headers = response.headers as Record<string, string | undefined>;
         const version = this.readHeader(headers, VERSION_HEADER_KEYS);
         const buildDate = this.readHeader(headers, BUILD_DATE_HEADER_KEYS);
@@ -137,14 +152,14 @@ class ApiClient {
         if (version || buildDate) {
           window.dispatchEvent(
             new CustomEvent('server-version-update', {
-              detail: { version: version || null, buildDate: buildDate || null }
+              detail: { version: version || null, buildDate: buildDate || null },
             })
           );
         }
         if (supportsPlugin !== null) {
           window.dispatchEvent(
             new CustomEvent('server-plugin-support-update', {
-              detail: { supportsPlugin }
+              detail: { supportsPlugin },
             })
           );
         }
@@ -190,7 +205,11 @@ class ApiClient {
     }
 
     const fallbackMessage =
-      error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error occurred';
+      error instanceof Error
+        ? error.message
+        : typeof error === 'string'
+          ? error
+          : 'Unknown error occurred';
     const fallback = new Error(fallbackMessage) as ApiError;
     fallback.name = 'ApiError';
     return fallback;
@@ -276,8 +295,8 @@ class ApiClient {
       ...config,
       headers: {
         ...(config?.headers || {}),
-        'Content-Type': 'multipart/form-data'
-      }
+        'Content-Type': 'multipart/form-data',
+      },
     });
     return response.data;
   }

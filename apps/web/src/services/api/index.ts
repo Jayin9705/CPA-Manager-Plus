@@ -11,6 +11,7 @@ export * from './logs';
 export * from './usageService';
 export * from './version';
 export * from './models';
+export * from './playground';
 export * from './plugins';
 export * from './transformers';
 export * from './vertex';

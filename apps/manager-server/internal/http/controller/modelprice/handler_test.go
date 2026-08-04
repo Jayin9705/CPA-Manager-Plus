@@ -9,7 +9,6 @@ import (
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/app"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
-	adminauthsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/adminauth"
 	modelpricesvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/modelprice"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/testutil"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
@@ -28,7 +27,7 @@ func TestHandleUsageSummaryUsesQueryLimitAndPanelAuthorization(t *testing.T) {
 
 	handler := &Handler{App: &app.Context{
 		Config:            cfg,
-		AdminAuthService:  adminauthsvc.New(cfg, st),
+		AdminAuthService:  testutil.NewAdminAuth(t),
 		ModelPriceService: modelpricesvc.New(st, nil),
 	}}
 

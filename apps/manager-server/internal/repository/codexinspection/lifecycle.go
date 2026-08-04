@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
-	modernsqlite "modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
@@ -64,10 +62,11 @@ func isSQLiteBusyError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var sqliteErr *modernsqlite.Error
+	var sqliteErr interface{ Code() int }
 	if errors.As(err, &sqliteErr) {
 		code := sqliteErr.Code() & 0xff
-		return code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED
+		// SQLITE_BUSY and SQLITE_LOCKED are stable public SQLite result codes.
+		return code == 5 || code == 6
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "sqlite_busy") ||
@@ -78,6 +77,13 @@ func isSQLiteBusyError(err error) bool {
 
 func IsSQLiteBusyError(err error) bool {
 	return isSQLiteBusyError(err)
+}
+
+func (r *repository) withWriteRetry(ctx context.Context, operation func() error) error {
+	if r.postgres {
+		return operation()
+	}
+	return withSQLiteBusyRetry(ctx, operation)
 }
 
 func (r *repository) AcquireRun(
@@ -99,7 +105,7 @@ func (r *repository) AcquireRun(
 	run.Status = model.CodexInspectionStatusRunning
 	run.FinishedAtMS = 0
 	run.Error = ""
-	err = withSQLiteBusyRetry(ctx, func() error {
+	err = r.withWriteRetry(ctx, func() error {
 		attemptResult, attemptErr := r.acquireRunOnce(ctx, run, ownerID, leaseDuration)
 		if attemptErr == nil {
 			result = attemptResult
@@ -120,6 +126,14 @@ func (r *repository) acquireRunOnce(
 		return AcquireRunResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if r.postgres {
+		// The single lease row may not exist yet, so a row lock alone cannot
+		// serialize the first acquisition. A transaction advisory lock provides
+		// the same global fencing point that SQLite's writer lock provided.
+		if _, err := tx.ExecContext(ctx, `select pg_advisory_xact_lock(hashtext('cpamp-core-codex-inspection-lease'))`); err != nil {
+			return AcquireRunResult{}, err
+		}
+	}
 
 	now := time.Now().UnixMilli()
 	leaseDurationMS := leaseDuration.Milliseconds()
@@ -379,7 +393,7 @@ func (r *repository) HeartbeatRun(ctx context.Context, runID int64, ownerID stri
 	if leaseDuration <= 0 {
 		leaseDuration = defaultInspectionLeaseDuration
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		leaseDurationMS := leaseDuration.Milliseconds()
 		if leaseDurationMS <= 0 {
 			leaseDurationMS = 1
@@ -418,7 +432,7 @@ func (r *repository) UpdateRunProgress(ctx context.Context, run model.CodexInspe
 	if run.SettingsJSON == "" {
 		run.SettingsJSON = model.MarshalCodexInspectionSettings(run.Settings)
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		now := time.Now().UnixMilli()
 		res, err := r.db.ExecContext(ctx, `update codex_inspection_runs set
 			total_files = ?, probe_set_count = ?, sampled_count = ?, disabled_count = ?, enabled_count = ?,
@@ -463,7 +477,7 @@ func (r *repository) UpdateRunProgress(ctx context.Context, run model.CodexInspe
 
 func (r *repository) MarkRunCancelling(ctx context.Context, runID int64, ownerID string, reason string) (bool, error) {
 	var changed bool
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -512,7 +526,7 @@ func (r *repository) MarkRunCancelling(ctx context.Context, runID int64, ownerID
 }
 
 func (r *repository) FinalizeRun(ctx context.Context, run model.CodexInspectionRun, ownerID string, finalLog *model.CodexInspectionLog) error {
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -557,7 +571,7 @@ func (r *repository) ForceFinalizeRun(ctx context.Context, run model.CodexInspec
 	if run.ID <= 0 || strings.TrimSpace(ownerID) == "" {
 		return ErrLeaseLost
 	}
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		return r.forceFinalizeRunOnce(ctx, run, ownerID, finalLog)
 	})
 	if err == nil || errors.Is(err, ErrLeaseLost) || finalLog == nil {
@@ -566,7 +580,7 @@ func (r *repository) ForceFinalizeRun(ctx context.Context, run model.CodexInspec
 	// A lifecycle log is useful but must never strand the terminal state. Retry
 	// the same fenced transition without the optional log when its insert was
 	// the failing write.
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		return r.forceFinalizeRunOnce(ctx, run, ownerID, nil)
 	})
 }
@@ -657,7 +671,7 @@ func (r *repository) RecoverStaleRuns(ctx context.Context, nowMS int64, reason s
 		reason = "服务重启或任务租约过期，巡检已中断"
 	}
 	var recovered []model.CodexInspectionRun
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		recovered = recovered[:0]
 		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {

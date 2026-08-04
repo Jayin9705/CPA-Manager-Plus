@@ -1,5 +1,7 @@
 import { useEffect } from 'react';
-import { useLanguageStore, useThemeStore, useVisualEffectsStore } from '@/stores';
+import { useLanguageStore } from '@/stores/useLanguageStore';
+import { useThemeStore } from '@/stores/useThemeStore';
+import { useVisualEffectsStore } from '@/stores/useVisualEffectsStore';
 
 export function AppLifecycle() {
   const initializeTheme = useThemeStore((state) => state.initializeTheme);

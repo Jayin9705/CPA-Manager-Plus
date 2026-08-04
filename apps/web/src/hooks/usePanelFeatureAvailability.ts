@@ -39,6 +39,7 @@ export interface ResolvePanelFeatureAvailabilityInput {
   managerConfig: ManagerConfig | null;
   hasManagerCandidate: boolean;
   managementKey: string;
+  managerSessionAuthenticated?: boolean;
 }
 
 const normalizeBase = (value?: string) => normalizeUsageServiceBase(value || '');
@@ -63,7 +64,7 @@ const buildUnavailableState = (
 export function resolvePanelFeatureAvailability(
   input: ResolvePanelFeatureAvailabilityInput
 ): PanelFeatureAvailability {
-  if (!input.managementKey) {
+  if (!input.managementKey && !input.managerSessionAuthenticated) {
     return buildUnavailableState(input, 'service_not_configured');
   }
   if (!input.panelHostedByUsageService) {
@@ -134,6 +135,7 @@ export function managerConfigMatchesPanel({
 type PanelFeatureAvailabilityRequestInput = {
   apiBase: string;
   managementKey: string;
+  managerSessionAuthenticated: boolean;
   usageServiceRevision: number;
   panelBase: string;
 };
@@ -179,6 +181,7 @@ let latestAvailabilityRequestKey = '';
 const buildAvailabilityRequestKey = ({
   apiBase,
   managementKey,
+  managerSessionAuthenticated,
   usageServiceRevision,
   panelBase,
 }: PanelFeatureAvailabilityRequestInput): string =>
@@ -186,16 +189,18 @@ const buildAvailabilityRequestKey = ({
     normalizeBase(panelBase),
     normalizeBase(apiBase),
     managementKey,
+    String(managerSessionAuthenticated),
     String(usageServiceRevision),
   ].join('\u001f');
 
 async function detectPanelFeatureAvailability({
   apiBase,
   managementKey,
+  managerSessionAuthenticated,
   panelBase,
 }: PanelFeatureAvailabilityRequestInput): Promise<PanelFeatureAvailability> {
   const normalizedPanelBase = normalizeBase(panelBase);
-  if (!managementKey) {
+  if (!managementKey && !managerSessionAuthenticated) {
     return resolvePanelFeatureAvailability({
       checking: false,
       panelHostedByUsageService: false,
@@ -204,6 +209,7 @@ async function detectPanelFeatureAvailability({
       managerConfig: null,
       hasManagerCandidate: false,
       managementKey,
+      managerSessionAuthenticated,
     });
   }
 
@@ -242,6 +248,7 @@ async function detectPanelFeatureAvailability({
         managerConfig: response.config,
         hasManagerCandidate: candidates.length > 0,
         managementKey,
+        managerSessionAuthenticated,
       });
     } catch {
       // Continue probing; a regular CPA endpoint or unreachable Manager Server is expected here.
@@ -256,6 +263,7 @@ async function detectPanelFeatureAvailability({
     managerConfig: null,
     hasManagerCandidate: candidates.length > 0,
     managementKey,
+    managerSessionAuthenticated,
   });
   return unavailableState;
 }
@@ -292,15 +300,19 @@ export function usePanelFeatureAvailability(): PanelFeatureAvailability {
   const demoMode = __DEMO_SITE__ && isDemoMode();
   const apiBase = useAuthStore((state) => state.apiBase);
   const managementKey = useAuthStore((state) => state.managementKey);
+  const sessionMode = useAuthStore((state) => state.sessionMode);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const panelBase = useMemo(() => detectApiBaseFromLocation(), []);
   const requestInput = useMemo(
     () => ({
       apiBase,
       managementKey,
+      managerSessionAuthenticated:
+        isAuthenticated && sessionMode === 'manager_embedded',
       usageServiceRevision: 0,
       panelBase,
     }),
-    [apiBase, managementKey, panelBase]
+    [apiBase, isAuthenticated, managementKey, panelBase, sessionMode]
   );
   const requestKey = useMemo(
     () => buildAvailabilityRequestKey(requestInput),

@@ -1,6 +1,8 @@
 # Manager Server 指南
 
-Manager Server 是完整 CPAMP 体验的后端。它托管 `management.html`，保存本地 SQLite，用采集器消费 CPA 用量队列，并用 CPAMP 管理员密钥保护管理能力。
+Manager Server 是完整 CPAMP 体验的后端。它托管 `management.html`，消费 CPA 用量队列，并用服务端认证保护管理能力。当前生产推荐的 PostgreSQL-only 模式使用 PostgreSQL 保存 core/usage 数据，Redis 保存 usage Stream、短缓存、管理员 session 和登录限流；SQLite 仅保留给兼容模式或离线迁移/回滚。
+
+当前 CPA + CPAMP + Redis + PostgreSQL 的完整拓扑、环境变量、persist/rollup worker 和安装顺序见[架构与安装文档](./cpa-redis-postgresql.md)。本页后续的 SQLite 说明主要用于兼容模式和历史部署。
 
 普通用户通常不需要从头阅读本页。根据目标直接进入对应文档：
 

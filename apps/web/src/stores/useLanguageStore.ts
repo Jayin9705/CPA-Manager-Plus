@@ -7,7 +7,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { Language } from '@/types';
 import { LANGUAGE_ORDER, STORAGE_KEY_LANGUAGE } from '@/utils/constants';
-import i18n from '@/i18n';
+import i18n, { ensureLanguageLoaded } from '@/i18n';
 import { getInitialLanguage, isSupportedLanguage } from '@/utils/language';
 
 interface LanguageState {
@@ -25,9 +25,13 @@ export const useLanguageStore = create<LanguageState>()(
         if (!isSupportedLanguage(language)) {
           return;
         }
-        // 切换 i18next 语言
-        i18n.changeLanguage(language);
         set({ language });
+        // 切换 i18next 语言
+        void ensureLanguageLoaded(language).then(() => {
+          if (get().language === language) {
+            void i18n.changeLanguage(language);
+          }
+        });
       },
 
       toggleLanguage: () => {

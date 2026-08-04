@@ -61,6 +61,30 @@
   flex-wrap: nowrap;
 }
 
+.pageTitle {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pageEyebrow,
+.sectionEyebrow {
+  color: var(--pricing-accent-strong);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.pageTitle h1,
+.modelCardsHeader h2 {
+  margin: 0;
+  color: var(--pricing-ink);
+  font-size: 17px;
+  line-height: 1.25;
+}
+
 .backLink,
 .metaPill,
 .filterButton,
@@ -253,6 +277,181 @@
   flex-wrap: nowrap;
   justify-content: flex-end;
   padding-bottom: 1px;
+}
+
+.modelCardsSection {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.modelCardsHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 2px 2px 0;
+}
+
+.modelCardsHeader > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.modelCardsHeader p {
+  max-width: 760px;
+  margin: 0;
+  color: var(--pricing-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.currentCount {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 6px 9px;
+  border: 1px solid var(--pricing-line);
+  border-radius: 999px;
+  background: var(--pricing-surface-muted);
+  color: var(--pricing-muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.modelCardsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.priceCard {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--pricing-line);
+  border-radius: 16px;
+  background: var(--pricing-surface-elevated);
+  box-shadow: var(--shadow);
+}
+
+.priceCardMissing {
+  border-color: color-mix(in srgb, var(--pricing-accent) 28%, var(--pricing-line));
+}
+
+.priceCardHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.priceCardIdentity {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.statusBadge {
+  width: fit-content;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--pricing-accent) 12%, var(--pricing-surface));
+  color: var(--pricing-accent-strong);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.priceCard h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--pricing-ink);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cardCalls {
+  color: var(--pricing-muted);
+  font-size: 11px;
+}
+
+.sourceLine {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.sourceLabel {
+  color: var(--pricing-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sourceModelId {
+  overflow: hidden;
+  color: var(--pricing-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.priceMetrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.priceMetric {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--pricing-line) 86%, transparent);
+  border-radius: 10px;
+  background: var(--pricing-surface);
+}
+
+.priceMetric span {
+  overflow: hidden;
+  color: var(--pricing-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.priceMetric strong {
+  overflow: hidden;
+  color: var(--pricing-ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.missingPriceNotice {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+  color: var(--pricing-muted);
+  font-size: 11px;
+}
+
+.missingPriceNotice .candidateControl {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .tableWrap {
@@ -457,11 +656,41 @@
   }
 }
 
+@media (max-width: 768px) {
+  .backLink,
+  .filterButton,
+  .confirmButton,
+  .actionGroup :global(.btn),
+  .compactEditorActions :global(.btn) {
+    min-height: 44px;
+  }
+
+  .searchWrap :global(.input),
+  .compactInput {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .iconAction {
+    width: 44px;
+    height: 44px;
+  }
+
+  .candidateControl select {
+    height: 44px;
+    font-size: 16px;
+  }
+}
+
 @media (max-width: 620px) {
   .titleGroup {
     align-items: flex-start;
     flex-direction: column;
     gap: 6px;
+  }
+
+  .modelCardsHeader {
+    flex-direction: column;
   }
 
   .filterGroup {
@@ -470,6 +699,15 @@
 
   .filterButton {
     flex: 1 1 0;
+    min-width: 0;
+    gap: 4px;
+    padding-inline: 6px;
+  }
+
+  .filterButton span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .candidateControl {

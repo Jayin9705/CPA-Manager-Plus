@@ -2,7 +2,6 @@ package monitoring
 
 import (
 	"bytes"
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -10,25 +9,15 @@ import (
 	"testing"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/app"
-	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/config"
-	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/security"
-	adminauthsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/adminauth"
 	monitoringsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/monitoring"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/testutil"
 )
 
 func TestHandleAccountHistoryRejectsUnknownTargetFields(t *testing.T) {
 	st := newHandlerTestStore(t)
-	const adminKey = "cpamp_test_key"
-	credential, err := security.NewAdminCredential(adminKey, "test")
-	if err != nil {
-		t.Fatalf("create admin credential: %v", err)
-	}
-	if err := st.SaveAdminCredential(context.Background(), credential); err != nil {
-		t.Fatalf("save admin credential: %v", err)
-	}
 	handler := &Handler{App: &app.Context{
-		AdminAuthService:  adminauthsvc.New(config.Config{}, st),
+		AdminAuthService:  testutil.NewAdminAuth(t),
 		MonitoringService: monitoringsvc.New(st),
 	}}
 	req := httptest.NewRequest(
@@ -36,7 +25,7 @@ func TestHandleAccountHistoryRejectsUnknownTargetFields(t *testing.T) {
 		"/v0/management/monitoring/account-history",
 		bytes.NewBufferString(`{"accounts":[{"source_hash":"source-only"}]}`),
 	)
-	req.Header.Set("Authorization", "Bearer "+adminKey)
+	req.Header.Set("Authorization", "Bearer "+testutil.AdminKey)
 	recorder := httptest.NewRecorder()
 
 	handler.Handle(recorder, req)
@@ -45,6 +34,30 @@ func TestHandleAccountHistoryRejectsUnknownTargetFields(t *testing.T) {
 		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 	if !strings.Contains(recorder.Body.String(), "source_hash") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestHandleQuotaWeeklyUsageRejectsUnknownTargetFields(t *testing.T) {
+	st := newHandlerTestStore(t)
+	handler := &Handler{App: &app.Context{
+		AdminAuthService:  testutil.NewAdminAuth(t),
+		MonitoringService: monitoringsvc.New(st),
+	}}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/monitoring/quota-weekly-usage",
+		bytes.NewBufferString(`{"targets":[{"target_key":"a","auth_file":"a.json","period_start_ms":1,"unexpected":true}]}`),
+	)
+	req.Header.Set("Authorization", "Bearer "+testutil.AdminKey)
+	recorder := httptest.NewRecorder()
+
+	handler.Handle(recorder, req)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "unexpected") {
 		t.Fatalf("body = %s", recorder.Body.String())
 	}
 }

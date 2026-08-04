@@ -33,6 +33,135 @@ export type ModelPriceSummary = {
   candidates: number;
 };
 
+const OFFICIAL_PRICE_SOURCES = new Set(['litellm', 'official', 'official-site', 'official_site']);
+const ROUTER_PRICE_PREFIXES = new Set([
+  'azure',
+  'azure_ai',
+  'vertex_ai',
+  'bedrock',
+  'bedrock_converse',
+  'openrouter',
+  'together_ai',
+  'deepinfra',
+  'fireworks_ai',
+  'groq',
+  'perplexity',
+  'novita',
+  'cerebras',
+  'sambanova',
+]);
+const OFFICIAL_VENDOR_PREFIXES = new Set([
+  'ai21',
+  'amazon',
+  'anthropic',
+  'cohere',
+  'deepseek',
+  'google',
+  'meta',
+  'meta-llama',
+  'minimax',
+  'mistral',
+  'moonshot',
+  'openai',
+  'qwen',
+  'xai',
+  'zhipu',
+]);
+
+const cleanModelSegments = (value: string): string[] => {
+  const segments = value
+    .trim()
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments[0]?.toLowerCase() === 'models') {
+    segments.shift();
+  }
+  return segments;
+};
+
+export const normalizeModelIdentity = (value: string): string => {
+  const segments = cleanModelSegments(value);
+  const model = segments[segments.length - 1] || value.trim();
+  return model.toLowerCase().replace(/[^a-z0-9]+/g, '');
+};
+
+const normalizeModelSlug = (value: string): string => {
+  const segments = cleanModelSegments(value);
+  const model = segments[segments.length - 1] || value.trim();
+  return model
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+};
+
+const isVersionedModelAlias = (base: string, candidate: string): boolean => {
+  const baseSlug = normalizeModelSlug(base);
+  const candidateSlug = normalizeModelSlug(candidate);
+  if (!baseSlug || baseSlug === candidateSlug || !candidateSlug.startsWith(`${baseSlug}-`)) {
+    return false;
+  }
+  const suffix = candidateSlug.slice(baseSlug.length + 1);
+  return /^(?:v)?\d/.test(suffix);
+};
+
+export const isOfficialPriceSource = (source: string | undefined): boolean =>
+  OFFICIAL_PRICE_SOURCES.has(
+    String(source || '')
+      .trim()
+      .toLowerCase()
+  );
+
+export const isOfficialModelPrice = (
+  price: ModelPrice | undefined,
+  fallbackModelId = ''
+): boolean => {
+  if (!price || !isOfficialPriceSource(price.source)) return false;
+  const modelId = String(price.sourceModelId || fallbackModelId).trim();
+  if (!modelId) return false;
+  const segments = cleanModelSegments(modelId);
+  if (segments.length === 0) return false;
+  const prefix = segments[0].toLowerCase();
+  if (segments.length > 1 && ROUTER_PRICE_PREFIXES.has(prefix)) return false;
+  return segments.length === 1 || OFFICIAL_VENDOR_PREFIXES.has(prefix);
+};
+
+const modelDisplayPriority = (model: string): number => {
+  const segments = cleanModelSegments(model);
+  if (segments.length === 0) return 0;
+  if (segments.length === 1) return 3;
+  return OFFICIAL_VENDOR_PREFIXES.has(segments[0].toLowerCase()) ? 2 : 1;
+};
+
+const chooseDisplayModel = (current: string, candidate: string): string => {
+  if (modelDisplayPriority(candidate) > modelDisplayPriority(current)) return candidate;
+  if (modelDisplayPriority(candidate) < modelDisplayPriority(current)) return current;
+  return candidate.length < current.length ? candidate : current;
+};
+
+const officialPricePriority = (modelId: string): number => {
+  const segments = cleanModelSegments(modelId);
+  if (segments.length === 1) return 3;
+  return OFFICIAL_VENDOR_PREFIXES.has(segments[0].toLowerCase()) ? 2 : 1;
+};
+
+export const findOfficialModelPrice = (
+  model: string,
+  prices: Record<string, ModelPrice>
+): ModelPrice | undefined => {
+  const identity = normalizeModelIdentity(model);
+  if (!identity) return undefined;
+  return Object.entries(prices)
+    .filter(
+      ([modelId, price]) =>
+        normalizeModelIdentity(modelId) === identity && isOfficialModelPrice(price, modelId)
+    )
+    .sort(([leftModelId], [rightModelId]) => {
+      const priority = officialPricePriority(rightModelId) - officialPricePriority(leftModelId);
+      return priority || leftModelId.localeCompare(rightModelId);
+    })[0]?.[1];
+};
+
 export type ModelPriceCandidateGroup = {
   source: string;
   candidates: ModelPriceSyncCandidate[];
@@ -92,14 +221,43 @@ export const applyCandidatePrice = (
   prices: Record<string, ModelPrice>,
   model: string,
   candidate: ModelPriceSyncCandidate
-): Record<string, ModelPrice> => ({
-  ...prices,
-  [model]: {
-    ...candidate.price,
-    source: candidate.price.source || 'sync',
-    sourceModelId: candidate.sourceModelId,
-  },
-});
+): Record<string, ModelPrice> => {
+  if (!isOfficialModelPrice(candidate.price, candidate.sourceModelId)) return prices;
+  return {
+    ...prices,
+    [model]: {
+      ...candidate.price,
+      source: candidate.price.source,
+      sourceModelId: candidate.sourceModelId,
+    },
+  };
+};
+
+const deduplicateModelNames = (models: string[]): string[] => {
+  const byIdentity = new Map<string, string>();
+  models.forEach((model) => {
+    const normalized = model.trim();
+    const identity = normalizeModelIdentity(normalized);
+    if (!identity) return;
+    const current = byIdentity.get(identity);
+    byIdentity.set(identity, current ? chooseDisplayModel(current, normalized) : normalized);
+  });
+  return Array.from(byIdentity.values()).sort((left, right) => left.localeCompare(right));
+};
+
+const deduplicateUsageModelNames = (items: ModelPriceUsageSummaryResponse['models']): string[] => {
+  const requestedModels = items
+    .filter((item) => Number(item.requested_calls) > 0)
+    .map((item) => item.model)
+    .filter(Boolean);
+  const resolvedOnlyModels = items
+    .filter((item) => Number(item.requested_calls) <= 0)
+    .map((item) => item.model)
+    .filter(
+      (model) => !requestedModels.some((requested) => isVersionedModelAlias(requested, model))
+    );
+  return deduplicateModelNames([...requestedModels, ...resolvedOnlyModels]);
+};
 
 export const getModelPriceCandidateSource = (candidate: ModelPriceSyncCandidate) =>
   candidate.price.source?.trim() || 'sync';
@@ -128,22 +286,26 @@ export const groupModelPriceCandidatesBySource = (
 
 export const buildSyncPriceModelsFromSummary = (
   summary: ModelPriceUsageSummaryResponse | null,
-  prices: Record<string, ModelPrice>
+  _prices: Record<string, ModelPrice>
 ) => {
-  const models = new Set<string>(Object.keys(prices));
-  summary?.models?.forEach((item) => {
-    if (item.model) models.add(item.model);
-  });
-  return Array.from(models)
-    .filter(Boolean)
-    .sort((left, right) => left.localeCompare(right));
+  if (!summary) return [];
+  return deduplicateUsageModelNames(summary.models ?? []);
 };
 
 export const buildCandidateMap = (candidateSets: ModelPriceSyncCandidateSet[] = []) => {
   const map = new Map<string, ModelPriceSyncCandidate[]>();
   candidateSets.forEach((set) => {
-    if (!set.model || !Array.isArray(set.candidates) || set.candidates.length === 0) return;
-    map.set(set.model, set.candidates);
+    const identity = normalizeModelIdentity(set.model || '');
+    const candidates = (Array.isArray(set.candidates) ? set.candidates : []).filter((candidate) =>
+      isOfficialModelPrice(candidate.price, candidate.sourceModelId)
+    );
+    if (!identity || candidates.length === 0) return;
+    const existing = map.get(identity) ?? [];
+    const seen = new Set(existing.map((candidate) => candidate.sourceModelId));
+    map.set(
+      identity,
+      existing.concat(candidates.filter((candidate) => !seen.has(candidate.sourceModelId)))
+    );
   });
   return map;
 };
@@ -156,32 +318,55 @@ export const buildModelPriceRows = (
   const rowMap = new Map<string, ModelPriceRow>();
   const candidateMap = buildCandidateMap(candidateSets);
 
-  const ensureRow = (model: string): ModelPriceRow => {
-    const existing = rowMap.get(model);
-    if (existing) return existing;
-    const price = prices[model];
+  const ensureRow = (model: string): ModelPriceRow | undefined => {
+    const identity = normalizeModelIdentity(model);
+    if (!identity) return undefined;
+    const existing = rowMap.get(identity);
+    if (existing) {
+      existing.model = chooseDisplayModel(existing.model, model.trim());
+      return existing;
+    }
+    const price = findOfficialModelPrice(model, prices);
     const row: ModelPriceRow = {
-      model,
+      model: model.trim(),
       calls: 0,
       requestedCalls: 0,
       resolvedCalls: 0,
       hasPrice: Boolean(price),
       price,
-      candidateCount: candidateMap.get(model)?.length ?? 0,
+      candidateCount: candidateMap.get(identity)?.length ?? 0,
     };
-    rowMap.set(model, row);
+    rowMap.set(identity, row);
     return row;
   };
 
-  Object.keys(prices).forEach(ensureRow);
-  candidateMap.forEach((_candidates, model) => ensureRow(model));
+  if (!summary) return [];
 
-  summary?.models?.forEach((item) => {
+  summary.models?.forEach((item) => {
     if (!item.model) return;
     const row = ensureRow(item.model);
+    if (!row) return;
     row.calls += Number(item.calls) || 0;
     row.requestedCalls += Number(item.requested_calls) || 0;
     row.resolvedCalls += Number(item.resolved_calls) || 0;
+  });
+
+  const requestedRows = Array.from(rowMap.entries()).filter(([, row]) => row.requestedCalls > 0);
+  Array.from(rowMap.entries()).forEach(([identity, row]) => {
+    if (row.requestedCalls > 0) return;
+    const requestedRow = requestedRows.find(([, candidate]) =>
+      isVersionedModelAlias(candidate.model, row.model)
+    );
+    if (!requestedRow) return;
+    const [, base] = requestedRow;
+    base.calls += row.calls;
+    base.resolvedCalls += row.resolvedCalls;
+    base.candidateCount = Math.max(base.candidateCount, row.candidateCount);
+    if (!base.price && row.price) {
+      base.price = row.price;
+      base.hasPrice = true;
+    }
+    rowMap.delete(identity);
   });
 
   return Array.from(rowMap.values()).sort(

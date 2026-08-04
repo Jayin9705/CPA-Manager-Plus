@@ -115,10 +115,18 @@ describe('PR check classifier', () => {
   });
 
   it('runs Docker validation for Compose changes', () => {
-    expect(classifyChangedFiles(['docker-compose.manager.yml'])).toEqual({
-      ...noChecks,
-      docker: true,
-    });
+    for (const filePath of [
+      'docker-compose.manager.yml',
+      'docker-compose.separated.yml',
+      'docker-compose.stack.yml',
+      'bin/bootstrap-stack.sh',
+      'bin/stack.sh',
+    ]) {
+      expect(classifyChangedFiles([filePath])).toEqual({
+        ...noChecks,
+        docker: true,
+      });
+    }
   });
 
   it('runs Node and Docker checks for root dependency changes', () => {

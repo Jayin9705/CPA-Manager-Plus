@@ -2,10 +2,10 @@ package automation
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/app"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/middleware"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/response"
 	automationsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/automation"
 )
@@ -66,35 +66,9 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authorizeWrite(w http.ResponseWriter, r *http.Request) bool {
-	ok, err := h.App.AdminAuthService.VerifyHeader(r.Context(), r.Header.Get("Authorization"))
-	if err != nil {
-		response.Error(w, http.StatusInternalServerError, err)
-		return false
-	}
-	if ok {
-		return true
-	}
-	response.Error(w, http.StatusUnauthorized, errors.New("invalid admin key"))
-	return false
+	return middleware.AuthorizeAdmin(w, r, h.App.AdminAuthService)
 }
 
 func (h *Handler) authorizeRead(w http.ResponseWriter, r *http.Request) bool {
-	ok, err := h.App.AdminAuthService.VerifyPanelHeader(r.Context(), r.Header.Get("Authorization"))
-	if err != nil {
-		response.Error(w, http.StatusInternalServerError, err)
-		return false
-	}
-	if ok {
-		return true
-	}
-	setup, setupOK, err := h.App.ManagerConfigService.ResolveSetup(r.Context())
-	if err != nil {
-		response.Error(w, http.StatusInternalServerError, err)
-		return false
-	}
-	if !setupOK || setup.ManagementKey == "" {
-		return true
-	}
-	response.Error(w, http.StatusUnauthorized, errors.New("invalid admin key"))
-	return false
+	return middleware.AuthorizePanel(w, r, h.App.AdminAuthService)
 }

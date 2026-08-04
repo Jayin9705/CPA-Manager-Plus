@@ -132,25 +132,37 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build all-in-one HTML
+      - name: Build split web assets
         run: npm run build
         env:
           VERSION: ${{ needs.preflight.outputs.release_tag }}
 
+      - name: Build single-file compatibility panel
+        run: npm run build:bundle
+        env:
+          VERSION: ${{ needs.preflight.outputs.release_tag }}
+
+      - name: Generate Manager Server build metadata
+        run: |
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       - name: Check demo isolation
-        run: npm run check:demo-isolation
+        run: node bin/release/check-web-demo-isolation.mjs apps/web/dist-bundle/index.html
 
       - name: Build native release packages
         run: bin/release/package-native.sh
         env:
           VERSION: ${{ needs.preflight.outputs.release_tag }}
+          COMMIT: ${{ env.COMMIT }}
+          BUILD_DATE: ${{ env.BUILD_DATE }}
 
       - name: Prepare release artifact
         run: |
           set -euo pipefail
           rm -rf dist/release
           mkdir -p dist/release/native
-          cp apps/web/dist/index.html dist/release/management.html
+          cp apps/web/dist-bundle/index.html dist/release/management.html
           cp dist/native/* dist/release/native/
           cp "docs/release-notes/${RELEASE_TAG}-zh.md" dist/release/release-notes.md
           find dist/release -maxdepth 2 -type f -print | sort
@@ -175,14 +187,19 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
       DRY_RUN: ${{ needs.preflight.outputs.dry_run }}
-      DOCKERHUB_IMAGE: seakee/cpa-manager-plus
-      GHCR_IMAGE: ghcr.io/seakee/cpa-manager-plus
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+      GHCR_IMAGE: ghcr.io/jayin9705/cpa-manager-plus
 
     steps:
       - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+
+      - name: Generate Manager Server build metadata
+        run: |
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -199,18 +216,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "${DOCKERHUB_IMAGE}" != "seakee/cpa-manager-plus" ]; then
-            echo "Docker image name must be seakee/cpa-manager-plus" >&2
-            exit 1
-          fi
-
           images="${GHCR_IMAGE}"
           dockerhub_enabled=false
-          if [ "${DRY_RUN}" != "true" ] && [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+          if [ "${DRY_RUN}" != "true" ] &&
+             [ -n "${DOCKERHUB_IMAGE}" ] &&
+             [ -n "${DOCKERHUB_USERNAME}" ] &&
+             [ -n "${DOCKERHUB_TOKEN}" ]; then
             images="${images}"$'\n'"${DOCKERHUB_IMAGE}"
             dockerhub_enabled=true
-          elif [ "${DRY_RUN}" != "true" ]; then
-            echo "::warning::DockerHub credentials are not both configured; DockerHub publish will be skipped."
+          elif [ "${DRY_RUN}" != "true" ] &&
+               { [ -n "${DOCKERHUB_IMAGE}" ] || [ -n "${DOCKERHUB_USERNAME}" ] || [ -n "${DOCKERHUB_TOKEN}" ]; }; then
+            echo "::warning::DockerHub image and credentials are incomplete; DockerHub publish will be skipped."
           fi
 
           {
@@ -263,6 +279,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ env.RELEASE_TAG }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
 
       - name: Update DockerHub overview
         if: env.DRY_RUN != 'true' && steps.docker_targets.outputs.dockerhub_enabled == 'true'

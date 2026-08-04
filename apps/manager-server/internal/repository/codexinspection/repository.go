@@ -62,11 +62,16 @@ var (
 )
 
 type repository struct {
-	db *sql.DB
+	db       *sql.DB
+	postgres bool
 }
 
 func New(db *sql.DB) Repository {
 	return &repository{db: db}
+}
+
+func NewPostgres(db *sql.DB) Repository {
+	return &repository{db: db, postgres: true}
 }
 
 func (r *repository) CreateRun(ctx context.Context, run model.CodexInspectionRun) (model.CodexInspectionRun, error) {
@@ -85,17 +90,17 @@ func (r *repository) CreateRun(ctx context.Context, run model.CodexInspectionRun
 	if run.SettingsJSON == "" {
 		run.SettingsJSON = model.MarshalCodexInspectionSettings(run.Settings)
 	}
-	var res sql.Result
-	err := withSQLiteBusyRetry(ctx, func() error {
-		var err error
-		res, err = r.db.ExecContext(
+	var id int64
+	err := r.withWriteRetry(ctx, func() error {
+		return r.db.QueryRowContext(
 			ctx,
 			`insert into codex_inspection_runs (
 			trigger_type, trigger_key, status, started_at_ms, finished_at_ms,
 			total_files, probe_set_count, sampled_count, disabled_count, enabled_count,
 			delete_count, disable_count, enable_count, reauth_count, keep_count, error,
 			settings_json, created_at_ms, updated_at_ms
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		returning id`,
 			run.TriggerType,
 			nullString(run.TriggerKey),
 			run.Status,
@@ -115,13 +120,8 @@ func (r *repository) CreateRun(ctx context.Context, run model.CodexInspectionRun
 			run.SettingsJSON,
 			run.CreatedAtMS,
 			run.UpdatedAtMS,
-		)
-		return err
+		).Scan(&id)
 	})
-	if err != nil {
-		return model.CodexInspectionRun{}, err
-	}
-	id, err := res.LastInsertId()
 	if err != nil {
 		return model.CodexInspectionRun{}, err
 	}
@@ -141,7 +141,7 @@ func (r *repository) UpdateRun(ctx context.Context, run model.CodexInspectionRun
 	if run.SettingsJSON == "" {
 		run.SettingsJSON = model.MarshalCodexInspectionSettings(run.Settings)
 	}
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		res, err := r.db.ExecContext(
 			ctx,
 			`update codex_inspection_runs set
@@ -217,7 +217,7 @@ func (r *repository) InsertResult(ctx context.Context, result model.CodexInspect
 		autoRecoverEligible = 1
 	}
 	var id int64
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		return r.db.QueryRowContext(
 			ctx,
 			`insert into codex_inspection_results (
@@ -297,7 +297,7 @@ func (r *repository) InsertLog(ctx context.Context, entry model.CodexInspectionL
 		}
 	}
 	var id int64
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		return r.db.QueryRowContext(
 			ctx,
 			`insert into codex_inspection_logs(run_id, level, message, detail_json, created_at_ms)
@@ -495,7 +495,7 @@ func (r *repository) UpsertDisableOwnerships(ctx context.Context, items []model.
 		item.UpdatedAtMS = now
 		normalized[index] = item
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		tx, err := r.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -536,7 +536,7 @@ func (r *repository) RevokeDisableOwnership(ctx context.Context, targets []model
 		return nil, nil
 	}
 	var revoked []model.CodexInspectionDisableOwnership
-	err := withSQLiteBusyRetry(ctx, func() error {
+	err := r.withWriteRetry(ctx, func() error {
 		items, err := r.revokeDisableOwnershipOnce(ctx, targets, clearAll)
 		if err != nil {
 			revoked = nil
@@ -610,7 +610,7 @@ func (r *repository) RestoreDisableOwnership(ctx context.Context, items []model.
 	if len(items) == 0 {
 		return nil
 	}
-	return withSQLiteBusyRetry(ctx, func() error {
+	return r.withWriteRetry(ctx, func() error {
 		return r.restoreDisableOwnershipOnce(ctx, items)
 	})
 }

@@ -72,7 +72,7 @@ export function AccountActionCandidatesPage() {
   const managerBase = featureAvailability.managerServiceBase;
 
   const loadCandidates = useCallback(async () => {
-    if (!managerBase || !managementKey) return;
+    if (!managerBase) return;
     setLoading(true);
     setError('');
     try {
@@ -134,7 +134,7 @@ export function AccountActionCandidatesPage() {
 
   const runAction = useCallback(
     async (candidate: AccountActionCandidate, action: CandidateAction) => {
-      if (!managerBase || !managementKey) return;
+      if (!managerBase) return;
       setActingId(candidate.id);
       try {
         switch (action) {

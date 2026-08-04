@@ -8,10 +8,13 @@ export type AuthSessionMode = 'manager_embedded' | 'external_panel';
 // 登录凭据
 export interface LoginCredentials {
   apiBase: string;
-  managementKey: string;
+  managementKey?: string;
+  email?: string;
+  password?: string;
   rememberPassword?: boolean;
   sessionMode?: AuthSessionMode;
   sessionPanelBase?: string;
+  managerSessionEstablished?: boolean;
 }
 
 export type LoginRecoveryMode = 'manager_config';

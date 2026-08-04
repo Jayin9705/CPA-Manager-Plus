@@ -27,7 +27,7 @@ func New(db *sql.DB) Repository {
 func (r *repository) LoadAll(ctx context.Context) ([]model.APIKeyAlias, error) {
 	rows, err := r.db.QueryContext(ctx, `select api_key_hash, alias, updated_at_ms
 		from api_key_aliases
-		order by alias collate nocase, api_key_hash`)
+		order by lower(alias), alias, api_key_hash`)
 	if err != nil {
 		return nil, err
 	}

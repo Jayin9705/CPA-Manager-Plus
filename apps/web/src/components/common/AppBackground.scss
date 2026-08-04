@@ -17,6 +17,12 @@
   animation: app-float 20s infinite ease-in-out alternate;
 }
 
+/* Operational console surfaces stay calm and predictable; decorative blobs
+   remain in the legacy stylesheet only as a rollback hook. */
+.app-background__shape {
+  display: none;
+}
+
 .app-background__shape-1 {
   top: -10%;
   right: -10%;
@@ -63,6 +69,12 @@
 }
 
 @media (max-width: 768px) {
+  .app-background__shape {
+    display: none;
+    filter: none;
+    animation: none;
+  }
+
   .app-background__shape-1 {
     width: 420px;
     height: 420px;

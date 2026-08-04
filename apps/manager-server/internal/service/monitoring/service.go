@@ -9,10 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/migration"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/pricing"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/usagehourly"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -27,14 +29,66 @@ const (
 	maxAccountHistoryTargets   = 200
 	accountHistoryCatchUpLimit = 5000
 	recentWindowMS             = 30 * 60 * 1000
-	// analyticsPrefetchConcurrency limits background analytics reads. The
-	// foreground summary/task path may hold one additional SQLite connection.
-	analyticsPrefetchConcurrency = 2
+	// SQLite has a deliberately small connection pool and its raw analytics
+	// path is CPU-heavy. PostgreSQL has independent connections and benefits
+	// from a little more parallelism while all dimensions share one snapshot.
+	analyticsSQLiteConcurrency   = 2
+	analyticsPostgresConcurrency = 4
+	analyticsQueryTimeout        = 20 * time.Second
+	modelPricesCacheTTL          = 10 * time.Second
 )
 
 type Service struct {
-	store        *store.Store
-	hourlyReader *usagehourly.Reader
+	store             *store.Store
+	hourlyReader      *usagehourly.Reader
+	cache             *RedisCache
+	analyticsCache    *analyticsMemoryCache
+	postgresSource    PostgresMonitoringSource
+	quotaUsageSource  QuotaWeeklyUsageSource
+	analyticsFlight   singleflight.Group
+	modelPricesMu     sync.Mutex
+	modelPrices       map[string]store.ModelPrice
+	modelPricesAt     time.Time
+	modelPricesFlight singleflight.Group
+}
+
+// PostgresMonitoringSource is the read-side contract used after raw usage
+// events have moved to PostgreSQL. The hourly aggregate method is embedded so
+// one connection can serve the core dashboard, account history and header
+// snapshot paths during the cutover.
+type PostgresMonitoringSource interface {
+	usagehourly.AggregateRowsSource
+	AggregateWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.Aggregate, error)
+	ModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter, limit int) ([]store.ModelStat, error)
+	TimelineWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.TimelinePoint, error)
+	LatencyPercentilesWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.LatencyPercentiles, error)
+	LatencySummaryWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.LatencySummary, error)
+	HourlyDistributionWithFilter(ctx context.Context, filter store.AnalyticsFilter, location *time.Location) ([]store.HourlyPoint, error)
+	FilterOptionValuesWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.FilterOptionValues, error)
+	FilterSelectorValuesWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.FilterSelectorValues, error)
+	HeatmapWithFilter(ctx context.Context, filter store.AnalyticsFilter, location *time.Location) ([]store.HeatmapPoint, error)
+	ChannelModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.ChannelModelStat, error)
+	FailureSourcesWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.FailureSourceStat, error)
+	AccountModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.AccountModelStat, error)
+	CredentialModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.CredentialModelStat, error)
+	CredentialTimelineWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.CredentialTimelinePoint, error)
+	APIKeyTimelineWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.APIKeyTimelinePoint, error)
+	APIKeyModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.APIKeyModelStat, error)
+	TaskBucketsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.TaskBucket, error)
+	ActiveDaysWithFilter(ctx context.Context, filter store.AnalyticsFilter, location *time.Location) (int64, error)
+	ZeroTokenModelsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]string, error)
+	LatestHeaderSnapshots(ctx context.Context, sinceMS int64, limit int) ([]store.HeaderSnapshot, error)
+	AccountHistoryRows(ctx context.Context, accountKeys []string) ([]store.AccountHistoryRollupRow, error)
+	LatestUsageEventID(ctx context.Context) (int64, error)
+	RecentFailuresWithFilter(ctx context.Context, filter store.AnalyticsFilter, limit int) ([]store.RecentFailure, error)
+	EventsCountWithFilter(ctx context.Context, filter store.AnalyticsFilter) (int64, error)
+	EventsPageWithFilter(ctx context.Context, filter store.AnalyticsFilter, beforeMS int64, beforeID int64, limit int) (store.EventsPage, error)
+}
+
+// QuotaWeeklyUsageSource is kept separate from PostgresMonitoringSource so
+// existing monitoring test doubles and alternate read sides remain compatible.
+type QuotaWeeklyUsageSource interface {
+	QuotaWeeklyUsageModelStats(ctx context.Context, targets []store.QuotaWeeklyUsageTarget) ([]store.QuotaWeeklyUsageModelStat, error)
 }
 
 type analyticsQueryGroup struct {
@@ -95,14 +149,280 @@ func (g *analyticsQueryGroup) Close() {
 }
 
 func New(store *store.Store, hourlyRollupEnabled ...bool) *Service {
+	return NewWithCache(store, nil, hourlyRollupEnabled...)
+}
+
+func NewWithCache(store *store.Store, cache *RedisCache, hourlyRollupEnabled ...bool) *Service {
 	enabled := false
 	if len(hourlyRollupEnabled) > 0 {
 		enabled = hourlyRollupEnabled[0]
 	}
-	return &Service{
-		store:        store,
-		hourlyReader: usagehourly.New(store, enabled, "monitoring-rollup"),
+	freshTTL := defaultAnalyticsCacheFreshTTL
+	staleTTL := defaultAnalyticsCacheStaleTTL
+	if cache != nil {
+		freshTTL = cache.freshTTL
+		staleTTL = cache.staleTTL
 	}
+	return &Service{
+		store:          store,
+		hourlyReader:   usagehourly.New(store, enabled, "monitoring-rollup"),
+		cache:          cache,
+		analyticsCache: newAnalyticsMemoryCache(freshTTL, staleTTL),
+	}
+}
+
+func (s *Service) SetRowsSource(source usagehourly.AggregateRowsSource) {
+	if s == nil || s.hourlyReader == nil {
+		return
+	}
+	s.hourlyReader.SetRowsSource(source)
+	if postgresSource, ok := source.(PostgresMonitoringSource); ok {
+		s.postgresSource = postgresSource
+	}
+	if quotaUsageSource, ok := source.(QuotaWeeklyUsageSource); ok {
+		s.quotaUsageSource = quotaUsageSource
+	}
+}
+
+func (s *Service) SetPostgresSource(source PostgresMonitoringSource) {
+	if s == nil {
+		return
+	}
+	s.postgresSource = source
+	if quotaUsageSource, ok := source.(QuotaWeeklyUsageSource); ok {
+		s.quotaUsageSource = quotaUsageSource
+	} else {
+		s.quotaUsageSource = nil
+	}
+	if s.hourlyReader != nil {
+		s.hourlyReader.SetRowsSource(source)
+	}
+}
+
+// SetQuotaWeeklyUsageSource supports focused tests and alternate deployments
+// without widening the main PostgreSQL monitoring interface.
+func (s *Service) SetQuotaWeeklyUsageSource(source QuotaWeeklyUsageSource) {
+	if s == nil {
+		return
+	}
+	s.quotaUsageSource = source
+}
+
+func (s *Service) SetCache(cache *RedisCache) {
+	if s == nil {
+		return
+	}
+	s.cache = cache
+	if cache != nil {
+		// A runtime cache replacement must use the same freshness policy as
+		// the process-local L1; otherwise one layer could evict a response
+		// while the other still considers it fresh.
+		s.analyticsCache = newAnalyticsMemoryCache(cache.freshTTL, cache.staleTTL)
+	}
+}
+
+func (s *Service) loadModelPrices(ctx context.Context) (map[string]store.ModelPrice, error) {
+	if s == nil || s.store == nil {
+		return nil, errors.New("model price store is not configured")
+	}
+	now := time.Now()
+	s.modelPricesMu.Lock()
+	if s.modelPrices != nil && !s.modelPricesAt.IsZero() && now.Sub(s.modelPricesAt) < modelPricesCacheTTL {
+		prices := cloneModelPrices(s.modelPrices)
+		s.modelPricesMu.Unlock()
+		return prices, nil
+	}
+	s.modelPricesMu.Unlock()
+
+	result, err, _ := s.modelPricesFlight.Do("load", func() (any, error) {
+		now := time.Now()
+		s.modelPricesMu.Lock()
+		if s.modelPrices != nil && !s.modelPricesAt.IsZero() && now.Sub(s.modelPricesAt) < modelPricesCacheTTL {
+			prices := cloneModelPrices(s.modelPrices)
+			s.modelPricesMu.Unlock()
+			return prices, nil
+		}
+		s.modelPricesMu.Unlock()
+
+		prices, err := s.store.LoadModelPrices(ctx)
+		if err != nil {
+			return nil, err
+		}
+		s.modelPricesMu.Lock()
+		s.modelPrices = cloneModelPrices(prices)
+		s.modelPricesAt = time.Now()
+		s.modelPricesMu.Unlock()
+		return cloneModelPrices(prices), nil
+	})
+	if err != nil {
+		s.modelPricesMu.Lock()
+		stale := cloneModelPrices(s.modelPrices)
+		s.modelPricesMu.Unlock()
+		if stale != nil {
+			return stale, nil
+		}
+		return nil, err
+	}
+	prices, ok := result.(map[string]store.ModelPrice)
+	if !ok {
+		return nil, errors.New("invalid monitoring model price cache result")
+	}
+	return cloneModelPrices(prices), nil
+}
+
+func cloneModelPrices(prices map[string]store.ModelPrice) map[string]store.ModelPrice {
+	if prices == nil {
+		return nil
+	}
+	clone := make(map[string]store.ModelPrice, len(prices))
+	for model, price := range prices {
+		clone[model] = price
+	}
+	return clone
+}
+
+// The PostgreSQL source is the canonical monitoring read side after the
+// Redis-to-PostgreSQL cutover. Each wrapper keeps the old Store path available
+// for local development and for an explicit, safe fallback when PostgreSQL is
+// not configured.
+func (s *Service) aggregateWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.Aggregate, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.AggregateWithFilter(ctx, filter)
+	}
+	return s.store.AggregateWithFilter(ctx, filter)
+}
+
+func (s *Service) modelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter, limit int) ([]store.ModelStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.ModelStatsWithFilter(ctx, filter, limit)
+	}
+	return s.store.ModelStatsWithFilter(ctx, filter, limit)
+}
+
+func (s *Service) timelineWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.TimelinePoint, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.TimelineWithFilter(ctx, filter, granularity, location)
+	}
+	return s.store.TimelineWithFilter(ctx, filter, granularity, location)
+}
+
+func (s *Service) latencyPercentilesWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.LatencyPercentiles, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.LatencyPercentilesWithFilter(ctx, filter, granularity, location)
+	}
+	return s.store.LatencyPercentilesWithFilter(ctx, filter, granularity, location)
+}
+
+func (s *Service) latencySummaryWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.LatencySummary, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.LatencySummaryWithFilter(ctx, filter)
+	}
+	return s.store.LatencySummaryWithFilter(ctx, filter)
+}
+
+func (s *Service) hourlyDistributionWithFilter(ctx context.Context, filter store.AnalyticsFilter, location *time.Location) ([]store.HourlyPoint, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.HourlyDistributionWithFilter(ctx, filter, location)
+	}
+	return s.store.HourlyDistributionWithFilter(ctx, filter, location)
+}
+
+func (s *Service) filterOptionValuesWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.FilterOptionValues, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.FilterOptionValuesWithFilter(ctx, filter)
+	}
+	return s.store.FilterOptionValuesWithFilter(ctx, filter)
+}
+
+func (s *Service) filterSelectorValuesWithFilter(ctx context.Context, filter store.AnalyticsFilter) (store.FilterSelectorValues, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.FilterSelectorValuesWithFilter(ctx, filter)
+	}
+	return s.store.FilterSelectorValuesWithFilter(ctx, filter)
+}
+
+func (s *Service) heatmapWithFilter(ctx context.Context, filter store.AnalyticsFilter, location *time.Location) ([]store.HeatmapPoint, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.HeatmapWithFilter(ctx, filter, location)
+	}
+	return s.store.HeatmapWithFilter(ctx, filter, location)
+}
+
+func (s *Service) channelModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.ChannelModelStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.ChannelModelStatsWithFilter(ctx, filter)
+	}
+	return s.store.ChannelModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) failureSourcesWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.FailureSourceStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.FailureSourcesWithFilter(ctx, filter)
+	}
+	return s.store.FailureSourcesWithFilter(ctx, filter)
+}
+
+func (s *Service) accountModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.AccountModelStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.AccountModelStatsWithFilter(ctx, filter)
+	}
+	return s.store.AccountModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) credentialModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.CredentialModelStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.CredentialModelStatsWithFilter(ctx, filter)
+	}
+	return s.store.CredentialModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) credentialTimelineWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.CredentialTimelinePoint, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.CredentialTimelineWithFilter(ctx, filter, granularity, location)
+	}
+	return s.store.CredentialTimelineWithFilter(ctx, filter, granularity, location)
+}
+
+func (s *Service) apiKeyTimelineWithFilter(ctx context.Context, filter store.AnalyticsFilter, granularity string, location *time.Location) ([]store.APIKeyTimelinePoint, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.APIKeyTimelineWithFilter(ctx, filter, granularity, location)
+	}
+	return s.store.APIKeyTimelineWithFilter(ctx, filter, granularity, location)
+}
+
+func (s *Service) apiKeyModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.APIKeyModelStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.APIKeyModelStatsWithFilter(ctx, filter)
+	}
+	return s.store.APIKeyModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) taskBucketsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.TaskBucket, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.TaskBucketsWithFilter(ctx, filter)
+	}
+	return s.store.TaskBucketsWithFilter(ctx, filter)
+}
+
+func (s *Service) activeDaysWithFilter(ctx context.Context, filter store.AnalyticsFilter, location *time.Location) (int64, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.ActiveDaysWithFilter(ctx, filter, location)
+	}
+	return s.store.ActiveDaysWithFilter(ctx, filter, location)
+}
+
+func (s *Service) zeroTokenModelsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]string, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.ZeroTokenModelsWithFilter(ctx, filter)
+	}
+	return s.store.ZeroTokenModelsWithFilter(ctx, filter)
+}
+
+func (s *Service) Close() error {
+	if s == nil || s.cache == nil {
+		return nil
+	}
+	return s.cache.Close()
 }
 
 type Request struct {
@@ -724,6 +1044,98 @@ type EventRow struct {
 }
 
 func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) {
+	key := analyticsCacheKey(req)
+	if response, state, _, ok := s.cachedAnalyticsResponse(ctx, key); ok {
+		if state == monitoringCacheStale {
+			s.refreshAnalyticsAsync(key, req)
+		}
+		return response, nil
+	}
+	return s.refreshAnalytics(ctx, key, req)
+}
+
+func (s *Service) cachedAnalyticsResponse(ctx context.Context, key string) (Response, monitoringCacheState, time.Time, bool) {
+	if s.analyticsCache != nil {
+		if response, state, storedAt := s.analyticsCache.get(key); state != monitoringCacheMiss {
+			return response, state, storedAt, true
+		}
+	}
+	if s.cache == nil {
+		return Response{}, monitoringCacheMiss, time.Time{}, false
+	}
+	var cached Response
+	state, storedAt := s.cache.getState(ctx, key, &cached)
+	if state == monitoringCacheMiss {
+		return Response{}, state, time.Time{}, false
+	}
+	if s.analyticsCache != nil {
+		s.analyticsCache.setAt(key, cached, storedAt)
+	}
+	return cached, state, storedAt, true
+}
+
+func (s *Service) refreshAnalyticsAsync(key string, req Request) {
+	// The singleflight group below coalesces these calls. The goroutine keeps a
+	// stale HTTP request completely independent from the refresh query and its
+	// client cancellation.
+	go func() {
+		_, _ = s.refreshAnalytics(context.Background(), key, req)
+	}()
+}
+
+func (s *Service) refreshAnalytics(ctx context.Context, key string, req Request) (Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sharedBaseContext := context.WithoutCancel(ctx)
+	resultCh := s.analyticsFlight.DoChan(key, func() (any, error) {
+		queryCtx, cancel := context.WithTimeout(sharedBaseContext, analyticsQueryTimeout)
+		defer cancel()
+
+		// Another request may have populated either cache between the initial
+		// lookup and joining singleflight. Only a fresh entry can short-circuit
+		// a refresh; stale entries intentionally fall through to the source.
+		if response, state, _, ok := s.cachedAnalyticsResponse(queryCtx, key); ok && state == monitoringCacheFresh {
+			return response, nil
+		}
+
+		response, queryErr := s.analyticsUncached(queryCtx, req)
+		if queryErr == nil {
+			if s.analyticsCache != nil {
+				s.analyticsCache.set(key, response)
+			}
+			if s.cache != nil {
+				// Redis is L2 durability/sharing, not part of the request's
+				// critical path. A slow Redis write must not be visible to the
+				// management API latency.
+				s.cache.setAsync(key, response)
+			}
+		}
+		return response, queryErr
+	})
+	select {
+	case <-ctx.Done():
+		return Response{}, ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return Response{}, result.Err
+		}
+		response, ok := result.Val.(Response)
+		if !ok {
+			return Response{}, errors.New("invalid monitoring analytics result")
+		}
+		return response, nil
+	}
+}
+
+func (s *Service) analyticsQueryConcurrency() int {
+	if s.postgresSource != nil {
+		return analyticsPostgresConcurrency
+	}
+	return analyticsSQLiteConcurrency
+}
+
+func (s *Service) analyticsUncached(ctx context.Context, req Request) (Response, error) {
 	var response Response
 	err := s.store.WithModelPriceSnapshot(func() error {
 		var analyticsErr error
@@ -736,6 +1148,12 @@ func (s *Service) Analytics(ctx context.Context, req Request) (Response, error) 
 func (s *Service) analytics(ctx context.Context, req Request) (Response, error) {
 	if req.FromMS <= 0 || req.ToMS <= 0 || req.FromMS >= req.ToMS {
 		return Response{}, errors.New("from_ms and to_ms are required and from_ms must be less than to_ms")
+	}
+	if s.postgresSource != nil {
+		// One request often asks for summary, model, channel, account and
+		// credential dimensions over the same filter. Let the PostgreSQL source
+		// share one decoded event snapshot across those readers.
+		ctx = migration.WithMonitoringQueryCache(ctx)
 	}
 	nowMS := req.NowMS
 	if nowMS <= 0 {
@@ -794,21 +1212,21 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 		if hourlySnapshotAvailable {
 			modelStats = hourlySnapshot.ModelStats
 		} else {
-			modelStats, err = s.store.ModelStatsWithFilter(ctx, filter, 0)
+			modelStats, err = s.modelStatsWithFilter(ctx, filter, 0)
 			if err != nil {
 				return Response{}, err
 			}
 		}
 	}
 
-	queries := newAnalyticsQueryGroup(ctx, analyticsPrefetchConcurrency)
+	queries := newAnalyticsQueryGroup(ctx, s.analyticsQueryConcurrency())
 	defer queries.Close()
 
 	var latencyPercentiles []store.LatencyPercentiles
 	if req.Include.Timeline || req.Include.AnomalyPoints {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			latencyPercentiles, queryErr = s.store.LatencyPercentilesWithFilter(queryCtx, filter, granularity, location)
+			latencyPercentiles, queryErr = s.latencyPercentilesWithFilter(queryCtx, filter, granularity, location)
 			return queryErr
 		})
 	}
@@ -817,7 +1235,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.HourlyDistribution {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			hourlyDistributionPoints, queryErr = s.store.HourlyDistributionWithFilter(queryCtx, filter, location)
+			hourlyDistributionPoints, queryErr = s.hourlyDistributionWithFilter(queryCtx, filter, location)
 			return queryErr
 		})
 	}
@@ -826,7 +1244,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.Heatmap {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			heatmapPoints, queryErr = s.store.HeatmapWithFilter(queryCtx, filter, location)
+			heatmapPoints, queryErr = s.heatmapWithFilter(queryCtx, filter, location)
 			return queryErr
 		})
 	}
@@ -834,7 +1252,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.ChannelShare {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			channelStats, queryErr = s.store.ChannelModelStatsWithFilter(queryCtx, filter)
+			channelStats, queryErr = s.channelModelStatsWithFilter(queryCtx, filter)
 			return queryErr
 		})
 	}
@@ -843,7 +1261,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.FailureSources {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			failureSourceStats, queryErr = s.store.FailureSourcesWithFilter(queryCtx, filter)
+			failureSourceStats, queryErr = s.failureSourcesWithFilter(queryCtx, filter)
 			return queryErr
 		})
 	}
@@ -851,7 +1269,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.AccountStats {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			accountStats, queryErr = s.store.AccountModelStatsWithFilter(queryCtx, filter)
+			accountStats, queryErr = s.accountModelStatsWithFilter(queryCtx, filter)
 			return queryErr
 		})
 	}
@@ -860,7 +1278,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.CredentialStats {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			credentialStats, queryErr = s.store.CredentialModelStatsWithFilter(queryCtx, filter)
+			credentialStats, queryErr = s.credentialModelStatsWithFilter(queryCtx, filter)
 			return queryErr
 		})
 	}
@@ -869,7 +1287,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.CredentialTimeline {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			credentialTimelinePoints, queryErr = s.store.CredentialTimelineWithFilter(queryCtx, filter, granularity, location)
+			credentialTimelinePoints, queryErr = s.credentialTimelineWithFilter(queryCtx, filter, granularity, location)
 			return queryErr
 		})
 	}
@@ -878,7 +1296,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.APIKeyTimeline {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			apiKeyTimelinePoints, queryErr = s.store.APIKeyTimelineWithFilter(queryCtx, filter, granularity, location)
+			apiKeyTimelinePoints, queryErr = s.apiKeyTimelineWithFilter(queryCtx, filter, granularity, location)
 			return queryErr
 		})
 	}
@@ -886,7 +1304,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.APIKeyStats {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			apiKeyStats, queryErr = s.store.APIKeyModelStatsWithFilter(queryCtx, filter)
+			apiKeyStats, queryErr = s.apiKeyModelStatsWithFilter(queryCtx, filter)
 			return queryErr
 		})
 	}
@@ -905,7 +1323,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 		if filterOptionsMatchMainScope(filter) {
 			queries.Go(func(queryCtx context.Context) error {
 				var queryErr error
-				filterOptionValues, queryErr = s.store.FilterOptionValuesWithFilter(queryCtx, filterOptionsBaseFilter(filter))
+				filterOptionValues, queryErr = s.filterOptionValuesWithFilter(queryCtx, filterOptionsBaseFilter(filter))
 				filterOptionValuesAvailable = queryErr == nil
 				return queryErr
 			})
@@ -922,7 +1340,11 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 	if req.Include.RecentFailures > 0 {
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			recentFailureRows, queryErr = s.store.RecentFailuresWithFilter(queryCtx, filter, req.Include.RecentFailures)
+			if s.postgresSource != nil {
+				recentFailureRows, queryErr = s.postgresSource.RecentFailuresWithFilter(queryCtx, filter, req.Include.RecentFailures)
+			} else {
+				recentFailureRows, queryErr = s.store.RecentFailuresWithFilter(queryCtx, filter, req.Include.RecentFailures)
+			}
 			return queryErr
 		})
 	}
@@ -946,14 +1368,18 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 		}
 		queries.Go(func(queryCtx context.Context) error {
 			var queryErr error
-			eventsPage, queryErr = s.store.EventsPageWithFilter(queryCtx, filter, beforeMS, beforeID, limit)
+			if s.postgresSource != nil {
+				eventsPage, queryErr = s.postgresSource.EventsPageWithFilter(queryCtx, filter, beforeMS, beforeID, limit)
+			} else {
+				eventsPage, queryErr = s.store.EventsPageWithFilter(queryCtx, filter, beforeMS, beforeID, limit)
+			}
 			return queryErr
 		})
 	}
 
 	var taskBuckets []store.TaskBucket
 	if req.Include.TaskBuckets || (req.Include.Summary && !compactSummary) {
-		taskBuckets, err = s.store.TaskBucketsWithFilter(ctx, filter)
+		taskBuckets, err = s.taskBucketsWithFilter(ctx, filter)
 		if err != nil {
 			return Response{}, err
 		}
@@ -964,14 +1390,14 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 		if hourlySnapshotAvailable {
 			agg = hourlySnapshot.Aggregate
 		} else {
-			agg, err = s.store.AggregateWithFilter(ctx, filter)
+			agg, err = s.aggregateWithFilter(ctx, filter)
 			if err != nil {
 				return Response{}, err
 			}
 		}
 		var latencySummary store.LatencySummary
 		if !compactSummary || req.Include.SummaryPercentiles {
-			latencySummary, err = s.store.LatencySummaryWithFilter(ctx, filter)
+			latencySummary, err = s.latencySummaryWithFilter(ctx, filter)
 			if err != nil {
 				return Response{}, err
 			}
@@ -983,15 +1409,15 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 			rollingFilter := filter
 			rollingFilter.FromMS = nowMS - recentWindowMS
 			rollingFilter.ToMS = nowMS
-			rollingAgg, err = s.store.AggregateWithFilter(ctx, rollingFilter)
+			rollingAgg, err = s.aggregateWithFilter(ctx, rollingFilter)
 			if err != nil {
 				return Response{}, err
 			}
-			activeDays, err = s.store.ActiveDaysWithFilter(ctx, filter, location)
+			activeDays, err = s.activeDaysWithFilter(ctx, filter, location)
 			if err != nil {
 				return Response{}, err
 			}
-			zeroTokenModels, err = s.store.ZeroTokenModelsWithFilter(ctx, filter)
+			zeroTokenModels, err = s.zeroTokenModelsWithFilter(ctx, filter)
 			if err != nil {
 				return Response{}, err
 			}
@@ -1033,11 +1459,11 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 					prevAgg = prevSnapshot.Aggregate
 					prevModelStats = prevSnapshot.ModelStats
 				} else {
-					prevAgg, err = s.store.AggregateWithFilter(ctx, prevFilter)
+					prevAgg, err = s.aggregateWithFilter(ctx, prevFilter)
 					if err != nil {
 						return Response{}, err
 					}
-					prevModelStats, err = s.store.ModelStatsWithFilter(ctx, prevFilter, 0)
+					prevModelStats, err = s.modelStatsWithFilter(ctx, prevFilter, 0)
 					if err != nil {
 						return Response{}, err
 					}
@@ -1066,7 +1492,7 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 			points, pointsAvailable = s.hourlyReader.AnalyticsTimeline(ctx, hourlySnapshot, granularity, location)
 		}
 		if !pointsAvailable {
-			points, err = s.store.TimelineWithFilter(ctx, filter, granularity, location)
+			points, err = s.timelineWithFilter(ctx, filter, granularity, location)
 			if err != nil {
 				return Response{}, err
 			}
@@ -1165,7 +1591,11 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 		// lightweight count(*).
 		total := summaryTotalCalls
 		if !summaryComputed {
-			total, err = s.store.EventsCountWithFilter(ctx, filter)
+			if s.postgresSource != nil {
+				total, err = s.postgresSource.EventsCountWithFilter(ctx, filter)
+			} else {
+				total, err = s.store.EventsCountWithFilter(ctx, filter)
+			}
 			if err != nil {
 				return Response{}, err
 			}
@@ -1185,7 +1615,12 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 			if limit > maxDrilldownLimit {
 				limit = maxDrilldownLimit
 			}
-			page, err := s.store.EventsPageWithFilter(ctx, previewFilter, 0, 0, limit)
+			var page store.EventsPage
+			if s.postgresSource != nil {
+				page, err = s.postgresSource.EventsPageWithFilter(ctx, previewFilter, 0, 0, limit)
+			} else {
+				page, err = s.store.EventsPageWithFilter(ctx, previewFilter, 0, 0, limit)
+			}
 			if err != nil {
 				return Response{}, err
 			}
@@ -1197,6 +1632,24 @@ func (s *Service) analytics(ctx context.Context, req Request) (Response, error) 
 }
 
 func (s *Service) AccountHistory(ctx context.Context, req AccountHistoryRequest) (AccountHistoryResponse, error) {
+	// A catch-up request is allowed to mutate the legacy rollup checkpoint, so
+	// do not cache it. Read-only account history requests are safe to cache for
+	// the same short TTL as analytics.
+	if s.cache != nil && !req.CatchUp {
+		var cached AccountHistoryResponse
+		if s.cache.get(ctx, accountHistoryCacheKey(req), &cached) {
+			return cached, nil
+		}
+		result, err := s.accountHistoryUncached(ctx, req)
+		if err == nil {
+			s.cache.setAsync(accountHistoryCacheKey(req), result)
+		}
+		return result, err
+	}
+	return s.accountHistoryUncached(ctx, req)
+}
+
+func (s *Service) accountHistoryUncached(ctx context.Context, req AccountHistoryRequest) (AccountHistoryResponse, error) {
 	var response AccountHistoryResponse
 	err := s.store.WithModelPriceSnapshot(func() error {
 		var historyErr error
@@ -1215,25 +1668,6 @@ func (s *Service) accountHistory(ctx context.Context, req AccountHistoryRequest)
 	}
 	generatedAtMS := time.Now().UnixMilli()
 	processed := 0
-	if req.CatchUp {
-		result, err := s.store.CatchUpAccountHistoryRollups(ctx, accountHistoryCatchUpLimit, generatedAtMS)
-		if err != nil {
-			return AccountHistoryResponse{}, err
-		}
-		processed = result.Processed
-		if _, err := s.store.CatchUpUsagePricing(ctx, accountHistoryCatchUpLimit, generatedAtMS); err != nil {
-			return AccountHistoryResponse{}, err
-		}
-	}
-	checkpoint, err := s.store.AccountHistoryRollupCheckpoint(ctx)
-	if err != nil {
-		return AccountHistoryResponse{}, err
-	}
-	latestID, err := s.store.LatestUsageEventID(ctx)
-	if err != nil {
-		return AccountHistoryResponse{}, err
-	}
-
 	keys := make([]string, 0, len(req.Accounts))
 	targetKeys := make([]string, len(req.Accounts))
 	validTargets := make([]bool, len(req.Accounts))
@@ -1245,20 +1679,67 @@ func (s *Service) accountHistory(ctx context.Context, req AccountHistoryRequest)
 			keys = append(keys, key)
 		}
 	}
-	pricingSnapshot, err := s.store.LoadUsagePricingAccountSnapshot(ctx, keys)
-	if err != nil {
-		return AccountHistoryResponse{}, err
-	}
-	prices := pricingSnapshot.Prices
-	var totals map[string]*accountHistoryTotal
-	if pricingSnapshot.Available {
-		totals = buildPricingAccountHistoryTotals(pricingSnapshot.Rows, prices)
-	} else {
-		rows, err := s.store.AccountHistoryRollupRows(ctx, keys)
+	var (
+		err        error
+		checkpoint store.UsageRollupCheckpoint
+		latestID   int64
+		totals     map[string]*accountHistoryTotal
+	)
+	if s.postgresSource != nil {
+		latestID, err = s.postgresSource.LatestUsageEventID(ctx)
 		if err != nil {
 			return AccountHistoryResponse{}, err
 		}
+		checkpoint = store.UsageRollupCheckpoint{
+			Name:                "postgres.account_history",
+			LastEventID:         latestID,
+			UpdatedAtMS:         generatedAtMS,
+			LastRunFinishedAtMS: generatedAtMS,
+		}
+		rows, rowsErr := s.postgresSource.AccountHistoryRows(ctx, keys)
+		if rowsErr != nil {
+			return AccountHistoryResponse{}, rowsErr
+		}
+		prices, pricesErr := s.store.LoadModelPrices(ctx)
+		if pricesErr != nil {
+			return AccountHistoryResponse{}, pricesErr
+		}
 		totals = buildAccountHistoryTotals(rows, prices)
+	} else {
+		if req.CatchUp {
+			result, catchUpErr := s.store.CatchUpAccountHistoryRollups(ctx, accountHistoryCatchUpLimit, generatedAtMS)
+			if catchUpErr != nil {
+				return AccountHistoryResponse{}, catchUpErr
+			}
+			processed = result.Processed
+			if _, catchUpErr := s.store.CatchUpUsagePricing(ctx, accountHistoryCatchUpLimit, generatedAtMS); catchUpErr != nil {
+				return AccountHistoryResponse{}, catchUpErr
+			}
+		}
+		checkpoint, err = s.store.AccountHistoryRollupCheckpoint(ctx)
+		if err != nil {
+			return AccountHistoryResponse{}, err
+		}
+		latestID, err = s.store.LatestUsageEventID(ctx)
+		if err != nil {
+			return AccountHistoryResponse{}, err
+		}
+		pricingSnapshot, snapshotErr := s.store.LoadUsagePricingAccountSnapshot(ctx, keys)
+		if snapshotErr != nil {
+			return AccountHistoryResponse{}, snapshotErr
+		}
+		if pricingSnapshot.Available {
+			totals = buildPricingAccountHistoryTotals(pricingSnapshot.Rows, pricingSnapshot.Prices)
+		} else {
+			rows, rowsErr := s.store.AccountHistoryRollupRows(ctx, keys)
+			if rowsErr != nil {
+				return AccountHistoryResponse{}, rowsErr
+			}
+			totals = buildAccountHistoryTotals(rows, pricingSnapshot.Prices)
+		}
+	}
+	if totals == nil {
+		totals = map[string]*accountHistoryTotal{}
 	}
 	pending := latestID > checkpoint.LastEventID
 	items := make([]AccountHistoryItem, 0, len(req.Accounts))
@@ -1314,6 +1795,21 @@ func (s *Service) accountHistory(ctx context.Context, req AccountHistoryRequest)
 }
 
 func (s *Service) HeaderSnapshots(ctx context.Context, req HeaderSnapshotsRequest) (HeaderSnapshotsResponse, error) {
+	if s.cache != nil {
+		var cached HeaderSnapshotsResponse
+		if s.cache.get(ctx, headerSnapshotsCacheKey(req), &cached) {
+			return cached, nil
+		}
+		result, err := s.headerSnapshotsUncached(ctx, req)
+		if err == nil {
+			s.cache.setAsync(headerSnapshotsCacheKey(req), result)
+		}
+		return result, err
+	}
+	return s.headerSnapshotsUncached(ctx, req)
+}
+
+func (s *Service) headerSnapshotsUncached(ctx context.Context, req HeaderSnapshotsRequest) (HeaderSnapshotsResponse, error) {
 	days := req.Days
 	if days <= 0 {
 		days = defaultHeaderSnapshotDays
@@ -1330,7 +1826,13 @@ func (s *Service) HeaderSnapshots(ctx context.Context, req HeaderSnapshotsReques
 	}
 	nowMS := time.Now().UnixMilli()
 	fromMS := nowMS - int64(days)*24*60*60*1000
-	items, err := s.store.LatestHeaderSnapshots(ctx, fromMS, limit)
+	var items []store.HeaderSnapshot
+	var err error
+	if s.postgresSource != nil {
+		items, err = s.postgresSource.LatestHeaderSnapshots(ctx, fromMS, limit)
+	} else {
+		items, err = s.store.LatestHeaderSnapshots(ctx, fromMS, limit)
+	}
 	if err != nil {
 		return HeaderSnapshotsResponse{}, err
 	}
@@ -1401,7 +1903,7 @@ func (s *Service) filterOptions(
 	accountStats := reuse.accountStats
 	if !reuse.accountStatsAvailable {
 		var err error
-		accountStats, err = s.store.AccountModelStatsWithFilter(ctx, optionFilter)
+		accountStats, err = s.accountModelStatsWithFilter(ctx, optionFilter)
 		if err != nil {
 			return nil, err
 		}
@@ -1409,7 +1911,7 @@ func (s *Service) filterOptions(
 	apiKeyStats := reuse.apiKeyStats
 	if !reuse.apiKeyStatsAvailable {
 		var err error
-		apiKeyStats, err = s.store.APIKeyModelStatsWithFilter(ctx, optionFilter)
+		apiKeyStats, err = s.apiKeyModelStatsWithFilter(ctx, optionFilter)
 		if err != nil {
 			return nil, err
 		}
@@ -1417,7 +1919,7 @@ func (s *Service) filterOptions(
 	channelStats := reuse.channelStats
 	if !reuse.channelStatsAvailable {
 		var err error
-		channelStats, err = s.store.ChannelModelStatsWithFilter(ctx, optionFilter)
+		channelStats, err = s.channelModelStatsWithFilter(ctx, optionFilter)
 		if err != nil {
 			return nil, err
 		}
@@ -1425,7 +1927,7 @@ func (s *Service) filterOptions(
 	modelStats := reuse.modelStats
 	if !reuse.modelStatsAvailable {
 		var err error
-		modelStats, err = s.store.ModelStatsWithFilter(ctx, optionFilter, 0)
+		modelStats, err = s.modelStatsWithFilter(ctx, optionFilter, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -1433,7 +1935,7 @@ func (s *Service) filterOptions(
 	optionValues := reuse.optionValues
 	if !reuse.optionValuesAvailable {
 		var err error
-		optionValues, err = s.store.FilterOptionValuesWithFilter(ctx, optionFilter)
+		optionValues, err = s.filterOptionValuesWithFilter(ctx, optionFilter)
 		if err != nil {
 			return nil, err
 		}
@@ -1477,7 +1979,7 @@ func filterOptionsMatchMainScope(filter store.AnalyticsFilter) bool {
 }
 
 func (s *Service) filterSelectors(ctx context.Context, filter store.AnalyticsFilter) (*FilterOptions, error) {
-	values, err := s.store.FilterSelectorValuesWithFilter(ctx, filterOptionsBaseFilter(filter))
+	values, err := s.filterSelectorValuesWithFilter(ctx, filterOptionsBaseFilter(filter))
 	if err != nil {
 		return nil, err
 	}
@@ -2082,6 +2584,15 @@ func buildChannelShare(stats []store.ChannelModelStat, prices map[string]store.M
 		}
 		result = append(result, entry.row)
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Calls != result[j].Calls {
+			return result[i].Calls > result[j].Calls
+		}
+		if result[i].AuthIndex != result[j].AuthIndex {
+			return result[i].AuthIndex < result[j].AuthIndex
+		}
+		return result[i].Source < result[j].Source
+	})
 	return result
 }
 

@@ -9,7 +9,8 @@ export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
 // API 客户端配置
 export interface ApiClientConfig {
   apiBase: string;
-  managementKey: string;
+  managementKey?: string;
+  withCredentials?: boolean;
   timeout?: number;
 }
 

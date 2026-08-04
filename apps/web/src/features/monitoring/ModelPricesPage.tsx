@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { IconPencil, IconSearch, IconTrash2, IconX } from '@/components/ui/icons';
@@ -27,6 +28,8 @@ import {
   formatServiceTierRule,
   getModelPriceCandidateIdentity,
   groupModelPriceCandidatesBySource,
+  isOfficialPriceSource,
+  normalizeModelIdentity,
   resolveContextTierDisplayPrice,
   resolveServiceTierDisplayPrice,
   type ModelPriceFilter,
@@ -42,6 +45,12 @@ const resolveErrorMessage = (error: unknown, fallback: string) => {
   return rawMessage === 'model_price_sync_requires_usage_service'
     ? 'model_price_sync_requires_usage_service'
     : rawMessage;
+};
+
+const resolvePriceSourceLabel = (source: string | undefined, t: TFunction) => {
+  const normalizedSource = source?.trim().toLowerCase() || 'manual';
+  const sourceKey = normalizedSource.replace(/[^a-z0-9]+/g, '_');
+  return t(`model_prices.source_${sourceKey}`, { defaultValue: source || normalizedSource });
 };
 
 export function ModelPricesPage() {
@@ -76,6 +85,7 @@ export function ModelPricesPage() {
     [candidateSets, modelPrices, usageSummary]
   );
   const summary = useMemo(() => buildModelPriceSummary(rows), [rows]);
+  const currentRows = useMemo(() => rows.filter((row) => row.calls > 0), [rows]);
   const visibleRows = useMemo(
     () => filterModelPriceRows(rows, filter, search),
     [filter, rows, search]
@@ -181,12 +191,7 @@ export function ModelPricesPage() {
       showNotification(t('usage_stats.model_price_model_required'), 'warning');
       return;
     }
-    await setModelPrices({
-      ...modelPrices,
-      [model]: {
-        ...price,
-      },
-    });
+    await setModelPrices({ ...modelPrices, [model]: price });
     setDraft(createEmptyPriceDraft());
     setManualEditorOpen(false);
     showNotification(t('usage_stats.model_price_saved'), 'success');
@@ -220,6 +225,10 @@ export function ModelPricesPage() {
     <div className={styles.page}>
       <section className={styles.actionBar} aria-label={t('common.action')}>
         <div className={styles.titleGroup}>
+          <div className={styles.pageTitle}>
+            <span className={styles.pageEyebrow}>{t('model_prices.eyebrow')}</span>
+            <h1>{t('model_prices.title')}</h1>
+          </div>
           {featureAvailability.requestMonitoringAvailable ? (
             <Link to="/monitoring" className={styles.backLink}>
               {t('model_prices.back_to_monitoring')}
@@ -277,23 +286,25 @@ export function ModelPricesPage() {
           </div>
         </div>
 
-        {syncResult?.sourceResults?.length ? (
+        {syncResult?.sourceResults?.some((result) => isOfficialPriceSource(result.source)) ? (
           <div className={styles.sourceResults}>
-            {syncResult.sourceResults.map((result) => (
-              <span
-                key={result.source}
-                className={result.error ? styles.sourceResultError : undefined}
-                title={result.error || undefined}
-              >
-                <strong>{result.source}</strong>
-                {result.error
-                  ? t('model_prices.source_result_failed')
-                  : t('model_prices.source_result_ok', {
-                      models: result.models,
-                      skipped: result.skipped,
-                    })}
-              </span>
-            ))}
+            {syncResult.sourceResults
+              .filter((result) => isOfficialPriceSource(result.source))
+              .map((result) => (
+                <span
+                  key={result.source}
+                  className={result.error ? styles.sourceResultError : undefined}
+                  title={result.error || undefined}
+                >
+                  <strong>{resolvePriceSourceLabel(result.source, t)}</strong>
+                  {result.error
+                    ? t('model_prices.source_result_failed')
+                    : t('model_prices.source_result_ok', {
+                        models: result.models,
+                        skipped: result.skipped,
+                      })}
+                </span>
+              ))}
           </div>
         ) : null}
 
@@ -384,206 +395,232 @@ export function ModelPricesPage() {
         {loading || usageSummaryLoading ? (
           <div className={styles.emptyState}>{t('common.loading')}</div>
         ) : visibleRows.length === 0 ? (
-          <div className={styles.emptyState}>{t('model_prices.empty')}</div>
+          <div className={styles.emptyState}>
+            {rows.length === 0 && !search && filter === 'all'
+              ? t('model_prices.no_current_models')
+              : t('model_prices.empty')}
+          </div>
         ) : (
-          <div className={styles.tableWrap}>
-            <table className={styles.priceTable}>
-              <thead>
-                <tr>
-                  <th>{t('usage_stats.model_name')}</th>
-                  <th>{t('model_prices.calls')}</th>
-                  <th>{t('usage_stats.model_price_prompt')}</th>
-                  <th>{t('usage_stats.model_price_completion')}</th>
-                  <th>{t('usage_stats.model_price_cache')}</th>
-                  <th>{t('usage_stats.model_price_cache_read')}</th>
-                  <th>{t('usage_stats.model_price_cache_creation')}</th>
-                  <th>{t('model_prices.pricing_rules')}</th>
-                  <th>{t('model_prices.source')}</th>
-                  <th>{t('common.action')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleRows.map((row) => {
-                  const candidates =
-                    candidateSets.find((candidateSet) => candidateSet.model === row.model)
-                      ?.candidates ?? [];
-                  const candidateGroups = groupModelPriceCandidatesBySource(candidates);
-                  const requestedCandidateIdentity = selectedCandidates[row.model] || '';
-                  const selectedCandidate =
-                    candidates.find(
-                      (candidate) =>
-                        getModelPriceCandidateIdentity(candidate) === requestedCandidateIdentity
-                    ) ??
-                    candidates[0];
-                  const selectedCandidateIdentity = selectedCandidate
-                    ? getModelPriceCandidateIdentity(selectedCandidate)
-                    : '';
-                  const contextTiers = row.price?.contextTiers ?? [];
-                  const serviceTiers = row.price?.serviceTiers ?? [];
+          <div className={styles.modelCardsSection}>
+            <div className={styles.modelCardsHeader}>
+              <div>
+                <span className={styles.sectionEyebrow}>{t('model_prices.official_price')}</span>
+                <h2>{t('model_prices.current_models_title')}</h2>
+                <p>{t('model_prices.current_models_hint')}</p>
+              </div>
+              <span className={styles.currentCount}>
+                {t('model_prices.current_count', { count: currentRows.length })}
+              </span>
+            </div>
+            <div className={styles.modelCardsGrid}>
+              {visibleRows.map((row) => {
+                const candidates =
+                  candidateSets.find(
+                    (candidateSet) =>
+                      normalizeModelIdentity(candidateSet.model) ===
+                      normalizeModelIdentity(row.model)
+                  )?.candidates ?? [];
+                const candidateGroups = groupModelPriceCandidatesBySource(candidates);
+                const requestedCandidateIdentity = selectedCandidates[row.model] || '';
+                const selectedCandidate =
+                  candidates.find(
+                    (candidate) =>
+                      getModelPriceCandidateIdentity(candidate) === requestedCandidateIdentity
+                  ) ?? candidates[0];
+                const selectedCandidateIdentity = selectedCandidate
+                  ? getModelPriceCandidateIdentity(selectedCandidate)
+                  : '';
+                const displayPrice = row.price ?? selectedCandidate?.price;
+                const displaySource = row.price?.source ?? selectedCandidate?.price.source;
+                const displaySourceModelId =
+                  row.price?.sourceModelId ?? selectedCandidate?.sourceModelId;
+                const contextTiers = displayPrice?.contextTiers ?? [];
+                const serviceTiers = displayPrice?.serviceTiers ?? [];
+                const statusKey = row.hasPrice
+                  ? row.calls > 0
+                    ? 'status_current'
+                    : 'status_saved'
+                  : candidates.length > 0
+                    ? 'status_candidate'
+                    : 'status_missing';
+                const priceMetrics = [
+                  { label: t('usage_stats.model_price_prompt'), value: displayPrice?.prompt },
+                  {
+                    label: t('usage_stats.model_price_completion'),
+                    value: displayPrice?.completion,
+                  },
+                  { label: t('usage_stats.model_price_cache'), value: displayPrice?.cache },
+                  {
+                    label: t('usage_stats.model_price_cache_read'),
+                    value: displayPrice?.cacheRead,
+                  },
+                  {
+                    label: t('usage_stats.model_price_cache_creation'),
+                    value: displayPrice?.cacheCreation,
+                  },
+                ];
 
-                  return (
-                    <tr key={row.model}>
-                      <td className={styles.modelCell}>
-                        <div className={styles.modelContent}>
-                          <strong>{row.model}</strong>
-                          {!row.hasPrice && candidates.length > 0 ? (
-                            <span>{t('model_prices.needs_confirmation')}</span>
-                          ) : !row.hasPrice ? (
-                            <span>{t('model_prices.no_price')}</span>
-                          ) : null}
-                        </div>
-                      </td>
-                      <td>{row.calls}</td>
-                      <td>{formatPriceUnit(row.price?.prompt)}</td>
-                      <td>{formatPriceUnit(row.price?.completion)}</td>
-                      <td>{formatPriceUnit(row.price?.cache)}</td>
-                      <td>{formatPriceUnit(row.price?.cacheRead)}</td>
-                      <td>{formatPriceUnit(row.price?.cacheCreation)}</td>
-                      <td className={styles.tierCell}>
-                        {contextTiers.length > 0 || serviceTiers.length > 0 ? (
-                          <div className={styles.tierList}>
-                            {contextTiers.map((tier) => {
-                              const effectivePrice = resolveContextTierDisplayPrice(
-                                row.price,
-                                tier
-                              );
-                              return (
-                                <span
-                                  key={tier.thresholdTokens}
-                                  className={styles.tierBadge}
-                                  title={`${t('usage_stats.model_price_prompt')}: ${formatPriceUnit(effectivePrice.prompt)} · ${t('usage_stats.model_price_completion')}: ${formatPriceUnit(effectivePrice.completion)}`}
-                                >
-                                  <strong>{`>${formatContextThreshold(tier.thresholdTokens)}`}</strong>
-                                  <small>
-                                    {formatPriceUnit(effectivePrice.prompt)} /{' '}
-                                    {formatPriceUnit(effectivePrice.completion)}
-                                  </small>
-                                </span>
-                              );
-                            })}
-                            {serviceTiers.map((tier) => {
-                              const effectivePrice = resolveServiceTierDisplayPrice(
-                                row.price,
-                                tier
-                              );
-                              return (
-                                <span
-                                  key={`${tier.mode}:${tier.serviceTier}`}
-                                  className={styles.tierBadge}
-                                  title={`${t('usage_stats.model_price_prompt')}: ${formatPriceUnit(effectivePrice.prompt)} · ${t('usage_stats.model_price_completion')}: ${formatPriceUnit(effectivePrice.completion)}`}
-                                >
-                                  <strong>{formatServiceTierRule(tier)}</strong>
-                                  <small>
-                                    {formatPriceUnit(effectivePrice.prompt)} /{' '}
-                                    {formatPriceUnit(effectivePrice.completion)}
-                                  </small>
-                                </span>
-                              );
-                            })}
-                          </div>
-                        ) : (
-                          <span className={styles.sourcePlaceholder}>--</span>
-                        )}
-                      </td>
-                      <td className={styles.sourceCell}>
-                        {row.price ? (
-                          <div className={styles.sourceContent}>
-                            <span className={styles.sourceBadge}>
-                              {row.price.source || 'manual'}
-                            </span>
-                            {row.price.sourceModelId ? (
-                              <small>{row.price.sourceModelId}</small>
-                            ) : null}
-                          </div>
-                        ) : selectedCandidate ? (
-                          <div className={styles.sourceContent}>
-                            <span className={styles.sourceBadge}>
-                              {selectedCandidate.price.source || 'sync'}
-                            </span>
-                            <small>{selectedCandidate.sourceModelId}</small>
-                          </div>
-                        ) : (
-                          <span className={styles.sourcePlaceholder}>--</span>
-                        )}
-                      </td>
-                      <td
-                        className={`${styles.actionsCell} ${
-                          !row.hasPrice && candidates.length > 0 ? styles.candidateActionsCell : ''
-                        }`}
-                      >
+                return (
+                  <article
+                    key={row.model}
+                    className={`${styles.priceCard} ${!row.hasPrice ? styles.priceCardMissing : ''}`}
+                  >
+                    <div className={styles.priceCardHeader}>
+                      <div className={styles.priceCardIdentity}>
+                        <span className={styles.statusBadge}>{t(`model_prices.${statusKey}`)}</span>
+                        <h3 title={row.model}>{row.model}</h3>
+                        <span className={styles.cardCalls}>
+                          {row.calls} {t('model_prices.calls')}
+                        </span>
+                      </div>
+                      {row.hasPrice ? (
                         <div className={styles.rowActions}>
-                          {row.hasPrice ? (
-                            <>
-                              <button
-                                type="button"
-                                className={styles.iconAction}
-                                title={t('common.edit')}
-                                aria-label={t('common.edit')}
-                                onClick={() => openManualEditor(row.model, row.price)}
-                              >
-                                <IconPencil size={14} />
-                              </button>
-                              <button
-                                type="button"
-                                className={styles.iconAction}
-                                title={t('common.delete')}
-                                aria-label={t('common.delete')}
-                                onClick={() => void handleDelete(row.model)}
-                              >
-                                <IconTrash2 size={14} />
-                              </button>
-                            </>
-                          ) : candidates.length > 0 && selectedCandidate ? (
-                            <div className={styles.candidateControl}>
-                              <select
-                                value={selectedCandidateIdentity}
-                                onChange={(event) =>
-                                  setSelectedCandidates((previous) => ({
-                                    ...previous,
-                                    [row.model]: event.target.value,
-                                  }))
-                                }
-                                aria-label={t('model_prices.candidate_select')}
-                              >
-                                {candidateGroups.map((group) => (
-                                  <optgroup key={group.source} label={group.source}>
-                                    {group.candidates.map((candidate) => {
-                                      const identity = getModelPriceCandidateIdentity(candidate);
-                                      return (
-                                        <option key={identity} value={identity}>
-                                          {`${candidate.sourceModelId} · ${Math.round(candidate.score * 100)}%`}
-                                        </option>
-                                      );
-                                    })}
-                                  </optgroup>
-                                ))}
-                              </select>
-                              <button
-                                type="button"
-                                className={styles.confirmButton}
-                                onClick={() =>
-                                  void handleConfirmCandidate(row.model, selectedCandidate)
-                                }
-                              >
-                                <span>{t('model_prices.confirm_candidate')}</span>
-                              </button>
-                            </div>
-                          ) : (
+                          <button
+                            type="button"
+                            className={styles.iconAction}
+                            title={t('common.edit')}
+                            aria-label={t('common.edit')}
+                            onClick={() => openManualEditor(row.model, row.price)}
+                          >
+                            <IconPencil size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className={styles.iconAction}
+                            title={t('common.delete')}
+                            aria-label={t('common.delete')}
+                            onClick={() => void handleDelete(row.model)}
+                          >
+                            <IconTrash2 size={14} />
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className={styles.sourceContent}>
+                      <div className={styles.sourceLine}>
+                        <span className={styles.sourceLabel}>
+                          {t('model_prices.official_price')}
+                        </span>
+                        <span className={styles.sourceBadge}>
+                          {displaySource
+                            ? resolvePriceSourceLabel(displaySource, t)
+                            : t('model_prices.status_missing')}
+                        </span>
+                      </div>
+                      {displaySourceModelId ? (
+                        <span className={styles.sourceModelId} title={displaySourceModelId}>
+                          {t('model_prices.source_model')}: {displaySourceModelId}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <div className={styles.priceMetrics}>
+                      {priceMetrics.map((metric) => (
+                        <div key={metric.label} className={styles.priceMetric}>
+                          <span>{metric.label}</span>
+                          <strong>{formatPriceUnit(metric.value)}</strong>
+                        </div>
+                      ))}
+                    </div>
+
+                    {contextTiers.length > 0 || serviceTiers.length > 0 ? (
+                      <div className={styles.tierList} aria-label={t('model_prices.pricing_rules')}>
+                        {contextTiers.map((tier) => {
+                          const effectivePrice = resolveContextTierDisplayPrice(displayPrice, tier);
+                          return (
+                            <span
+                              key={tier.thresholdTokens}
+                              className={styles.tierBadge}
+                              title={`${t('usage_stats.model_price_prompt')}: ${formatPriceUnit(effectivePrice.prompt)} · ${t('usage_stats.model_price_completion')}: ${formatPriceUnit(effectivePrice.completion)}`}
+                            >
+                              <strong>{`>${formatContextThreshold(tier.thresholdTokens)}`}</strong>
+                              <small>
+                                {formatPriceUnit(effectivePrice.prompt)} /{' '}
+                                {formatPriceUnit(effectivePrice.completion)}
+                              </small>
+                            </span>
+                          );
+                        })}
+                        {serviceTiers.map((tier) => {
+                          const effectivePrice = resolveServiceTierDisplayPrice(displayPrice, tier);
+                          return (
+                            <span
+                              key={`${tier.mode}:${tier.serviceTier}`}
+                              className={styles.tierBadge}
+                              title={`${t('usage_stats.model_price_prompt')}: ${formatPriceUnit(effectivePrice.prompt)} · ${t('usage_stats.model_price_completion')}: ${formatPriceUnit(effectivePrice.completion)}`}
+                            >
+                              <strong>{formatServiceTierRule(tier)}</strong>
+                              <small>
+                                {formatPriceUnit(effectivePrice.prompt)} /{' '}
+                                {formatPriceUnit(effectivePrice.completion)}
+                              </small>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+
+                    {!row.hasPrice ? (
+                      <div className={styles.missingPriceNotice}>
+                        <span>
+                          {candidates.length > 0
+                            ? t('model_prices.needs_confirmation')
+                            : t('model_prices.no_price')}
+                        </span>
+                        {candidates.length > 0 && selectedCandidate ? (
+                          <div className={styles.candidateControl}>
+                            <select
+                              value={selectedCandidateIdentity}
+                              onChange={(event) =>
+                                setSelectedCandidates((previous) => ({
+                                  ...previous,
+                                  [row.model]: event.target.value,
+                                }))
+                              }
+                              aria-label={t('model_prices.candidate_select')}
+                            >
+                              {candidateGroups.map((group) => (
+                                <optgroup
+                                  key={group.source}
+                                  label={resolvePriceSourceLabel(group.source, t)}
+                                >
+                                  {group.candidates.map((candidate) => {
+                                    const identity = getModelPriceCandidateIdentity(candidate);
+                                    return (
+                                      <option key={identity} value={identity}>
+                                        {`${candidate.sourceModelId} · ${Math.round(candidate.score * 100)}%`}
+                                      </option>
+                                    );
+                                  })}
+                                </optgroup>
+                              ))}
+                            </select>
                             <button
                               type="button"
                               className={styles.confirmButton}
-                              onClick={() => openManualEditor(row.model)}
+                              onClick={() =>
+                                void handleConfirmCandidate(row.model, selectedCandidate)
+                              }
                             >
-                              <span>{t('model_prices.add_manual')}</span>
+                              <span>{t('model_prices.confirm_candidate')}</span>
                             </button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className={styles.confirmButton}
+                            onClick={() => openManualEditor(row.model)}
+                          >
+                            <span>{t('model_prices.add_manual')}</span>
+                          </button>
+                        )}
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
           </div>
         )}
 

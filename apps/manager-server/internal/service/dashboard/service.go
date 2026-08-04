@@ -25,8 +25,24 @@ const (
 )
 
 type Service struct {
-	store        *store.Store
-	hourlyReader *usagehourly.Reader
+	store          *store.Store
+	hourlyReader   *usagehourly.Reader
+	postgresSource PostgresDashboardSource
+}
+
+// PostgresDashboardSource is the canonical read path once usage events have
+// moved out of the core store. Keeping this seam on the dashboard prevents the
+// home page from silently reading a frozen legacy SQLite snapshot.
+type PostgresDashboardSource interface {
+	usagehourly.AggregateRowsSource
+	AggregateBetween(ctx context.Context, fromMS, toMS int64) (store.Aggregate, error)
+	TopModelsBetween(ctx context.Context, fromMS, toMS int64, limit int) ([]store.ModelStat, error)
+	ModelStatsBetween(ctx context.Context, fromMS, toMS int64) ([]store.ModelStat, error)
+	RecentFailuresBetween(ctx context.Context, fromMS, toMS int64, limit int) ([]store.RecentFailure, error)
+	HourlyTimelineBetween(ctx context.Context, fromMS, toMS int64) ([]store.TimelinePoint, error)
+	BucketTimelineBetween(ctx context.Context, fromMS, toMS, bucketMS int64) ([]store.TimelinePoint, error)
+	ChannelModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.ChannelModelStat, error)
+	FailureSourcesWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.FailureSourceStat, error)
 }
 
 func New(store *store.Store, hourlyRollupEnabled ...bool) *Service {
@@ -38,6 +54,51 @@ func New(store *store.Store, hourlyRollupEnabled ...bool) *Service {
 		store:        store,
 		hourlyReader: usagehourly.New(store, enabled, "dashboard-rollup"),
 	}
+}
+
+func (s *Service) SetPostgresSource(source PostgresDashboardSource) {
+	if s == nil {
+		return
+	}
+	s.postgresSource = source
+	if s.hourlyReader != nil {
+		s.hourlyReader.SetRowsSource(source)
+	}
+}
+
+func (s *Service) aggregateBetween(ctx context.Context, fromMS, toMS int64) (store.Aggregate, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.AggregateBetween(ctx, fromMS, toMS)
+	}
+	return s.store.AggregateBetween(ctx, fromMS, toMS)
+}
+
+func (s *Service) recentFailuresBetween(ctx context.Context, fromMS, toMS int64, limit int) ([]store.RecentFailure, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.RecentFailuresBetween(ctx, fromMS, toMS, limit)
+	}
+	return s.store.RecentFailuresBetween(ctx, fromMS, toMS, limit)
+}
+
+func (s *Service) bucketTimelineBetween(ctx context.Context, fromMS, toMS, bucketMS int64) ([]store.TimelinePoint, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.BucketTimelineBetween(ctx, fromMS, toMS, bucketMS)
+	}
+	return s.store.BucketTimelineBetween(ctx, fromMS, toMS, bucketMS)
+}
+
+func (s *Service) channelModelStatsWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.ChannelModelStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.ChannelModelStatsWithFilter(ctx, filter)
+	}
+	return s.store.ChannelModelStatsWithFilter(ctx, filter)
+}
+
+func (s *Service) failureSourcesWithFilter(ctx context.Context, filter store.AnalyticsFilter) ([]store.FailureSourceStat, error) {
+	if s.postgresSource != nil {
+		return s.postgresSource.FailureSourcesWithFilter(ctx, filter)
+	}
+	return s.store.FailureSourcesWithFilter(ctx, filter)
 }
 
 type SummaryParams struct {
@@ -293,27 +354,27 @@ func (s *Service) summary(ctx context.Context, p SummaryParams) (SummaryResponse
 	})
 	runQuery(func() error {
 		var err error
-		rollingAgg, err = s.store.AggregateBetween(queryCtx, rollingStartMS, nowMS)
+		rollingAgg, err = s.aggregateBetween(queryCtx, rollingStartMS, nowMS)
 		return err
 	})
 	runQuery(func() error {
 		var err error
-		recentFailures, err = s.store.RecentFailuresBetween(queryCtx, p.TodayStartMS, nowMS, recentLimit)
+		recentFailures, err = s.recentFailuresBetween(queryCtx, p.TodayStartMS, nowMS, recentLimit)
 		return err
 	})
 	runQuery(func() error {
 		var err error
-		healthTimelinePoints, err = s.store.BucketTimelineBetween(queryCtx, p.TodayStartMS, nowMS, healthTimelineBucketMs)
+		healthTimelinePoints, err = s.bucketTimelineBetween(queryCtx, p.TodayStartMS, nowMS, healthTimelineBucketMs)
 		return err
 	})
 	runQuery(func() error {
 		var err error
-		channelStats, err = s.store.ChannelModelStatsWithFilter(queryCtx, filter)
+		channelStats, err = s.channelModelStatsWithFilter(queryCtx, filter)
 		return err
 	})
 	runQuery(func() error {
 		var err error
-		failureSources, err = s.store.FailureSourcesWithFilter(queryCtx, filter)
+		failureSources, err = s.failureSourcesWithFilter(queryCtx, filter)
 		return err
 	})
 
@@ -348,6 +409,30 @@ func (s *Service) summary(ctx context.Context, p SummaryParams) (SummaryResponse
 func (s *Service) loadTodayMetrics(ctx context.Context, fromMS, toMS int64, topLimit int) (store.Aggregate, []store.ModelStat, []store.ModelStat, []store.TimelinePoint, map[string]store.ModelPrice, error) {
 	if agg, modelStats, timeline, prices, ok := s.loadTodayMetricsFromRollup(ctx, fromMS, toMS); ok {
 		return agg, modelStats, selectTopModelStats(modelStats, topLimit), timeline, prices, nil
+	}
+
+	if s.postgresSource != nil {
+		agg, err := s.postgresSource.AggregateBetween(ctx, fromMS, toMS)
+		if err != nil {
+			return store.Aggregate{}, nil, nil, nil, nil, err
+		}
+		modelStats, err := s.postgresSource.ModelStatsBetween(ctx, fromMS, toMS)
+		if err != nil {
+			return store.Aggregate{}, nil, nil, nil, nil, err
+		}
+		topStats, err := s.postgresSource.TopModelsBetween(ctx, fromMS, toMS, topLimit)
+		if err != nil {
+			return store.Aggregate{}, nil, nil, nil, nil, err
+		}
+		timeline, err := s.postgresSource.HourlyTimelineBetween(ctx, fromMS, toMS)
+		if err != nil {
+			return store.Aggregate{}, nil, nil, nil, nil, err
+		}
+		prices, err := s.store.LoadModelPrices(ctx)
+		if err != nil {
+			return store.Aggregate{}, nil, nil, nil, nil, err
+		}
+		return agg, modelStats, topStats, timeline, prices, nil
 	}
 
 	agg, err := s.store.AggregateBetween(ctx, fromMS, toMS)

@@ -4,7 +4,7 @@ import type {
   CodexUsagePayload,
   CodexUsageWindow,
 } from '@/types';
-import { formatCodexResetLabel } from './formatters';
+import { formatCodexResetLabel, resolveCodexResetAtMs } from './formatters';
 import { normalizeNumberValue, normalizePlanType, normalizeStringValue } from './parsers';
 
 const FIVE_HOUR_SECONDS = 18_000;
@@ -43,6 +43,7 @@ export type CodexQuotaWindowInfo = {
   usedPercent: number | null;
   resetLabel: string;
   limitWindowSeconds: number | null;
+  resetAtMs: number | null;
 };
 
 const getWindowSeconds = (window?: CodexUsageWindow | null): number | null => {
@@ -199,6 +200,7 @@ const addCodexWindowInfo = (
     usedPercent,
     resetLabel,
     limitWindowSeconds: getWindowSeconds(window),
+    resetAtMs: resolveCodexResetAtMs(window),
   });
 };
 

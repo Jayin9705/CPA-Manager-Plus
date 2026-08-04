@@ -52,7 +52,10 @@ const triggersFrontend = (filePath) =>
   filePath === 'bin/release/validate-release.mjs';
 
 const triggersManagerServer = (filePath) =>
-  startsWithPath(filePath, 'apps/manager-server') || filePath === 'bin/release/package-native.sh';
+  startsWithPath(filePath, 'apps/manager-server') ||
+  filePath === 'Dockerfile.manager-server-api' ||
+  startsWithPath(filePath, 'contracts') ||
+  filePath === 'bin/release/package-native.sh';
 
 const triggersNativeControl = (filePath) =>
   startsWithPath(filePath, 'bin/native') ||
@@ -65,6 +68,13 @@ const triggersDocker = (filePath) =>
   startsWithPath(filePath, 'apps/web') ||
   startsWithPath(filePath, 'apps/manager-server') ||
   filePath === 'Dockerfile.manager-server' ||
+  filePath === 'Dockerfile.manager-server-api' ||
+  filePath === 'Dockerfile.web' ||
+  startsWithPath(filePath, 'deploy') ||
+  filePath === 'docker-compose.separated.yml' ||
+  filePath === 'docker-compose.stack.yml' ||
+  filePath === 'bin/bootstrap-stack.sh' ||
+  filePath === 'bin/stack.sh' ||
   filePath === 'docker-compose.manager.yml' ||
   filePath === '.dockerignore' ||
   filePath === 'package.json' ||

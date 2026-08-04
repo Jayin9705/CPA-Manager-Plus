@@ -1,0 +1,40 @@
+# Exact, reviewed false-positive fingerprints from existing public upstream
+# history. Keep these commit- and line-specific so future credentials in tests
+# or fixtures are still detected. These are synthetic test/demo values.
+04b7bd0ed5309d0a0ff8fa2869bfe156d3be769b:apps/web/src/utils/sourceResolver.test.ts:generic-api-key:10
+04b7bd0ed5309d0a0ff8fa2869bfe156d3be769b:apps/web/src/utils/sourceResolver.test.ts:generic-api-key:140
+04b7bd0ed5309d0a0ff8fa2869bfe156d3be769b:apps/web/src/utils/sourceResolver.test.ts:generic-api-key:156
+04b7bd0ed5309d0a0ff8fa2869bfe156d3be769b:apps/web/src/utils/usage.test.ts:generic-api-key:16
+053f05affa69a48b29597636cea90e948ec62ff9:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:729
+053f05affa69a48b29597636cea90e948ec62ff9:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:739
+053f05affa69a48b29597636cea90e948ec62ff9:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:422
+1caba2256b9ae6e8ba04aa3f4257bc71ee71fe82:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:764
+1caba2256b9ae6e8ba04aa3f4257bc71ee71fe82:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:241
+1caba2256b9ae6e8ba04aa3f4257bc71ee71fe82:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:274
+2449c48e5fe63535bb81d8009239e8bc74eb451c:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:563
+2449c48e5fe63535bb81d8009239e8bc74eb451c:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:603
+2449c48e5fe63535bb81d8009239e8bc74eb451c:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:628
+2449c48e5fe63535bb81d8009239e8bc74eb451c:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:657
+2449c48e5fe63535bb81d8009239e8bc74eb451c:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:676
+52165324f73b0556554fcaf7d8383538e5f8d8d9:apps/manager-server/internal/security/security_test.go:generic-api-key:11
+52165324f73b0556554fcaf7d8383538e5f8d8d9:apps/manager-server/internal/testutil/sqlite.go:generic-api-key:13
+538e7520b24427c73bbcbdef677f3061f08697e3:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:575
+6626f630ca92818fdd8ea9577dd35dab73c09051:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:578
+702fcae69d916095c9c71cd3601467bef830865c:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:286
+775681773936d7d7a0509e894f5169e54c475050:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:129
+775681773936d7d7a0509e894f5169e54c475050:apps/web/src/features/usage-analytics/UsageAnalyticsPage.test.tsx:generic-api-key:491
+775681773936d7d7a0509e894f5169e54c475050:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:167
+775681773936d7d7a0509e894f5169e54c475050:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:200
+775681773936d7d7a0509e894f5169e54c475050:apps/web/src/features/usage-analytics/usageAnalyticsModel.test.ts:generic-api-key:275
+7df3623fe0b30dea55de6a4fdc730dbd5cf9449f:apps/manager-server/internal/httpapi/server_compat_test.go:generic-api-key:452
+7df3623fe0b30dea55de6a4fdc730dbd5cf9449f:apps/manager-server/internal/service/usage/import_session_test.go:generic-api-key:157
+85e7375e14218fd25483b27085c7cee9b1cc88a8:apps/web/src/features/demo/demoFixtures.ts:generic-api-key:1330
+85e7375e14218fd25483b27085c7cee9b1cc88a8:apps/web/src/features/demo/demoFixtures.ts:generic-api-key:1809
+85e7375e14218fd25483b27085c7cee9b1cc88a8:apps/web/src/features/demo/demoFixtures.ts:generic-api-key:2272
+85e7375e14218fd25483b27085c7cee9b1cc88a8:apps/web/src/features/demo/demoFixtures.ts:generic-api-key:316
+b5679b59a2425e6eadb4cc3c2f74785e5261fb1b:apps/web/src/features/monitoring/services/usageImportSession.test.ts:generic-api-key:340
+c54e3f0d6347d3436fe270c11e49e363eae73d19:src/features/authFiles/sessionAuthConverter.test.ts:generic-api-key:945
+c54e3f0d6347d3436fe270c11e49e363eae73d19:src/features/authFiles/sessionAuthConverter.test.ts:generic-api-key:956
+dd18ed8a91c9589be41628207a99b799f7e3c537:apps/web/src/utils/sourceResolver.test.ts:generic-api-key:31
+e6c7ca76fe4efbb97f18ad84a8401a399c23bf06:apps/web/src/features/monitoring/components/RealtimeEventsPanel.test.tsx:generic-api-key:210
+e6c7ca76fe4efbb97f18ad84a8401a399c23bf06:apps/web/src/features/monitoring/components/RealtimeEventsPanel.test.tsx:generic-api-key:220

@@ -293,6 +293,28 @@ func TestReaderUsesRawDeltaWhileAggregateIsPending(t *testing.T) {
 	}
 }
 
+func TestReaderDoesNotFallbackToSQLiteWhenRowsSourceConfigured(t *testing.T) {
+	db := newReaderTestStore(t)
+	ctx := context.Background()
+	fromMS := int64(1_800_000_000_000) + time.Minute.Milliseconds()
+	toMS := fromMS + 2*hourMS
+	if _, err := db.InsertEvents(ctx, []usage.Event{
+		readerEvent("configured-source", fromMS+time.Minute.Milliseconds(), "model-a", false, 1, 2, nil),
+	}); err != nil {
+		t.Fatalf("insert events: %v", err)
+	}
+	catchUpReaderRollup(t, ctx, db)
+
+	source := &recordingRowsSource{}
+	reader := NewWithRowsSource(db, true, source)
+	if _, ok := reader.Load(ctx, fromMS, toMS); ok {
+		t.Fatal("reader fell back to SQLite after a rows source was configured")
+	}
+	if !source.called {
+		t.Fatal("configured rows source was not called for a partial-hour range")
+	}
+}
+
 func TestReaderFallbackLogIsRateLimited(t *testing.T) {
 	reader := New(newReaderTestStore(t), true)
 	reader.logFallback("first")
@@ -336,6 +358,15 @@ func newReaderTestStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+type recordingRowsSource struct {
+	called bool
+}
+
+func (s *recordingRowsSource) UsageHourlyAggregateRows(context.Context, store.UsageHourlyAggregateFilter) ([]store.UsageHourlyAggregateRow, store.UsageHourlyAggregateState, bool, error) {
+	s.called = true
+	return nil, store.UsageHourlyAggregateState{AggregateName: "configured-source", SchemaVersion: 1, Status: "edge_requires_raw"}, false, nil
 }
 
 func readerEvent(hash string, timestampMS int64, model string, failed bool, inputTokens, outputTokens int64, latencyMS *int64) usage.Event {

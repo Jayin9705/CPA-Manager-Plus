@@ -14,7 +14,10 @@ function getVersion(): string {
 
   // 2. Try git tag
   try {
-    const gitTag = execSync('git describe --tags --exact-match 2>/dev/null || git describe --tags 2>/dev/null || echo ""', { encoding: 'utf8' }).trim();
+    const gitTag = execSync(
+      'git describe --tags --exact-match 2>/dev/null || git describe --tags 2>/dev/null || echo ""',
+      { encoding: 'utf8' }
+    ).trim();
     if (gitTag) {
       return gitTag;
     }
@@ -36,23 +39,62 @@ function getVersion(): string {
 }
 
 const isDemoSiteBuild = (mode: string) =>
-  mode === 'demo' || process.env.DEMO_SITE === 'true' || process.env.VITE_DEMO_SITE === 'true';
+  mode === 'demo' ||
+  mode === 'demo-bundle' ||
+  process.env.DEMO_SITE === 'true' ||
+  process.env.VITE_DEMO_SITE === 'true';
+
+const isSeparatedSiteBuild = (mode: string) =>
+  mode === 'separated' ||
+  process.env.SEPARATED_SITE === 'true' ||
+  process.env.VITE_SEPARATED_SITE === 'true';
+
+const normalizeBasePath = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '/') return '/';
+  const withLeadingSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  return `${withLeadingSlash.replace(/\/+$/, '')}/`;
+};
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
   const demoSite = isDemoSiteBuild(mode);
+  const separatedSite = !demoSite && isSeparatedSiteBuild(mode);
+  const singleFileBuild =
+    mode === 'bundle' || mode === 'demo-bundle' || process.env.SINGLE_FILE === 'true';
   const useRealDemoFixtures = demoSite || mode === 'test';
+  const outDir = demoSite
+    ? singleFileBuild
+      ? 'dist-demo-bundle'
+      : 'dist-demo'
+    : singleFileBuild
+      ? 'dist-bundle'
+      : separatedSite
+        ? 'dist-separated'
+        : 'dist';
+  // The separated console is served from this sub-path in the production
+  // deployment. Keep the default aligned with that mount point so the
+  // standard `build:separated` script cannot emit root-relative asset URLs.
+  const separatedBase = normalizeBasePath(
+    process.env.VITE_BASE_PATH || '/separated-console/'
+  );
 
   return {
+    base: separatedSite ? separatedBase : demoSite || singleFileBuild ? './' : '/management-assets/',
     plugins: [
       react(),
-      viteSingleFile({
-        removeViteModuleLoader: true
-      })
+      ...(singleFileBuild
+        ? [
+            viteSingleFile({
+              removeViteModuleLoader: true,
+            }),
+          ]
+        : []),
     ],
     define: {
       __APP_VERSION__: JSON.stringify(getVersion()),
-      __DEMO_SITE__: JSON.stringify(demoSite || mode === 'test')
+      __DEMO_SITE__: JSON.stringify(demoSite || mode === 'test'),
+      __SEPARATED_SITE__: JSON.stringify(separatedSite),
     },
     resolve: {
       alias: [
@@ -63,36 +105,40 @@ export default defineConfig(({ mode }) => {
             useRealDemoFixtures
               ? './src/features/demo/demoFixtures.ts'
               : './src/features/demo/demoFixtures.empty.ts'
-          )
+          ),
         },
         {
           find: '@',
-          replacement: path.resolve(__dirname, './src')
-        }
-      ]
+          replacement: path.resolve(__dirname, './src'),
+        },
+      ],
     },
     css: {
       modules: {
         localsConvention: 'camelCase',
-        generateScopedName: '[name]__[local]___[hash:base64:5]'
+        generateScopedName: '[name]__[local]___[hash:base64:5]',
       },
       preprocessorOptions: {
         scss: {
-          additionalData: `@use "@/styles/variables.scss" as *;`
-        }
-      }
+          additionalData: `@use "@/styles/variables.scss" as *;`,
+        },
+      },
     },
     build: {
       target: 'es2020',
-      outDir: demoSite ? 'dist-demo' : 'dist',
-      assetsInlineLimit: 100000000,
-      chunkSizeWarningLimit: 100000000,
-      cssCodeSplit: false,
-      rolldownOptions: {
-        output: {
-          codeSplitting: false
-        }
-      }
-    }
+      outDir,
+      assetsInlineLimit: singleFileBuild ? 100000000 : 4096,
+      chunkSizeWarningLimit: 700,
+      cssCodeSplit: !singleFileBuild,
+      ...(singleFileBuild
+        ? {
+            rolldownOptions: {
+              output: {
+                codeSplitting: false,
+              },
+            },
+          }
+        : {}),
+    },
   };
 });

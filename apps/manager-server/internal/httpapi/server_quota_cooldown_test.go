@@ -15,7 +15,9 @@ func TestServerCompatQuotaCooldownsList(t *testing.T) {
 	cfg := testutil.NewConfig(t)
 	db := testutil.NewStore(t, cfg)
 	manager := collector.NewManager(cfg, db)
-	handler := New(cfg, db, manager).Handler()
+	server := New(cfg, db, manager)
+	installTestAdminAuth(t, server)
+	handler := server.Handler()
 
 	now := int64(1_700_000_000_000)
 	persisted, err := db.QuotaCooldowns.UpsertActive(context.Background(), model.QuotaCooldownUpsert{
@@ -87,7 +89,9 @@ func TestServerCompatQuotaCooldownsRequiresPanelAuth(t *testing.T) {
 	cfg := testutil.NewConfig(t)
 	db := testutil.NewStore(t, cfg)
 	manager := collector.NewManager(cfg, db)
-	handler := New(cfg, db, manager).Handler()
+	server := New(cfg, db, manager)
+	installTestAdminAuth(t, server)
+	handler := server.Handler()
 
 	noKey := testutil.Request(t, handler, http.MethodGet, "/usage-service/quota-cooldowns", "", "")
 	testutil.RequireStatus(t, noKey, http.StatusUnauthorized)

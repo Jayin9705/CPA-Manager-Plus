@@ -21,9 +21,26 @@ const (
 
 type Reader struct {
 	store              *store.Store
+	rowsSource         AggregateRowsSource
 	enabled            bool
 	lastFallbackLogMS  atomic.Int64
 	fallbackLogContext string
+}
+
+// AggregateRowsSource is the read-side seam used during the SQLite to
+// PostgreSQL cutover. The normal Store implementation remains the fallback;
+// a PostgreSQL source can provide the permanent hourly rows without changing
+// any of the monitoring response semantics.
+type AggregateRowsSource interface {
+	UsageHourlyAggregateRows(ctx context.Context, filter store.UsageHourlyAggregateFilter) ([]store.UsageHourlyAggregateRow, store.UsageHourlyAggregateState, bool, error)
+}
+
+// HourlyTimelineSource is the optional raw timeline seam used when a
+// dashboard range starts inside an hour. Hourly aggregate rows are anchored
+// to UTC hour starts, while the dashboard contract anchors buckets to fromMS;
+// the source must therefore aggregate that case from raw events.
+type HourlyTimelineSource interface {
+	HourlyTimelineBetween(ctx context.Context, fromMS, toMS int64) ([]store.TimelinePoint, error)
 }
 
 type Snapshot struct {
@@ -71,6 +88,24 @@ func New(store *store.Store, enabled bool, logContext ...string) *Reader {
 		enabled:            enabled,
 		fallbackLogContext: contextName,
 	}
+}
+
+// NewWithRowsSource is equivalent to New, but uses source for aggregate reads.
+// A configured source owns the complete read path: it may return unavailable
+// for a partial-hour range so the caller can use its own raw-event fallback.
+// This is important during the SQLite cutover because the legacy Store must
+// not be consulted after its event and rollup writers have been stopped.
+func NewWithRowsSource(store *store.Store, enabled bool, source AggregateRowsSource, logContext ...string) *Reader {
+	reader := New(store, enabled, logContext...)
+	reader.rowsSource = source
+	return reader
+}
+
+func (r *Reader) SetRowsSource(source AggregateRowsSource) {
+	if r == nil {
+		return
+	}
+	r.rowsSource = source
 }
 
 func (r *Reader) Load(ctx context.Context, fromMS, toMS int64) (Snapshot, bool) {
@@ -140,6 +175,23 @@ func (r *Reader) loadRows(ctx context.Context, filter store.AnalyticsFilter, das
 		FailedOnly:      filter.FailedOnly,
 		CollapseBuckets: !dashboardTimelineReady && !analyticsTimelineReady,
 	}
+	if r.rowsSource != nil {
+		_, state, available, err := r.rowsSource.UsageHourlyAggregateRows(ctx, aggregateFilter)
+		if err != nil {
+			r.logFallback(fmt.Sprintf("permanent hourly rows query failed: %v", err))
+			return Snapshot{}, false
+		}
+		if !available {
+			r.logFallback(fmt.Sprintf("permanent hourly aggregate unavailable: schema_version=%d status=%s", state.SchemaVersion, state.Status))
+			return Snapshot{}, false
+		}
+		// The PostgreSQL aggregate currently preserves the core usage dimensions,
+		// but not the exact model-price context bands introduced by pricing_v1.
+		// Fall back to the PostgreSQL raw analytics source instead of mixing a
+		// complete external aggregate with the frozen SQLite pricing snapshot.
+		r.logFallback("pricing hourly aggregate unavailable from configured rows source")
+		return Snapshot{}, false
+	}
 	pricingFilter := store.UsagePricingHourlyFilter{
 		FromMS:          filter.FromMS,
 		ToMS:            filter.ToMS,
@@ -182,14 +234,27 @@ func (r *Reader) DashboardTimeline(ctx context.Context, snapshot Snapshot, fromM
 		return nil, false
 	}
 	if fromMS%hourMS != 0 {
-		timeline, err := r.store.HourlyTimelineBetween(ctx, fromMS, toMS)
-		if err != nil {
-			r.logFallback(fmt.Sprintf("offset timeline query failed: %v", err))
-			return nil, false
+		if source, ok := r.rowsSource.(HourlyTimelineSource); ok {
+			timeline, err := source.HourlyTimelineBetween(ctx, fromMS, toMS)
+			if err != nil {
+				r.logFallback(fmt.Sprintf("offset timeline query failed: %v", err))
+				return nil, false
+			}
+			return timeline, true
 		}
-		return timeline, true
+		// The legacy Store owns both the rollup and raw event tables, so its
+		// fallback remains safe when no external source is configured. Once a
+		// PostgreSQL source is configured, never read the frozen SQLite copy.
+		if r.rowsSource == nil {
+			timeline, err := r.store.HourlyTimelineBetween(ctx, fromMS, toMS)
+			if err != nil {
+				r.logFallback(fmt.Sprintf("offset timeline query failed: %v", err))
+				return nil, false
+			}
+			return timeline, true
+		}
+		return nil, false
 	}
-
 	return dashboardTimelineFromRows(snapshot.rows), true
 }
 

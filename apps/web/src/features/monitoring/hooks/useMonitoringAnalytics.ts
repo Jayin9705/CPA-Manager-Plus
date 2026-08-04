@@ -15,7 +15,83 @@ import { useAuthStore } from '@/stores';
 
 const DEFAULT_REFRESH_THROTTLE_MS = 5_000;
 
+type SharedAnalyticsRequest = {
+  controller: AbortController;
+  promise: Promise<MonitoringAnalyticsResponse>;
+  subscribers: number;
+  settled: boolean;
+};
+
+// Several panels can ask for the same analytics snapshot while a route is
+// mounting (for example a pre-existing transition layer and the new layer).
+// Keep one transport request per exact payload and only abort it when its last
+// consumer goes away. This prevents browser connection queueing without
+// changing the response shape or freshness semantics.
+const sharedAnalyticsRequests = new Map<string, SharedAnalyticsRequest>();
+
+const buildSharedAnalyticsRequestKey = (
+  serviceBase: string,
+  managementKey: string | undefined,
+  requestKey: string
+) => `${serviceBase}\u0000${managementKey || ''}\u0000${requestKey}`;
+
+const acquireSharedAnalyticsRequest = (
+  serviceBase: string,
+  managementKey: string | undefined,
+  request: MonitoringAnalyticsRequest,
+  requestKey: string
+) => {
+  const key = buildSharedAnalyticsRequestKey(serviceBase, managementKey, requestKey);
+  let entry = sharedAnalyticsRequests.get(key);
+  if (!entry) {
+    const controller = new AbortController();
+    let requestPromise: Promise<MonitoringAnalyticsResponse>;
+    try {
+      requestPromise = monitoringAnalyticsApi.getAnalytics(
+        serviceBase,
+        managementKey,
+        request,
+        controller.signal
+      );
+    } catch (error) {
+      requestPromise = Promise.reject(error);
+    }
+
+    entry = {
+      controller,
+      promise: requestPromise,
+      subscribers: 0,
+      settled: false,
+    };
+    const currentEntry = entry;
+    entry.promise = requestPromise.finally(() => {
+      currentEntry.settled = true;
+      if (sharedAnalyticsRequests.get(key) === currentEntry) {
+        sharedAnalyticsRequests.delete(key);
+      }
+    });
+    sharedAnalyticsRequests.set(key, entry);
+  }
+
+  entry.subscribers += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    entry!.subscribers = Math.max(0, entry!.subscribers - 1);
+    if (entry!.subscribers === 0 && !entry!.settled) {
+      if (sharedAnalyticsRequests.get(key) === entry) {
+        sharedAnalyticsRequests.delete(key);
+      }
+      entry!.controller.abort();
+    }
+  };
+
+  return { promise: entry.promise, release, signal: entry.controller.signal };
+};
+
 export interface UseMonitoringAnalyticsParams {
+  enabled?: boolean;
   fromMs?: number | null;
   toMs?: number | null;
   nowMs?: number;
@@ -79,6 +155,7 @@ const buildInFlightRequestIdentityKey = (
 };
 
 export function useMonitoringAnalytics({
+  enabled: requestedEnabled = true,
   fromMs,
   toMs,
   nowMs,
@@ -102,7 +179,7 @@ export function useMonitoringAnalytics({
   const lastRequestKeyRef = useRef('');
   const inFlightRequestIdentityKeyRef = useRef('');
   const inFlightRequestIdRef = useRef(0);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const releaseInFlightRequestRef = useRef<(() => void) | null>(null);
 
   const filtersKey = useMemo(() => stableJson(filters), [filters]);
   const includeKey = useMemo(() => stableJson(include), [include]);
@@ -158,13 +235,14 @@ export function useMonitoringAnalytics({
   );
   const activeDataScopeKey = dataScopeKey || requestKey;
   const serviceBase = availability.serviceBase;
-  const enabled = availability.available && Boolean(serviceBase) && Boolean(request);
+  const enabled =
+    requestedEnabled && availability.available && Boolean(serviceBase) && Boolean(request);
 
   const refresh = useCallback(
     async (options: MonitoringAnalyticsRefreshOptions = {}) => {
       if (!enabled || !request || !serviceBase) {
-        abortControllerRef.current?.abort();
-        abortControllerRef.current = null;
+        releaseInFlightRequestRef.current?.();
+        releaseInFlightRequestRef.current = null;
         requestIdRef.current += 1;
         inFlightRequestIdentityKeyRef.current = '';
         inFlightRequestIdRef.current = 0;
@@ -190,9 +268,8 @@ export function useMonitoringAnalytics({
       }
 
       const requestId = requestIdRef.current + 1;
-      abortControllerRef.current?.abort();
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
+      releaseInFlightRequestRef.current?.();
+      releaseInFlightRequestRef.current = null;
       requestIdRef.current = requestId;
       lastStartedAtRef.current = startedAt;
       lastRequestKeyRef.current = requestKey;
@@ -201,28 +278,32 @@ export function useMonitoringAnalytics({
       setLoading(true);
       setError('');
 
+      const sharedRequest = acquireSharedAnalyticsRequest(
+        serviceBase,
+        managementKey,
+        request,
+        requestKey
+      );
+      releaseInFlightRequestRef.current = sharedRequest.release;
+
       try {
-        const response = await monitoringAnalyticsApi.getAnalytics(
-          serviceBase,
-          managementKey,
-          request,
-          controller.signal
-        );
+        const response = await sharedRequest.promise;
         if (requestIdRef.current !== requestId) return;
         setData(response);
         setDataScopeStateKey(activeDataScopeKey);
         setLastRefreshedAt(new Date());
       } catch (err) {
-        if (controller.signal.aborted) return;
+        if (sharedRequest.signal.aborted) return;
         if (requestIdRef.current !== requestId) return;
         setError(err instanceof Error ? err.message : String(err));
       } finally {
+        sharedRequest.release();
+        if (releaseInFlightRequestRef.current === sharedRequest.release) {
+          releaseInFlightRequestRef.current = null;
+        }
         if (inFlightRequestIdRef.current === requestId) {
           inFlightRequestIdentityKeyRef.current = '';
           inFlightRequestIdRef.current = 0;
-        }
-        if (abortControllerRef.current === controller) {
-          abortControllerRef.current = null;
         }
         if (requestIdRef.current === requestId) {
           setLoading(false);
@@ -250,8 +331,8 @@ export function useMonitoringAnalytics({
 
   useEffect(
     () => () => {
-      abortControllerRef.current?.abort();
-      abortControllerRef.current = null;
+      releaseInFlightRequestRef.current?.();
+      releaseInFlightRequestRef.current = null;
     },
     []
   );

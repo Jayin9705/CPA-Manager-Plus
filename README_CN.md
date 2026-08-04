@@ -162,20 +162,66 @@ docker run -d \
 
 推荐 CPA 版本：`v7.1.39+`，HTTP usage queue 至少需要 `v6.10.8+`。
 
+### 完整持久化栈（CPA + Plus + Redis + PostgreSQL）
+
+需要把当前四服务架构完整重建时，克隆仓库后运行：
+
+```bash
+git clone https://github.com/Jayin9705/CPA-Manager-Plus.git
+cd CPA-Manager-Plus
+./bin/bootstrap-stack.sh
+```
+
+脚本只在被 Git 忽略的本机目录生成密钥，不会把凭据写入版本库或输出到终端。
+服务拓扑、域名配置、备份和现网切换注意事项见
+[完整栈部署说明](deploy/stack/README_CN.md)。
+
+### 前后端完全分离（可与旧服务并行验证）
+
+仓库现在同时提供纯 Go API 和独立静态 console 构建。它们使用独立端口，
+不会替换现有 `cpa-manager-plus.service`，也不会停止旧的 Manager、Redis 或 PostgreSQL：
+
+```bash
+npm run build:separated
+docker compose -f docker-compose.separated.yml --profile separated --profile separated-api build
+```
+
+启动前复制并修改 `deploy/separated/api.env.example`，将 Redis、PostgreSQL、CPA
+地址和 `CPAMP_CONSOLE_ORIGINS` 指向实际私网地址。console 镜像中的
+`runtime-config.json` 只放公开的 API origin；不要放密钥。默认并行入口是
+`http://localhost:18080`（console）和 `http://localhost:18318`（API），可通过环境变量改端口。
+API 的 `/readyz` 会检查 PostgreSQL 模式下的认证依赖；健康检查未通过时不要切换入口。
+如果复用已有 PostgreSQL 数据平面，还必须向 API 提供原 Manager 使用的 data key，不能让新实例重新生成。
+
+当前旧 Manager 正在运行时，只启动静态 console（并把 `runtime-config.json` 指向已配置好的
+API）。不要同时启动 `cpamp-api` 连接同一个 live Redis Stream/CPA；它包含 collector/persist
+worker，应在计划切换窗口启动，或先指向隔离的测试数据平面：
+
+```bash
+docker compose -f docker-compose.separated.yml --profile separated up -d cpamp-console
+# 仅切换/隔离测试数据平面：
+docker compose -f docker-compose.separated.yml --profile separated-api up -d cpamp-api
+```
+
+纯后端镜像使用 `Dockerfile.manager-server-api`，不安装 Node、也不打包 HTML/CSS/JS；
+旧的 `Dockerfile.manager-server`、`/management.html` 和内嵌面板继续保留作回滚路径。
+
 ## 文档
 
-| 任务                                  | 文档                                                                                                                                                                                  |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 选择面板和部署模式                    | [如何选择 CPA 面板](https://seakee.github.io/CPA-Manager-Plus/docs/guide/choosing-a-panel.html)                                                                                       |
-| 不部署额外服务，直接替换官方 UI       | [CPAMP 轻量面板](https://seakee.github.io/CPA-Manager-Plus/docs/deployment/cpa-panel.html)                                                                                            |
-| 安装并完成首次配置                    | [快速开始](https://seakee.github.io/CPA-Manager-Plus/docs/guide/getting-started.html)                                                                                                 |
-| 查看功能、Provider 和模式边界         | [能力矩阵](https://seakee.github.io/CPA-Manager-Plus/docs/reference/capability-matrix.html)                                                                                           |
-| 了解运行端口、密钥和请求流向          | [运行模型](https://seakee.github.io/CPA-Manager-Plus/docs/guide/runtime-model.html)                                                                                                   |
-| 配置 Provider、认证文件、配额和插件   | [面板手册](https://seakee.github.io/CPA-Manager-Plus/docs/manual/ai-providers.html)                                                                                                   |
-| 运维 Manager Server、备份、升级与迁移 | [Manager Server 指南](https://seakee.github.io/CPA-Manager-Plus/docs/operations/manager-server.html)                                                                                  |
-| 备份数据或恢复丢失的管理员密钥        | [备份与恢复](https://seakee.github.io/CPA-Manager-Plus/docs/operations/backup.html)、[重置管理员密钥](https://seakee.github.io/CPA-Manager-Plus/docs/operations/reset-admin-key.html) |
-| 从旧版 CPA-Manager 迁移               | [CPA-Manager 迁移指南](https://seakee.github.io/CPA-Manager-Plus/docs/migration/from-cpa-manager.html)                                                                                |
-| 排查监控为空或队列问题                | [请求监控排障](https://seakee.github.io/CPA-Manager-Plus/docs/troubleshooting/request-monitoring.html)                                                                                |
+| 任务                                    | 文档                                                                                                                                                                                  |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 选择面板和部署模式                      | [如何选择 CPA 面板](https://seakee.github.io/CPA-Manager-Plus/docs/guide/choosing-a-panel.html)                                                                                       |
+| 不部署额外服务，直接替换官方 UI         | [CPAMP 轻量面板](https://seakee.github.io/CPA-Manager-Plus/docs/deployment/cpa-panel.html)                                                                                            |
+| 安装并完成首次配置                      | [快速开始](https://seakee.github.io/CPA-Manager-Plus/docs/guide/getting-started.html)                                                                                                 |
+| 查看功能、Provider 和模式边界           | [能力矩阵](https://seakee.github.io/CPA-Manager-Plus/docs/reference/capability-matrix.html)                                                                                           |
+| 了解运行端口、密钥和请求流向            | [运行模型](https://seakee.github.io/CPA-Manager-Plus/docs/guide/runtime-model.html)                                                                                                   |
+| 配置 Provider、认证文件、配额和插件     | [面板手册](https://seakee.github.io/CPA-Manager-Plus/docs/manual/ai-providers.html)                                                                                                   |
+| 运维 Manager Server、备份、升级与迁移   | [Manager Server 指南](https://seakee.github.io/CPA-Manager-Plus/docs/operations/manager-server.html)                                                                                  |
+| CPA + Redis + PostgreSQL 当前架构与安装 | [架构与安装文档](https://seakee.github.io/CPA-Manager-Plus/docs/operations/cpa-redis-postgresql.html)                                                                                 |
+| 前后端分离与 UI 重构设计                | [分离设计](docs/frontend-backend-separation-ui-redesign.zh-CN.md)、[UI Design System](design-system/cpa-manager-plus/MASTER.md)                                                       |
+| 备份数据或恢复丢失的管理员密钥          | [备份与恢复](https://seakee.github.io/CPA-Manager-Plus/docs/operations/backup.html)、[重置管理员密钥](https://seakee.github.io/CPA-Manager-Plus/docs/operations/reset-admin-key.html) |
+| 从旧版 CPA-Manager 迁移                 | [CPA-Manager 迁移指南](https://seakee.github.io/CPA-Manager-Plus/docs/migration/from-cpa-manager.html)                                                                                |
+| 排查监控为空或队列问题                  | [请求监控排障](https://seakee.github.io/CPA-Manager-Plus/docs/troubleshooting/request-monitoring.html)                                                                                |
 
 ## 数据、隐私与安全
 

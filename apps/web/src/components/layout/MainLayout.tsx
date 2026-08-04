@@ -17,17 +17,20 @@ import {
   IconSidebarAuthFiles,
   IconSidebarConfig,
   IconSidebarDashboard,
+  IconDollarSign,
   IconSidebarInspection,
   IconSidebarLogs,
   IconSidebarMonitor,
   IconSidebarOauth,
+  IconSidebarOperations,
   IconSidebarPlugins,
+  IconSidebarPlayground,
   IconSidebarProviders,
   IconSidebarQuota,
   IconSidebarSystem,
   IconSidebarUsage,
 } from '@/components/ui/icons';
-import { INLINE_LOGO_JPEG } from '@/assets/logoInline';
+import { JAY_AI_FAVICON } from '@/assets/jayAiFaviconInline';
 import {
   useAuthStore,
   useConfigStore,
@@ -47,11 +50,17 @@ import {
 } from '@/features/plugins/pluginResources';
 import { triggerHeaderRefresh } from '@/hooks/useHeaderRefresh';
 import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { isFileLogsAvailable } from '@/features/logs/logFeatureAvailability';
 import { getDemoLogoutPath, prefixRouteBase, stripRouteBase } from '@/features/demo/demoMode';
 import { LANGUAGE_LABEL_KEYS, LANGUAGE_ORDER, STORAGE_KEY_SIDEBAR } from '@/utils/constants';
 import { isSupportedLanguage } from '@/utils/language';
 import type { Theme, VisualEffectsMode } from '@/types';
+import {
+  COMPACT_VIEWPORT_QUERY,
+  MOBILE_VIEWPORT_QUERY,
+  resolveSidebarResponsiveState,
+} from './sidebarResponsive';
 
 const SIDEBAR_ICON_SIZE = 20;
 const GITHUB_REPOSITORY_URL = 'https://github.com/seakee/CPA-Manager-Plus';
@@ -65,10 +74,13 @@ const sidebarIcons: Record<string, ReactNode> = {
   usageAnalytics: <IconSidebarUsage size={SIDEBAR_ICON_SIZE} />,
   codexInspection: <IconSidebarInspection size={SIDEBAR_ICON_SIZE} />,
   monitoring: <IconSidebarMonitor size={SIDEBAR_ICON_SIZE} />,
+  modelPrices: <IconDollarSign size={SIDEBAR_ICON_SIZE} />,
   plugins: <IconSidebarPlugins size={SIDEBAR_ICON_SIZE} />,
+  playground: <IconSidebarPlayground size={SIDEBAR_ICON_SIZE} />,
   config: <IconSidebarConfig size={SIDEBAR_ICON_SIZE} />,
   logs: <IconSidebarLogs size={SIDEBAR_ICON_SIZE} />,
   system: <IconSidebarSystem size={SIDEBAR_ICON_SIZE} />,
+  operations: <IconSidebarOperations size={SIDEBAR_ICON_SIZE} />,
 };
 
 // Header action icons - smaller size for header buttons
@@ -103,6 +115,13 @@ const headerIcons = {
     <svg {...headerIconProps}>
       <path d="M18 6 6 18" />
       <path d="m6 6 12 12" />
+    </svg>
+  ),
+  more: (
+    <svg {...headerIconProps}>
+      <circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+      <circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none" />
     </svg>
   ),
   sidebarCollapse: (
@@ -251,30 +270,42 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
   const setVisualEffectsMode = useVisualEffectsStore((state) => state.setMode);
   const language = useLanguageStore((state) => state.language);
   const setLanguage = useLanguageStore((state) => state.setLanguage);
+  const isMobileViewport = useMediaQuery(MOBILE_VIEWPORT_QUERY);
+  const isCompactViewport = useMediaQuery(COMPACT_VIEWPORT_QUERY);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [preferredSidebarCollapsed, setPreferredSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem(STORAGE_KEY_SIDEBAR) === 'true';
     } catch {
       return false;
     }
   });
+  const [tabletSidebarExpanded, setTabletSidebarExpanded] = useState(false);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const [visualEffectsMenuOpen, setVisualEffectsMenuOpen] = useState(false);
+  const [mobileHeaderMenuOpen, setMobileHeaderMenuOpen] = useState(false);
   const [pluginResources, setPluginResources] = useState<PluginResourceEntry[]>([]);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const languageMenuRef = useRef<HTMLDivElement | null>(null);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
   const visualEffectsMenuRef = useRef<HTMLDivElement | null>(null);
+  const mobileHeaderMenuRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
 
-  const fullBrandName = 'CPA Manager Plus';
-  const abbrBrandName = t('title.abbr');
+  const fullBrandName = t('title.main');
   const isLogsPage = routePathname.startsWith('/logs');
   const isPluginResourcePage = routePathname.startsWith('/plugin-pages');
-  const showSidebarLabels = !sidebarCollapsed || sidebarOpen;
+  const { isTabletViewport, sidebarCollapsed, sidebarExpanded, showSidebarLabels } =
+    resolveSidebarResponsiveState({
+      isMobileViewport,
+      isCompactViewport,
+      preferredSidebarCollapsed,
+      tabletSidebarExpanded,
+      sidebarOpen,
+    });
   const pluginControlMenuVisible = isPluginManagementNavVisible({ supportsPlugin });
   const configPluginsEnabled = config?.pluginsEnabled;
 
@@ -417,6 +448,70 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
     };
   }, [visualEffectsMenuOpen]);
 
+  useEffect(() => {
+    if (!mobileHeaderMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!mobileHeaderMenuRef.current?.contains(event.target as Node)) {
+        setMobileHeaderMenuOpen(false);
+      }
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMobileHeaderMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleEscape);
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [mobileHeaderMenuOpen]);
+
+  useEffect(() => {
+    if (!sidebarOpen) {
+      return;
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSidebarOpen(false);
+      }
+    };
+
+    document.addEventListener('keydown', handleEscape);
+
+    const previousBodyOverflow = document.body.style.overflow;
+    if (isMobileViewport) {
+      document.body.style.overflow = 'hidden';
+    }
+
+    return () => {
+      document.removeEventListener('keydown', handleEscape);
+      if (isMobileViewport) {
+        document.body.style.overflow = previousBodyOverflow;
+      }
+    };
+  }, [isMobileViewport, sidebarOpen]);
+
+  useEffect(() => {
+    // Viewport mode changes should always start from a predictable navigation
+    // state. In particular, do not reopen a mobile drawer after rotating or
+    // resizing back from a wider layout.
+    setSidebarOpen(false);
+    setMobileHeaderMenuOpen(false);
+
+    if (!isTabletViewport) {
+      setTabletSidebarExpanded(false);
+    }
+  }, [isMobileViewport, isTabletViewport]);
+
   const toggleLanguageMenu = useCallback(() => {
     setLanguageMenuOpen((prev) => !prev);
     setThemeMenuOpen(false);
@@ -435,10 +530,40 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
     setThemeMenuOpen(false);
   }, []);
 
+  const toggleMobileHeaderMenu = useCallback(() => {
+    setMobileHeaderMenuOpen((prev) => !prev);
+    setLanguageMenuOpen(false);
+    setThemeMenuOpen(false);
+    setVisualEffectsMenuOpen(false);
+  }, []);
+
+  const toggleSidebar = useCallback(() => {
+    if (isMobileViewport) {
+      setSidebarOpen((previous) => !previous);
+      return;
+    }
+
+    if (isTabletViewport) {
+      setTabletSidebarExpanded((previous) => !previous);
+      return;
+    }
+
+    setPreferredSidebarCollapsed((previous) => {
+      const next = !previous;
+      try {
+        localStorage.setItem(STORAGE_KEY_SIDEBAR, String(next));
+      } catch {
+        /* ignore storage failures */
+      }
+      return next;
+    });
+  }, [isMobileViewport, isTabletViewport]);
+
   const handleThemeSelect = useCallback(
     (nextTheme: Theme) => {
       setTheme(nextTheme);
       setThemeMenuOpen(false);
+      setMobileHeaderMenuOpen(false);
     },
     [setTheme]
   );
@@ -447,6 +572,7 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
     (nextMode: VisualEffectsMode) => {
       setVisualEffectsMode(nextMode);
       setVisualEffectsMenuOpen(false);
+      setMobileHeaderMenuOpen(false);
     },
     [setVisualEffectsMode]
   );
@@ -458,6 +584,7 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
       }
       setLanguage(nextLanguage);
       setLanguageMenuOpen(false);
+      setMobileHeaderMenuOpen(false);
     },
     [setLanguage]
   );
@@ -508,10 +635,13 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
     const label = t(shortKey, { defaultValue: fallback });
     return label === shortKey ? fallback : label;
   };
+  // Keep this compact literal stable for the navigation wiring check.
+  // prettier-ignore
   const dashboardNavItem: NavItem = {
-    path: '/', label: t('nav.dashboard'),
+    path: '/dashboard', label: t('nav.dashboard'),
     shortLabel: navShortLabel('nav.dashboard', t('nav.dashboard')),
     icon: sidebarIcons.dashboard,
+    exact: true,
   };
   const usageAnalyticsNavItem = featureAvailability.requestMonitoringAvailable
     ? {
@@ -527,6 +657,14 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
         label: t('nav.monitoring_center'),
         shortLabel: navShortLabel('nav.monitoring_center', t('nav.monitoring_center')),
         icon: sidebarIcons.monitoring,
+      }
+    : null;
+  const modelPricesNavItem = featureAvailability.modelPricesAvailable
+    ? {
+        path: '/model-prices',
+        label: t('nav.model_prices'),
+        shortLabel: navShortLabel('nav.model_prices', t('nav.model_prices')),
+        icon: sidebarIcons.modelPrices,
       }
     : null;
   const operationNavItems: NavItem[] = [
@@ -559,11 +697,26 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
         icon: <PluginSidebarIcon src={resolvePluginAssetURL(resource.pluginLogo, apiBase)} />,
       }))
     : [];
+  const operationsNavItem = featureAvailability.managerServiceAvailable
+    ? {
+        path: '/operations',
+        label: t('nav.operations'),
+        shortLabel: navShortLabel('nav.operations', t('nav.operations')),
+        icon: sidebarIcons.operations,
+      }
+    : null;
   const navSections: NavItem[][] = [
     [
       dashboardNavItem,
+      {
+        path: '/playground',
+        label: t('nav.playground'),
+        shortLabel: navShortLabel('nav.playground', t('nav.playground')),
+        icon: sidebarIcons.playground,
+      },
       ...(usageAnalyticsNavItem ? [usageAnalyticsNavItem] : []),
       ...(monitoringNavItem ? [monitoringNavItem] : []),
+      ...(modelPricesNavItem ? [modelPricesNavItem] : []),
     ],
     [
       {
@@ -615,6 +768,7 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
         shortLabel: navShortLabel('nav.system_info', t('nav.system_info')),
         icon: sidebarIcons.system,
       },
+      ...(operationsNavItem ? [operationsNavItem] : []),
     ],
   ].filter((section) => section.length > 0);
   const navItems = navSections.flat();
@@ -622,7 +776,7 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
   const getRouteOrder = (pathname: string) => {
     const trimmedPath =
       pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
-    const normalizedPath = trimmedPath === '/dashboard' ? '/' : trimmedPath;
+    const normalizedPath = trimmedPath;
 
     const aiProvidersIndex = navOrder.indexOf('/ai-providers');
     if (aiProvidersIndex !== -1) {
@@ -657,9 +811,7 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
 
   const getTransitionVariant = useCallback((fromPathname: string, toPathname: string) => {
     const normalize = (pathname: string) => {
-      const trimmed =
-        pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
-      return trimmed === '/dashboard' ? '/' : trimmed;
+      return pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
     };
 
     const from = normalize(fromPathname);
@@ -674,6 +826,7 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
   }, []);
 
   const handleRefreshAll = async () => {
+    setMobileHeaderMenuOpen(false);
     clearCache();
     const results = await Promise.allSettled([
       fetchConfig(undefined, true),
@@ -693,21 +846,28 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
     }
     showNotification(t('notification.data_refreshed'), 'success');
   };
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    setMobileHeaderMenuOpen(false);
     if (demoMode) {
       navigate(getDemoLogoutPath(routeBase), { replace: true });
       return;
     }
-    logout();
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await logout();
+    } finally {
+      setLoggingOut(false);
+    }
   };
-  const mobileSidebarToggleLabel = sidebarOpen
-    ? t('sidebar.toggle_collapse', { defaultValue: 'Close navigation' })
-    : t('sidebar.toggle_expand', { defaultValue: 'Open navigation' });
+  const sidebarToggleLabel = sidebarExpanded
+    ? t('sidebar.toggle_collapse', { defaultValue: 'Collapse sidebar' })
+    : t('sidebar.toggle_expand', { defaultValue: 'Expand sidebar' });
   const normalizedLocationPath =
     routePathname.length > 1 && routePathname.endsWith('/')
       ? routePathname.slice(0, -1)
       : routePathname;
-  const currentPath = normalizedLocationPath === '/dashboard' ? '/' : normalizedLocationPath;
+  const currentPath = normalizedLocationPath;
   const matchesNavPath = (item: NavItem, pathname: string) =>
     item.path === '/' || item.exact
       ? pathname === item.path
@@ -717,43 +877,36 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
       .sort((a, b) => b.path.length - a.path.length)
       .find((item) => matchesNavPath(item, currentPath)) ?? navItems[0];
   const currentRouteLabel = activeNavItem?.label ?? fullBrandName;
-
   return (
     <div
       className={[
         'app-shell',
+        __SEPARATED_SITE__ ? 'separated-shell' : '',
         sidebarCollapsed ? 'sidebar-is-collapsed' : '',
         isPluginResourcePage ? 'plugin-resource-shell' : '',
       ]
         .filter(Boolean)
         .join(' ')}
     >
+      <a className="skip-link" href="#main-content">
+        {t('common.skip_to_content', { defaultValue: 'Skip to content' })}
+      </a>
       <header className="main-header" ref={headerRef}>
         <div className="navbar">
           <div className="navbar-left">
             <button
               type="button"
               className="hamburger-container"
-              onClick={() => {
-                if (window.matchMedia('(max-width: 768px)').matches) {
-                  setSidebarOpen((prev) => !prev);
-                  return;
-                }
-                setSidebarCollapsed((prev) => {
-                  const next = !prev;
-                  try {
-                    localStorage.setItem(STORAGE_KEY_SIDEBAR, String(next));
-                  } catch {
-                    /* ignore storage failures */
-                  }
-                  return next;
-                });
-              }}
-              title={mobileSidebarToggleLabel}
-              aria-label={mobileSidebarToggleLabel}
+              onClick={toggleSidebar}
+              title={sidebarToggleLabel}
+              aria-label={sidebarToggleLabel}
+              aria-controls="primary-navigation"
+              aria-expanded={sidebarExpanded}
             >
-              {sidebarOpen
-                ? headerIcons.close
+              {isMobileViewport
+                ? sidebarOpen
+                  ? headerIcons.close
+                  : headerIcons.menu
                 : sidebarCollapsed
                   ? headerIcons.sidebarExpand
                   : headerIcons.sidebarCollapse}
@@ -765,6 +918,12 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
             >
               <span className="breadcrumb-item">{currentRouteLabel}</span>
             </nav>
+            {__SEPARATED_SITE__ && (
+              <div className="console-mode-badge" role="status">
+                <span className="console-mode-badge__dot" aria-hidden="true" />
+                <span>Separated Console</span>
+              </div>
+            )}
           </div>
 
           <div className="navbar-right">
@@ -915,12 +1074,140 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
             <Button
               variant="ghost"
               size="sm"
-              onClick={handleLogout}
+              onClick={() => void handleLogout()}
+              loading={loggingOut}
               title={t('header.logout')}
               aria-label={t('header.logout')}
             >
               {headerIcons.logout}
             </Button>
+
+            <div className="mobile-header-menu" ref={mobileHeaderMenuRef}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={toggleMobileHeaderMenu}
+                title={t('common.more', { defaultValue: 'More actions' })}
+                aria-label={t('common.more', { defaultValue: 'More actions' })}
+                aria-haspopup="menu"
+                aria-expanded={mobileHeaderMenuOpen}
+                aria-controls="mobile-header-popover"
+              >
+                {headerIcons.more}
+              </Button>
+              {mobileHeaderMenuOpen && (
+                <div
+                  id="mobile-header-popover"
+                  className="mobile-header-popover notification entering"
+                  role="menu"
+                  aria-label={t('common.more', { defaultValue: 'More actions' })}
+                >
+                  <button
+                    type="button"
+                    className="mobile-header-menu-item"
+                    onClick={() => void handleRefreshAll()}
+                    role="menuitem"
+                  >
+                    <span aria-hidden="true">{headerIcons.refresh}</span>
+                    <span>{t('header.refresh_all')}</span>
+                  </button>
+                  <a
+                    className="mobile-header-menu-item"
+                    href={GITHUB_REPOSITORY_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={() => setMobileHeaderMenuOpen(false)}
+                    role="menuitem"
+                  >
+                    <span aria-hidden="true">
+                      <IconGithub size={16} />
+                    </span>
+                    <span>{t('header.open_github')}</span>
+                  </a>
+
+                  <div
+                    className="mobile-header-menu-section"
+                    role="group"
+                    aria-label={t('language.switch')}
+                  >
+                    <span className="mobile-header-menu-label">{t('language.switch')}</span>
+                    <div className="mobile-header-menu-options">
+                      {LANGUAGE_ORDER.map((lang) => (
+                        <button
+                          key={lang}
+                          type="button"
+                          className={`mobile-header-menu-option ${language === lang ? 'active' : ''}`}
+                          onClick={() => handleLanguageSelect(lang)}
+                          role="menuitemradio"
+                          aria-checked={language === lang}
+                        >
+                          {t(LANGUAGE_LABEL_KEYS[lang])}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div
+                    className="mobile-header-menu-section"
+                    role="group"
+                    aria-label={t('theme.switch')}
+                  >
+                    <span className="mobile-header-menu-label">{t('theme.switch')}</span>
+                    <div className="mobile-header-menu-options mobile-header-menu-options-icons">
+                      {THEME_OPTIONS.map((option) => (
+                        <button
+                          key={option.key}
+                          type="button"
+                          className={`mobile-header-menu-option ${theme === option.key ? 'active' : ''}`}
+                          onClick={() => handleThemeSelect(option.key)}
+                          role="menuitemradio"
+                          aria-checked={theme === option.key}
+                          title={t(option.labelKey)}
+                        >
+                          <span aria-hidden="true">{option.icon}</span>
+                          <span>{t(option.labelKey)}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div
+                    className="mobile-header-menu-section"
+                    role="group"
+                    aria-label={t('visual_effects.switch')}
+                  >
+                    <span className="mobile-header-menu-label">{t('visual_effects.switch')}</span>
+                    <div className="mobile-header-menu-options mobile-header-menu-options-icons">
+                      {VISUAL_EFFECTS_OPTIONS.map((option) => (
+                        <button
+                          key={option.key}
+                          type="button"
+                          className={`mobile-header-menu-option ${visualEffectsMode === option.key ? 'active' : ''}`}
+                          onClick={() => handleVisualEffectsSelect(option.key)}
+                          role="menuitemradio"
+                          aria-checked={visualEffectsMode === option.key}
+                          title={t(option.labelKey)}
+                        >
+                          <span aria-hidden="true">{option.icon}</span>
+                          <span>{t(option.labelKey)}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="mobile-header-menu-item mobile-header-menu-item-danger"
+                    onClick={() => void handleLogout()}
+                    disabled={loggingOut}
+                    role="menuitem"
+                  >
+                    <span aria-hidden="true">{headerIcons.logout}</span>
+                    <span>{t('header.logout')}</span>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -936,22 +1223,65 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
         />
 
         <aside
+          id="primary-navigation"
           className={`sidebar ${sidebarOpen ? 'open' : ''} ${sidebarCollapsed ? 'collapsed' : ''}`}
+          aria-label={t('common.navigation', { defaultValue: 'Primary navigation' })}
         >
           <div className="sidebar-brand" title={fullBrandName}>
             <div className="sidebar-brand-main">
-              <img src={INLINE_LOGO_JPEG} alt="CPAMC logo" className="sidebar-brand-logo" />
-              {showSidebarLabels && <span className="sidebar-brand-title">{abbrBrandName}</span>}
+              <img
+                src={JAY_AI_FAVICON}
+                alt={`${fullBrandName} logo`}
+                className="sidebar-brand-logo"
+              />
+              {showSidebarLabels &&
+                (__SEPARATED_SITE__ ? (
+                  <span className="separated-brand-copy">
+                    <span className="separated-brand-kicker">CPA MANAGER PLUS</span>
+                    <span className="separated-brand-title">{fullBrandName}</span>
+                    <span className="separated-brand-subtitle">OPERATIONS CONSOLE</span>
+                  </span>
+                ) : (
+                  <span className="sidebar-brand-title">{fullBrandName}</span>
+                ))}
             </div>
             {!showSidebarLabels && (
-              <span className="sidebar-brand-short">{abbrBrandName.charAt(0) || 'C'}</span>
+              <span className="sidebar-brand-short">{fullBrandName.charAt(0) || 'J'}</span>
             )}
           </div>
 
           <div className="nav-section">
             {navSections.map((section, sectionIndex) => (
-              <div className="nav-menu-section" key={`nav-section-${sectionIndex}`}>
+              <div
+                className="nav-menu-section"
+                key={`nav-section-${sectionIndex}`}
+                role="group"
+                aria-label={
+                  [
+                    t('nav.group_overview', { defaultValue: 'Overview' }),
+                    t('nav.group_configuration', { defaultValue: 'Configuration' }),
+                    t('nav.group_credentials', { defaultValue: 'Credentials' }),
+                    t('nav.group_operations', { defaultValue: 'Operations' }),
+                    t('nav.group_plugins', { defaultValue: 'Plugin pages' }),
+                    t('nav.group_system', { defaultValue: 'System' }),
+                  ][sectionIndex]
+                }
+              >
                 {sectionIndex > 0 && <div className="nav-menu-divider" aria-hidden="true" />}
+                {showSidebarLabels && (
+                  <div className="nav-menu-section-label" aria-hidden="true">
+                    {
+                      [
+                        t('nav.group_overview', { defaultValue: 'Overview' }),
+                        t('nav.group_configuration', { defaultValue: 'Configuration' }),
+                        t('nav.group_credentials', { defaultValue: 'Credentials' }),
+                        t('nav.group_operations', { defaultValue: 'Operations' }),
+                        t('nav.group_plugins', { defaultValue: 'Plugin pages' }),
+                        t('nav.group_system', { defaultValue: 'System' }),
+                      ][sectionIndex]
+                    }
+                  </div>
+                )}
                 {section.map((item) => (
                   <NavLink
                     key={item.path}
@@ -983,6 +1313,8 @@ export function MainLayout({ routeBase = '', demoMode = false }: MainLayoutProps
           ref={contentRef}
         >
           <main
+            id="main-content"
+            tabIndex={-1}
             className={[
               'main-content',
               isLogsPage ? 'main-content-logs' : '',

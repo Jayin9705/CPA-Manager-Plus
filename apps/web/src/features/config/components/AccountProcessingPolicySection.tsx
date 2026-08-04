@@ -53,7 +53,7 @@ export function AccountProcessingPolicySection() {
   const [confirmAutoDisableOpen, setConfirmAutoDisableOpen] = useState(false);
 
   const load = useCallback(async () => {
-    if (!managerServiceBase || !managementKey) return;
+    if (!managerServiceBase) return;
     setLoading(true);
     setLoadError('');
     setSaveError(null);
@@ -81,7 +81,7 @@ export function AccountProcessingPolicySection() {
 
   const persistCapability = useCallback(
     async (key: AccountPolicyCapabilityKey, value: boolean) => {
-      if (!managerServiceBase || !managementKey) return;
+      if (!managerServiceBase) return;
       setSavingKey(key);
       setSaveError(null);
       try {

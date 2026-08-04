@@ -108,10 +108,12 @@ describe('demo persist isolation', () => {
       sessionPanelBase: 'http://next.local:18317',
     });
 
-    expect(obfuscatedStorage.getItem<{ state?: { apiBase?: string } }>(STORAGE_KEY_AUTH)?.state)
-      .toMatchObject({
-        apiBase: 'http://next.local:18317',
-        managementKey: 'next-management-key',
-      });
+    const persistedManagerSession = obfuscatedStorage.getItem<{
+      state?: { apiBase?: string; managementKey?: string };
+    }>(STORAGE_KEY_AUTH)?.state;
+    expect(persistedManagerSession).toMatchObject({
+      apiBase: 'http://next.local:18317',
+    });
+    expect(persistedManagerSession).not.toHaveProperty('managementKey');
   });
 });

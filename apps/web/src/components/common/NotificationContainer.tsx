@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNotificationStore } from '@/stores';
+import { useNotificationStore } from '@/stores/useNotificationStore';
 import { IconX } from '@/components/ui/icons';
 import type { Notification } from '@/types';
 

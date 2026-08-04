@@ -19,6 +19,7 @@ import (
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/command/adminreset"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/config"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/httpapi"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/migration"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/security"
 	bootstrapservice "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/bootstrap"
 	collectorservice "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/collector"
@@ -53,13 +54,25 @@ func runServer() {
 	if err != nil {
 		log.Fatalf("initialize secret protector: %v", err)
 	}
-	db, err := store.Open(cfg.DBPath, protector)
-	if err != nil {
-		log.Fatalf("open sqlite: %v", err)
+	postgresOnly := cfg.PersistenceBackend == "postgres"
+	var db *store.Store
+	if postgresOnly {
+		coreCtx, cancelCore := context.WithTimeout(context.Background(), 5*time.Second)
+		db, err = store.OpenPostgres(coreCtx, cfg.CorePostgresDSN, protector)
+		cancelCore()
+		if err != nil {
+			log.Fatalf("open PostgreSQL core store: %v", err)
+		}
+		log.Printf("PostgreSQL-only core store enabled")
+	} else {
+		db, err = store.Open(cfg.DBPath, protector)
+		if err != nil {
+			log.Fatalf("open sqlite: %v", err)
+		}
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
-			log.Printf("close sqlite: %v", err)
+			log.Printf("close core store: %v", err)
 		}
 	}()
 
@@ -68,7 +81,11 @@ func runServer() {
 		log.Fatalf("bootstrap manager server: %v", err)
 	}
 	if bootstrapResult.GeneratedAdminKey != "" {
-		log.Printf("CPA Manager Plus admin key generated: %s", bootstrapResult.GeneratedAdminKey)
+		if postgresOnly {
+			log.Printf("legacy CPA Manager Plus admin credential initialized in PostgreSQL")
+		} else {
+			log.Printf("CPA Manager Plus admin key generated: %s", bootstrapResult.GeneratedAdminKey)
+		}
 	} else {
 		log.Printf("CPA Manager Plus admin credential initialized")
 	}
@@ -85,12 +102,72 @@ func runServer() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	serverApp := httpapi.New(cfg, db, manager)
-	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := serverApp.AppContext().CodexInspectionService.Recover(recoveryCtx); err != nil {
-		log.Printf("recover codex inspection runs: %v", err)
+	var usagePostgres *migration.Postgres
+	if strings.TrimSpace(cfg.UsagePostgresDSN) != "" {
+		pgCtx, cancelPG := context.WithTimeout(context.Background(), 3*time.Second)
+		usagePostgres, err = migration.OpenPostgres(pgCtx, cfg.UsagePostgresDSN)
+		cancelPG()
+		if err != nil {
+			if postgresOnly {
+				log.Fatalf("open required PostgreSQL usage store: %v", err)
+			}
+			log.Printf("open PostgreSQL usage reader: %v; using SQLite development fallback", err)
+			usagePostgres = nil
+		} else {
+			defer usagePostgres.Close()
+			log.Printf("PostgreSQL usage store enabled")
+		}
 	}
-	cancelRecovery()
+	if postgresOnly && usagePostgres == nil {
+		log.Fatalf("PostgreSQL usage store is required in PostgreSQL-only mode")
+	}
+	if postgresOnly {
+		redisCtx, cancelRedis := context.WithTimeout(context.Background(), 3*time.Second)
+		redisClient, redisErr := migration.OpenRedis(redisCtx, migration.RedisOptions{
+			Address: cfg.UsageRedisAddr, Password: cfg.UsageRedisPassword, DB: cfg.UsageRedisDB,
+		})
+		if redisErr == nil {
+			redisErr = migration.EnsureUsageStream(redisCtx, redisClient, cfg.UsageRedisStream, cfg.UsageRedisGroup)
+			_ = redisClient.Close()
+		}
+		cancelRedis()
+		if redisErr != nil {
+			log.Fatalf("verify required Redis usage stream: %v", redisErr)
+		}
+	}
+
+	var serverApp *httpapi.Server
+	if httpapi.IsAPIOnly() {
+		serverApp = httpapi.NewAPI(cfg, db, manager)
+	} else {
+		serverApp = httpapi.New(cfg, db, manager)
+	}
+	defer func() {
+		if err := serverApp.AppContext().AdminAuthService.Close(); err != nil {
+			log.Printf("close administrator authentication service: %v", err)
+		}
+	}()
+	if postgresOnly {
+		if err := serverApp.AppContext().AdminAuthService.Ready(); err != nil {
+			log.Fatalf("verify required administrator authentication backends: %v", err)
+		}
+	}
+	if usagePostgres != nil {
+		serverApp.AppContext().MonitoringService.SetPostgresSource(usagePostgres)
+		serverApp.AppContext().DashboardService.SetPostgresSource(usagePostgres)
+		serverApp.AppContext().UsageService.SetPostgresSource(usagePostgres)
+		serverApp.AppContext().ModelPriceService.SetUsageSummarySource(usagePostgres)
+		manager.SetUsagePostgresFallback(usagePostgres)
+	}
+	if !cfg.APIShadowMode {
+		recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := serverApp.AppContext().CodexInspectionService.Recover(recoveryCtx); err != nil {
+			log.Printf("recover codex inspection runs: %v", err)
+		}
+		cancelRecovery()
+	} else {
+		log.Printf("API shadow mode enabled: process-local workers are disabled")
+	}
 	if err := serverApp.AppContext().UsageService.StartImportSessionCleanup(ctx); err != nil {
 		log.Fatalf("start usage import session cleanup: %v", err)
 	}
@@ -109,19 +186,33 @@ func runServer() {
 		serverApp.AppContext().AuthFileMutationCoordinator,
 		runtimeSettings.AccountActionsAutoDisable,
 	)
-	accountHistoryRollupWorker := worker.NewAccountHistoryRollupWorker(db)
-	accountHistoryRollupWorker.Start(ctx)
-	usagePricingRollupWorker := worker.NewUsagePricingRollupWorker(db)
-	usagePricingRollupWorker.Start(ctx)
-	serverApp.AppContext().ModelPriceService.SetPricesChangedNotifier(usagePricingRollupWorker.Wake)
+	var accountHistoryRollupWorker *worker.AccountHistoryRollupWorker
+	var usagePricingRollupWorker *worker.UsagePricingRollupWorker
+	if !postgresOnly && cfg.SQLiteAccountRollupEnabled {
+		accountHistoryRollupWorker = worker.NewAccountHistoryRollupWorker(db)
+		accountHistoryRollupWorker.Start(ctx)
+		usagePricingRollupWorker = worker.NewUsagePricingRollupWorker(db)
+		usagePricingRollupWorker.Start(ctx)
+		serverApp.AppContext().ModelPriceService.SetPricesChangedNotifier(usagePricingRollupWorker.Wake)
+	} else {
+		log.Printf("PostgreSQL raw-event monitoring enabled; local account-history and pricing rollups disabled")
+	}
 	var usageHourlyAggregateWorker *worker.UsageHourlyAggregateWorker
-	if cfg.DashboardHourlyRollupEnabled {
+	if !postgresOnly && cfg.DashboardHourlyRollupEnabled && cfg.SQLiteHourlyRollupEnabled {
 		usageHourlyAggregateWorker = worker.NewUsageHourlyAggregateWorker(db)
 		usageHourlyAggregateWorker.Start(ctx)
+	} else if !postgresOnly && cfg.DashboardHourlyRollupEnabled {
+		log.Printf("PostgreSQL aggregate monitoring enabled; local hourly rollup disabled")
+	} else if postgresOnly {
+		log.Printf("PostgreSQL-only usage pipeline enabled")
 	}
 	serverApp.AppContext().UsageService.SetEventsInsertedNotifier(func() {
-		accountHistoryRollupWorker.Wake()
-		usagePricingRollupWorker.Wake()
+		if accountHistoryRollupWorker != nil {
+			accountHistoryRollupWorker.Wake()
+		}
+		if usagePricingRollupWorker != nil {
+			usagePricingRollupWorker.Wake()
+		}
 		if usageHourlyAggregateWorker != nil {
 			usageHourlyAggregateWorker.Wake()
 		}
@@ -133,7 +224,11 @@ func runServer() {
 		accountActionWorker,
 	)
 	serverApp.AppContext().AutomationRuntimeService = automationRuntime
-	automationRuntime.Start(ctx)
+	if !cfg.APIShadowMode {
+		automationRuntime.Start(ctx)
+	} else {
+		log.Printf("API shadow mode: automation runtime worker start skipped")
+	}
 	manager.SetUsageEventHandler(worker.NewUsageEventFanout(
 		automationRuntime.UsageEventHandler(),
 		accountHistoryRollupWorker,
@@ -141,12 +236,19 @@ func runServer() {
 		usageHourlyAggregateWorker,
 	))
 
-	collectorWorker.Start(ctx)
+	if !cfg.APIShadowMode {
+		collectorWorker.Start(ctx)
+	} else {
+		log.Printf("API shadow mode: collector worker start skipped")
+	}
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           serverApp.Handler(),
+		ReadTimeout:       2 * time.Minute,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	pprofServer, err := newPprofServer(cfg.PprofAddr)
 	if err != nil {
@@ -166,7 +268,9 @@ func runServer() {
 		log.Fatalf("http listen: %v", err)
 	}
 	codexInspectionWorker := worker.NewCodexInspectionWorker(serverApp.AppContext().Store, serverApp.AppContext().CodexInspectionService)
-	codexInspectionWorker.Start(ctx)
+	if !cfg.APIShadowMode {
+		codexInspectionWorker.Start(ctx)
+	}
 	serverResult := make(chan error, 1)
 	go func() {
 		log.Printf("cpa-manager-plus listening on %s", listener.Addr())
@@ -177,15 +281,21 @@ func runServer() {
 		serverResult <- err
 	}()
 
-	usageCacheAccountingMigrationWorker := worker.NewUsageCacheAccountingMigrationWorker(db, func() {
-		go runUsageResponseMetadataBackfill(ctx, db)
-		accountHistoryRollupWorker.Wake()
-		usagePricingRollupWorker.Wake()
-		if usageHourlyAggregateWorker != nil {
-			usageHourlyAggregateWorker.Wake()
-		}
-	})
-	usageCacheAccountingMigrationWorker.Start(ctx)
+	if !postgresOnly && !cfg.APIShadowMode {
+		usageCacheAccountingMigrationWorker := worker.NewUsageCacheAccountingMigrationWorker(db, func() {
+			go runUsageResponseMetadataBackfill(ctx, db)
+			if accountHistoryRollupWorker != nil {
+				accountHistoryRollupWorker.Wake()
+			}
+			if usagePricingRollupWorker != nil {
+				usagePricingRollupWorker.Wake()
+			}
+			if usageHourlyAggregateWorker != nil {
+				usageHourlyAggregateWorker.Wake()
+			}
+		})
+		usageCacheAccountingMigrationWorker.Start(ctx)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -258,6 +368,8 @@ func newPprofServer(addr string) (*http.Server, error) {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}, nil
 }
 

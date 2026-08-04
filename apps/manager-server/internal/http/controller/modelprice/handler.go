@@ -1,11 +1,13 @@
 package modelprice
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/app"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/middleware"
@@ -17,6 +19,11 @@ type Handler struct {
 	App *app.Context
 }
 
+const (
+	modelPriceReadTimeout = 3 * time.Second
+	modelPriceSyncTimeout = 45 * time.Second
+)
+
 func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	if !middleware.AuthorizePanel(w, r, h.App.AdminAuthService) {
 		return
@@ -25,16 +32,20 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimRight(r.URL.Path, "/")
 	switch {
 	case path == "/v0/management/model-prices/usage-summary" && r.Method == http.MethodGet:
-		summary, err := h.App.ModelPriceService.UsageSummary(r.Context(), h.App.Config.QueryLimit)
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		summary, err := h.App.ModelPriceService.UsageSummary(ctx, h.App.Config.QueryLimit)
 		if err != nil {
-			response.Error(w, http.StatusInternalServerError, err)
+			response.Error(w, modelPriceReadErrorStatus(err), err)
 			return
 		}
 		response.JSON(w, http.StatusOK, summary)
 	case path == "/v0/management/model-prices" && r.Method == http.MethodGet:
-		prices, err := h.App.ModelPriceService.List(r.Context())
+		ctx, cancel := context.WithTimeout(r.Context(), modelPriceReadTimeout)
+		defer cancel()
+		prices, err := h.App.ModelPriceService.List(ctx)
 		if err != nil {
-			response.Error(w, http.StatusInternalServerError, err)
+			response.Error(w, modelPriceReadErrorStatus(err), err)
 			return
 		}
 		response.JSON(w, http.StatusOK, map[string]any{"prices": prices})
@@ -56,7 +67,9 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 			response.Error(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := h.App.ModelPriceService.Sync(r.Context(), req)
+		ctx, cancel := context.WithTimeout(r.Context(), modelPriceSyncTimeout)
+		defer cancel()
+		result, err := h.App.ModelPriceService.Sync(ctx, req)
 		if err != nil {
 			response.Error(w, response.ModelPriceErrorStatus(err), err)
 			return
@@ -65,4 +78,11 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		response.MethodNotAllowed(w)
 	}
+}
+
+func modelPriceReadErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusInternalServerError
 }

@@ -33,6 +33,7 @@ type Repository interface {
 type repository struct {
 	db        *sql.DB
 	protector *security.Protector
+	postgres  bool
 }
 
 func New(db *sql.DB, protector ...*security.Protector) Repository {
@@ -41,6 +42,14 @@ func New(db *sql.DB, protector ...*security.Protector) Repository {
 		p = protector[0]
 	}
 	return &repository{db: db, protector: p}
+}
+
+func NewPostgres(db *sql.DB, protector ...*security.Protector) Repository {
+	var p *security.Protector
+	if len(protector) > 0 {
+		p = protector[0]
+	}
+	return &repository{db: db, protector: p, postgres: true}
 }
 
 func (r *repository) SaveSetup(ctx context.Context, setup model.Setup) error {
@@ -237,6 +246,16 @@ func (r *repository) LoadBootstrapState(ctx context.Context) (model.BootstrapSta
 
 func (r *repository) HasHistoricalData(ctx context.Context) (bool, error) {
 	tables := []string{"usage_events", "dead_letter_events", "model_prices", "api_key_aliases"}
+	if r.postgres {
+		tables = []string{
+			"dead_letter_events",
+			"model_prices",
+			"api_key_aliases",
+			"account_action_candidates",
+			"quota_cooldowns",
+			"codex_inspection_runs",
+		}
+	}
 	for _, table := range tables {
 		var count int64
 		if err := r.db.QueryRowContext(ctx, `select count(*) from `+table).Scan(&count); err != nil {

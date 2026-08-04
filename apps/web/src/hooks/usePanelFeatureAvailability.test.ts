@@ -117,6 +117,22 @@ describe('panel feature availability', () => {
     expect(availability.reason).toBe('monitoring_disabled');
   });
 
+  it('accepts an authenticated Manager cookie session without a management key', () => {
+    const availability = resolvePanelFeatureAvailability({
+      panelHostedByUsageService: true,
+      panelBase: 'http://manager.local:18317',
+      managerServiceBase: 'http://manager.local:18317',
+      managerConfig: buildManagerConfig(),
+      hasManagerCandidate: true,
+      managementKey: '',
+      managerSessionAuthenticated: true,
+    });
+
+    expect(availability.managerServiceAvailable).toBe(true);
+    expect(availability.modelPricesAvailable).toBe(true);
+    expect(availability.serverCodexInspectionAvailable).toBe(true);
+  });
+
   it('keeps Manager-only features unavailable for CPA-hosted panels even with stale Manager config', () => {
     const availability = resolvePanelFeatureAvailability({
       panelHostedByUsageService: false,

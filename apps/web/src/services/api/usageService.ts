@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axiosLibrary from 'axios';
 import type { UsagePayload } from '@/features/monitoring/hooks/useUsageData';
 import {
   getDemoAccountActionCandidates,
@@ -27,6 +27,40 @@ import {
   resolveAuthFileStatusMutationTarget,
 } from '@/utils/authFileStatusMutation';
 import type { ModelPrice } from '@/utils/usage';
+import { clearCsrfToken, getCsrfToken, setCsrfToken } from '@/services/security/csrf';
+
+// Manager endpoints authenticate with an HttpOnly cookie. Keeping a dedicated
+// client prevents cookie mode from leaking into the regular CPA API client.
+const axios = Object.assign(axiosLibrary.create({ withCredentials: true }), {
+  isAxiosError: axiosLibrary.isAxiosError,
+});
+
+axios.interceptors.request.use((config) => {
+  const method = (config.method || 'get').toUpperCase();
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    const token = getCsrfToken();
+    if (token) {
+      config.headers = config.headers || {};
+      config.headers['X-CSRF-Token'] = token;
+    }
+  }
+  return config;
+});
+
+axios.interceptors.response.use(
+  (response) => {
+    const token =
+      response.data && typeof response.data === 'object'
+        ? (response.data as { csrfToken?: unknown }).csrfToken
+        : undefined;
+    if (typeof token === 'string' && token.trim()) setCsrfToken(token);
+    return response;
+  },
+  (error) => {
+    if (axiosLibrary.isAxiosError(error) && error.response?.status === 401) clearCsrfToken();
+    return Promise.reject(error);
+  }
+);
 
 const USAGE_SERVICE_ERROR_CODES = new Set([
   'request_failed',
@@ -101,6 +135,45 @@ export interface UsageServiceStatus {
   collector?: UsageServiceCollectorStatus;
 }
 
+export interface ServerOperationsSnapshot {
+  timestampMs: number;
+  cpu: {
+    usagePercent: number;
+    load1: number;
+    load5: number;
+    load15: number;
+    cores: number;
+  };
+  memory: {
+    totalBytes: number;
+    usedBytes: number;
+    availableBytes: number;
+    usagePercent: number;
+  };
+  disk: {
+    mountPoint: string;
+    totalBytes: number;
+    usedBytes: number;
+    availableBytes: number;
+    usagePercent: number;
+  };
+  network: {
+    receiveBytesPerSecond: number;
+    transmitBytesPerSecond: number;
+  };
+  host: {
+    hostname: string;
+    operatingSystem: string;
+    architecture: string;
+    uptimeSeconds: number;
+  };
+  process: {
+    uptimeSeconds: number;
+    residentMemoryBytes: number;
+    goroutines: number;
+  };
+}
+
 export interface AccountPolicyCapability {
   enabled: boolean;
   configured?: boolean;
@@ -156,6 +229,24 @@ export interface UsageServiceSetupRequest {
   tlsSkipVerify?: boolean;
   ensureUsageStatisticsEnabled?: boolean;
   requestMonitoringEnabled?: boolean;
+}
+
+export interface ManagerSessionUser {
+  id: number;
+  email: string;
+}
+
+export interface ManagerSessionResponse {
+  authenticated: true;
+  user: ManagerSessionUser;
+  expiresAt: number;
+  csrfToken?: string;
+}
+
+export interface ManagerLoginRequest {
+  email: string;
+  password: string;
+  remember?: boolean;
 }
 
 export interface ManagerCPAConnectionConfig {
@@ -1413,7 +1504,39 @@ export interface MonitoringAnalyticsResponse {
   drilldown_preview?: MonitoringAnalyticsEventsResponse;
 }
 
+export interface QuotaWeeklyUsageTarget {
+  target_key: string;
+  auth_file?: string;
+  auth_index?: string;
+  provider?: string;
+  period_start_ms: number;
+  reset_at_ms?: number;
+  period_source: 'quota_week' | 'calendar_week';
+}
+
+export interface QuotaWeeklyUsageRequest {
+  targets: QuotaWeeklyUsageTarget[];
+}
+
+export interface QuotaWeeklyUsageItem {
+  target_key: string;
+  period_start_ms: number;
+  period_end_ms: number;
+  reset_at_ms?: number;
+  period_source: 'quota_week' | 'calendar_week';
+  calls: number;
+  total_tokens: number;
+  estimated_cost_usd: number;
+  last_seen_ms?: number;
+}
+
+export interface QuotaWeeklyUsageResponse {
+  generated_at_ms: number;
+  items: QuotaWeeklyUsageItem[];
+}
+
 const USAGE_SERVICE_TIMEOUT_MS = 30 * 1000;
+const USAGE_SERVICE_PROBE_TIMEOUT_MS = 5 * 1000;
 const USAGE_SERVICE_TRANSFER_TIMEOUT_MS = 60 * 1000;
 const USAGE_IMPORT_CHUNK_TIMEOUT_MS = 5 * 60 * 1000;
 const CODEX_INSPECTION_RUN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -1511,6 +1634,20 @@ const withUsageServiceError = async <T>(operation: () => Promise<T>): Promise<T>
     return await operation();
   } catch (error) {
     throw toUsageServiceApiError(error);
+  }
+};
+
+const withManagerAuthError = async <T>(operation: () => Promise<T>): Promise<T> => {
+  try {
+    return await operation();
+  } catch (error) {
+    const apiError = toUsageServiceApiError(error);
+    // A login 401 represents invalid account credentials, not the removed
+    // Manager Admin Key flow.
+    if (apiError.status === 401 && apiError.code === 'invalid_admin_key') {
+      apiError.code = undefined;
+    }
+    throw apiError;
   }
 };
 
@@ -2105,32 +2242,87 @@ const getDemoModelPriceSyncResponse = (models?: string[]): ModelPriceSyncRespons
 };
 
 export const usageServiceApi = {
-  getInfo: async (base: string): Promise<UsageServiceInfo> => {
+  login: async (
+    base: string,
+    credentials: ManagerLoginRequest
+  ): Promise<ManagerSessionResponse> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return {
+        authenticated: true,
+        user: { id: 1, email: credentials.email },
+        expiresAt: Date.now() + 12 * 60 * 60 * 1000,
+      };
+    }
+
+    return withManagerAuthError(async () => {
+      const response = await axios.post<ManagerSessionResponse>(
+        buildUrl(base, '/usage-service/auth/login'),
+        {
+          email: credentials.email,
+          password: credentials.password,
+          remember: credentials.remember === true,
+        },
+        { timeout: USAGE_SERVICE_TIMEOUT_MS }
+      );
+      setCsrfToken(response.data.csrfToken);
+      return response.data;
+    });
+  },
+
+  getSession: async (base: string): Promise<ManagerSessionResponse> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      return {
+        authenticated: true,
+        user: { id: 1, email: 'demo@example.com' },
+        expiresAt: Date.now() + 12 * 60 * 60 * 1000,
+      };
+    }
+
+    return withManagerAuthError(async () => {
+      const response = await axios.get<ManagerSessionResponse>(
+        buildUrl(base, '/usage-service/auth/session'),
+        { timeout: USAGE_SERVICE_TIMEOUT_MS }
+      );
+      setCsrfToken(response.data.csrfToken);
+      return response.data;
+    });
+  },
+
+  logout: async (base: string): Promise<void> => {
+    if (__DEMO_SITE__ && isDemoMode()) return;
+
+    await withManagerAuthError(async () => {
+      await axios.post(buildUrl(base, '/usage-service/auth/logout'), undefined, {
+        timeout: USAGE_SERVICE_TIMEOUT_MS,
+      });
+      clearCsrfToken();
+    });
+  },
+
+  getInfo: async (
+    base: string,
+    timeout: number = USAGE_SERVICE_PROBE_TIMEOUT_MS
+  ): Promise<UsageServiceInfo> => {
     if (__DEMO_SITE__ && isDemoMode()) {
       return getDemoUsageServiceInfo();
     }
 
     return withUsageServiceError(async () => {
       const response = await axios.get<UsageServiceInfo>(buildUrl(base, '/usage-service/info'), {
-        timeout: USAGE_SERVICE_TIMEOUT_MS,
+        timeout,
       });
       return response.data;
     });
   },
 
-  setup: async (
-    base: string,
-    payload: UsageServiceSetupRequest,
-    adminKey?: string
-  ): Promise<void> => {
+  setup: async (base: string, payload: UsageServiceSetupRequest): Promise<void> => {
     if (__DEMO_SITE__ && isDemoMode()) {
       return;
     }
 
-    await withUsageServiceError(async () => {
+    await withManagerAuthError(async () => {
       await axios.post(buildUrl(base, '/setup'), payload, {
         timeout: USAGE_SERVICE_TIMEOUT_MS,
-        headers: authHeaders(adminKey),
       });
     });
   },
@@ -2331,6 +2523,67 @@ export const usageServiceApi = {
     });
   },
 
+  getOperationsMetrics: async (
+    base: string,
+    signal?: AbortSignal
+  ): Promise<ServerOperationsSnapshot> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      const now = Date.now();
+      const wave = (Math.sin(now / 12_000) + 1) / 2;
+      const cpuUsage = 24 + wave * 28;
+      const memoryUsage = 56 + wave * 5;
+      return {
+        timestampMs: now,
+        cpu: {
+          usagePercent: cpuUsage,
+          load1: 0.82,
+          load5: 0.74,
+          load15: 0.69,
+          cores: 8,
+        },
+        memory: {
+          totalBytes: 16 * 1024 ** 3,
+          usedBytes: (16 * 1024 ** 3 * memoryUsage) / 100,
+          availableBytes: (16 * 1024 ** 3 * (100 - memoryUsage)) / 100,
+          usagePercent: memoryUsage,
+        },
+        disk: {
+          mountPoint: '/',
+          totalBytes: 240 * 1024 ** 3,
+          usedBytes: 98 * 1024 ** 3,
+          availableBytes: 142 * 1024 ** 3,
+          usagePercent: (98 / 240) * 100,
+        },
+        network: {
+          receiveBytesPerSecond: 640_000 + wave * 1_200_000,
+          transmitBytesPerSecond: 180_000 + wave * 420_000,
+        },
+        host: {
+          hostname: 'demo-server',
+          operatingSystem: 'Ubuntu 24.04 LTS',
+          architecture: 'amd64',
+          uptimeSeconds: 18 * 24 * 60 * 60,
+        },
+        process: {
+          uptimeSeconds: 3 * 24 * 60 * 60,
+          residentMemoryBytes: 92 * 1024 ** 2,
+          goroutines: 42,
+        },
+      };
+    }
+
+    return withUsageServiceError(async () => {
+      const response = await axios.get<ServerOperationsSnapshot>(
+        buildUrl(base, '/api/v1/operations/metrics'),
+        {
+          timeout: 8_000,
+          signal,
+        }
+      );
+      return response.data;
+    });
+  },
+
   getAccountProcessingPolicy: async (
     base: string,
     managementKey?: string
@@ -2414,7 +2667,7 @@ export const usageServiceApi = {
 
     return withUsageServiceError(async () => {
       const response = await axios.get<ModelPricesResponse>(
-        buildUrl(base, '/v0/management/model-prices'),
+        buildUrl(base, '/api/v1/model-prices'),
         {
           timeout: USAGE_SERVICE_TIMEOUT_MS,
           headers: authHeaders(managementKey),
@@ -2435,7 +2688,7 @@ export const usageServiceApi = {
 
     return withUsageServiceError(async () => {
       const response = await axios.get<ModelPriceUsageSummaryResponse>(
-        buildUrl(base, '/v0/management/model-prices/usage-summary'),
+        buildUrl(base, '/api/v1/model-prices/usage-summary'),
         {
           timeout: USAGE_SERVICE_TIMEOUT_MS,
           headers: authHeaders(managementKey),
@@ -2457,7 +2710,7 @@ export const usageServiceApi = {
 
     return withUsageServiceError(async () => {
       const response = await axios.put<ModelPricesResponse>(
-        buildUrl(base, '/v0/management/model-prices'),
+        buildUrl(base, '/api/v1/model-prices'),
         { prices },
         {
           timeout: USAGE_SERVICE_TIMEOUT_MS,
@@ -2676,7 +2929,7 @@ export const usageServiceApi = {
 
     return withUsageServiceError(async () => {
       const response = await axios.post<ModelPriceSyncResponse>(
-        buildUrl(base, '/v0/management/model-prices/sync'),
+        buildUrl(base, '/api/v1/model-prices/sync'),
         models ? { models } : {},
         {
           timeout: 45 * 1000,
@@ -2933,6 +3186,42 @@ export const monitoringAnalyticsApi = {
     return withUsageServiceError(async () => {
       const response = await axios.post<MonitoringAnalyticsResponse>(
         buildUrl(base, '/v0/management/monitoring/analytics'),
+        request,
+        {
+          timeout: USAGE_SERVICE_TIMEOUT_MS,
+          headers: authHeaders(managementKey),
+          signal,
+        }
+      );
+      return response.data;
+    });
+  },
+  getQuotaWeeklyUsage: async (
+    base: string,
+    managementKey: string | undefined,
+    request: QuotaWeeklyUsageRequest,
+    signal?: AbortSignal
+  ): Promise<QuotaWeeklyUsageResponse> => {
+    if (__DEMO_SITE__ && isDemoMode()) {
+      const generatedAtMs = Date.now();
+      return {
+        generated_at_ms: generatedAtMs,
+        items: request.targets.map((target) => ({
+          target_key: target.target_key,
+          period_start_ms: target.period_start_ms,
+          period_end_ms: generatedAtMs,
+          reset_at_ms: target.reset_at_ms,
+          period_source: target.period_source,
+          calls: 0,
+          total_tokens: 0,
+          estimated_cost_usd: 0,
+        })),
+      };
+    }
+
+    return withUsageServiceError(async () => {
+      const response = await axios.post<QuotaWeeklyUsageResponse>(
+        buildUrl(base, '/v0/management/monitoring/quota-weekly-usage'),
         request,
         {
           timeout: USAGE_SERVICE_TIMEOUT_MS,

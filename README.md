@@ -162,6 +162,59 @@ docker run -d \
 
 Recommended CPA version: `v7.1.39+`. The HTTP usage queue needs `v6.10.8+`.
 
+### Durable full stack (CPA + Plus + Redis + PostgreSQL)
+
+To recreate the complete four-service architecture from a fresh clone, run:
+
+```bash
+git clone https://github.com/Jayin9705/CPA-Manager-Plus.git
+cd CPA-Manager-Plus
+./bin/bootstrap-stack.sh
+```
+
+The bootstrap writes generated credentials only to a Git-ignored local runtime
+directory and never prints them. See the
+[full-stack deployment guide](deploy/stack/README_CN.md) for topology, public
+origins, backups, and live cutover precautions.
+
+### Fully separated console (parallel validation)
+
+The repository now includes a pure Go API image and an independently deployable
+static console. They use different host ports and can be validated alongside the
+existing `cpa-manager-plus.service`; the current Manager, Redis, PostgreSQL, and
+their data are not stopped or replaced:
+
+```bash
+npm run build:separated
+docker compose -f docker-compose.separated.yml --profile separated --profile separated-api build
+```
+
+Copy and edit `deploy/separated/api.env.example` first. Point Redis, PostgreSQL,
+CPA, and `CPAMP_CONSOLE_ORIGINS` at private addresses. The console's
+`runtime-config.json` contains only the public API origin—never credentials. The
+parallel defaults are `http://localhost:18080` (console) and
+`http://localhost:18318` (API); override the ports with environment variables.
+The API `/readyz` endpoint checks the authentication dependency in PostgreSQL
+mode; do not cut over while it is unhealthy. When reusing an existing
+PostgreSQL data plane, provide the original Manager data key instead of allowing
+the new instance to generate a different key.
+
+While the existing Manager is running, start only the static console (with
+`runtime-config.json` pointing at an already configured API). Do not start
+`cpamp-api` against the same live Redis Stream/CPA: it includes collector/persist
+workers and must be activated during the planned cutover or pointed at an
+isolated test data plane:
+
+```bash
+docker compose -f docker-compose.separated.yml --profile separated up -d cpamp-console
+# cutover/test data plane only:
+docker compose -f docker-compose.separated.yml --profile separated-api up -d cpamp-api
+```
+
+`Dockerfile.manager-server-api` builds a Go-only backend without Node or frontend
+assets. The existing `Dockerfile.manager-server`, `/management.html`, and embedded
+panel remain available as the rollback path.
+
 ## Documentation
 
 | Task                                                      | Guide                                                                                                                                                                                                |
@@ -174,6 +227,7 @@ Recommended CPA version: `v7.1.39+`. The HTTP usage queue needs `v6.10.8+`.
 | Configure providers, credentials, quota, and plugins      | [Panel Manual](https://seakee.github.io/CPA-Manager-Plus/docs/en/manual/ai-providers.html)                                                                                                           |
 | Operate Manager Server, backups, upgrades, and migrations | [Manager Server Guide](https://seakee.github.io/CPA-Manager-Plus/docs/en/operations/manager-server.html)                                                                                             |
 | Back up data or recover a lost admin key                  | [Backup And Restore](https://seakee.github.io/CPA-Manager-Plus/docs/en/operations/backup.html), [Reset Admin Key](https://seakee.github.io/CPA-Manager-Plus/docs/en/operations/reset-admin-key.html) |
+| Separated architecture and UI redesign                    | [Design](docs/frontend-backend-separation-ui-redesign.zh-CN.md), [UI Design System](design-system/cpa-manager-plus/MASTER.md)                                                                        |
 | Migrate from the legacy CPA-Manager                       | [Migration From CPA-Manager](https://seakee.github.io/CPA-Manager-Plus/docs/en/migration/from-cpa-manager.html)                                                                                      |
 | Diagnose empty monitoring or queue problems               | [Troubleshooting](https://seakee.github.io/CPA-Manager-Plus/docs/en/troubleshooting/request-monitoring.html)                                                                                         |
 
@@ -216,7 +270,8 @@ docker compose -f docker-compose.manager.yml up --build
 
 ## Release
 
-- `npm run build` creates a single-file `apps/web/dist/index.html`.
+- `npm run build` creates the split management panel in `apps/web/dist/index.html` and `apps/web/dist/assets/`.
+- `npm run build:bundle` creates the legacy single-file panel in `apps/web/dist-bundle/index.html`.
 - `bin/release/package-native.sh` embeds the panel into native packages.
 - Create release notes through `release/<version> -> dev -> main`, then push a
   strict `vX.Y.Z` or prerelease tag from the verified `main` promotion merge.

@@ -807,11 +807,6 @@ export function ServerCodexInspectionPage() {
     if (featureAvailability.checking) {
       return;
     }
-    if (!managementKey) {
-      setLoading(false);
-      setError(t('monitoring.server_codex_inspection_connection_required'));
-      return;
-    }
     if (!featureAvailability.serverCodexInspectionAvailable) {
       setLoading(false);
       setError(t('monitoring.server_codex_inspection_service_unavailable'));

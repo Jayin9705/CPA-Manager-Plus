@@ -6,10 +6,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
 import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability';
-import { useAuthStore } from '@/stores';
+import { useAuthStore, useQuotaStore } from '@/stores';
 import { authFilesApi, configFileApi } from '@/services/api';
 import {
   monitoringAnalyticsApi,
+  type QuotaWeeklyUsageTarget,
   type UsageHeaderSnapshot,
 } from '@/services/api/usageService';
 import { buildUsageHeaderSnapshotLookup } from '@/utils/usageHeaderSnapshots';
@@ -22,7 +23,7 @@ import {
   CLAUDE_CONFIG,
   CODEX_CONFIG,
   KIMI_CONFIG,
-  XAI_CONFIG
+  XAI_CONFIG,
 } from '@/components/quota';
 import { CodexReauthDialog } from '@/features/oauth/CodexReauthDialog';
 import {
@@ -30,6 +31,7 @@ import {
   type CodexReauthTarget,
 } from '@/features/oauth/codexReauthModel';
 import type { QuotaSortMode } from '@/components/quota/quotaConfigs';
+import { getScopedQuotaState } from '@/components/quota/quotaConfigs';
 import type { AuthFileItem } from '@/types';
 import {
   DEFAULT_QUOTA_ACCOUNT_DISPLAY_MODE,
@@ -39,6 +41,8 @@ import {
   type QuotaSectionViewMode,
   type QuotaAccountDisplayMode,
 } from './quotaPageUiState';
+import { buildQuotaWeeklyUsageTarget } from './quotaWeeklyUsage';
+import { useQuotaWeeklyUsage } from './useQuotaWeeklyUsage';
 import styles from './QuotaPage.module.scss';
 
 export function QuotaPage() {
@@ -47,6 +51,11 @@ export function QuotaPage() {
   const managementKey = useAuthStore((state) => state.managementKey);
   const featureAvailability = usePanelFeatureAvailability();
   const managerServiceBase = featureAvailability.managerServiceBase;
+  const codexQuota = useQuotaStore((state) => state.codexQuota);
+  const claudeQuota = useQuotaStore((state) => state.claudeQuota);
+  const antigravityQuota = useQuotaStore((state) => state.antigravityQuota);
+  const kimiQuota = useQuotaStore((state) => state.kimiQuota);
+  const xaiQuota = useQuotaStore((state) => state.xaiQuota);
   const initialUiState = useRef(readQuotaPageUiState());
 
   const [files, setFiles] = useState<AuthFileItem[]>([]);
@@ -62,6 +71,7 @@ export function QuotaPage() {
   const [accountDisplayModes, setAccountDisplayModes] = useState(() => ({
     ...initialUiState.current.accountDisplayModes,
   }));
+  const [quotaPeriodClock, setQuotaPeriodClock] = useState(() => Date.now());
 
   const disableControls = connectionStatus !== 'connected';
   const sortOptions = useMemo(
@@ -69,7 +79,7 @@ export function QuotaPage() {
       { value: 'default', label: t('quota_management.sort_default') },
       { value: 'name-asc', label: t('quota_management.sort_name_asc') },
       { value: 'plan-desc', label: t('quota_management.sort_plan_desc') },
-      { value: 'plan-asc', label: t('quota_management.sort_plan_asc') }
+      { value: 'plan-asc', label: t('quota_management.sort_plan_asc') },
     ],
     [t]
   );
@@ -103,19 +113,92 @@ export function QuotaPage() {
       return;
     }
     try {
-      const response = await monitoringAnalyticsApi.getHeaderSnapshots(managerServiceBase, managementKey, {
-        days: 30,
-        limit: 1000,
-      });
+      const response = await monitoringAnalyticsApi.getHeaderSnapshots(
+        managerServiceBase,
+        managementKey,
+        {
+          days: 30,
+          limit: 1000,
+        }
+      );
       setHeaderSnapshots(response.items ?? []);
     } catch {
       setHeaderSnapshots((current) => current);
     }
   }, [managementKey, managerServiceBase]);
 
+  const weeklyUsageTargets = useMemo(() => {
+    const targets: QuotaWeeklyUsageTarget[] = [];
+    files.filter(CODEX_CONFIG.filterFn).forEach((file) => {
+      targets.push(
+        buildQuotaWeeklyUsageTarget(
+          CODEX_CONFIG.type,
+          file,
+          getScopedQuotaState(CODEX_CONFIG, codexQuota, file),
+          quotaPeriodClock
+        )
+      );
+    });
+    files.filter(CLAUDE_CONFIG.filterFn).forEach((file) => {
+      targets.push(
+        buildQuotaWeeklyUsageTarget(
+          CLAUDE_CONFIG.type,
+          file,
+          claudeQuota[file.name],
+          quotaPeriodClock
+        )
+      );
+    });
+    files.filter(ANTIGRAVITY_CONFIG.filterFn).forEach((file) => {
+      targets.push(
+        buildQuotaWeeklyUsageTarget(
+          ANTIGRAVITY_CONFIG.type,
+          file,
+          antigravityQuota[file.name],
+          quotaPeriodClock
+        )
+      );
+    });
+    files.filter(KIMI_CONFIG.filterFn).forEach((file) => {
+      targets.push(
+        buildQuotaWeeklyUsageTarget(KIMI_CONFIG.type, file, kimiQuota[file.name], quotaPeriodClock)
+      );
+    });
+    files.filter(XAI_CONFIG.filterFn).forEach((file) => {
+      targets.push(
+        buildQuotaWeeklyUsageTarget(XAI_CONFIG.type, file, xaiQuota[file.name], quotaPeriodClock)
+      );
+    });
+    return targets;
+  }, [antigravityQuota, claudeQuota, codexQuota, files, kimiQuota, quotaPeriodClock, xaiQuota]);
+
+  const {
+    itemsByKey: weeklyUsageByKey,
+    loading: weeklyUsageLoading,
+    error: weeklyUsageError,
+    refresh: refreshWeeklyUsage,
+  } = useQuotaWeeklyUsage({
+    serviceBase: managerServiceBase,
+    managementKey,
+    targets: weeklyUsageTargets,
+  });
+
+  useEffect(() => {
+    const nowMs = Date.now();
+    const nextResetAtMs = weeklyUsageTargets.reduce<number | null>((nearest, target) => {
+      const resetAtMs = target.reset_at_ms;
+      if (!resetAtMs || resetAtMs <= nowMs) return nearest;
+      return nearest === null || resetAtMs < nearest ? resetAtMs : nearest;
+    }, null);
+    if (nextResetAtMs === null) return;
+    const delay = Math.min(Math.max(nextResetAtMs - nowMs + 250, 250), 2_147_000_000);
+    const timer = window.setTimeout(() => setQuotaPeriodClock(Date.now()), delay);
+    return () => window.clearTimeout(timer);
+  }, [weeklyUsageTargets]);
+
   const handleHeaderRefresh = useCallback(async () => {
-    await Promise.all([loadConfig(), loadFiles(), loadHeaderSnapshots()]);
-  }, [loadConfig, loadFiles, loadHeaderSnapshots]);
+    await Promise.all([loadConfig(), loadFiles(), loadHeaderSnapshots(), refreshWeeklyUsage()]);
+  }, [loadConfig, loadFiles, loadHeaderSnapshots, refreshWeeklyUsage]);
 
   useHeaderRefresh(handleHeaderRefresh);
 
@@ -177,7 +260,16 @@ export function QuotaPage() {
 
   return (
     <div className={styles.container}>
-      {error && <div className={styles.errorBox}>{error}</div>}
+      {error && (
+        <div className={styles.errorBox} role="alert">
+          {error}
+        </div>
+      )}
+      {weeklyUsageError && (
+        <div className={styles.errorBox} role="alert">
+          {t('quota_management.weekly_usage_load_failed', { message: weeklyUsageError })}
+        </div>
+      )}
 
       <div className={styles.toolbar}>
         <div className={styles.toolbarField}>
@@ -218,6 +310,9 @@ export function QuotaPage() {
         accountDisplayMode={getAccountDisplayMode(CODEX_CONFIG.type)}
         onAccountDisplayModeChange={(mode) => setAccountDisplayMode(CODEX_CONFIG.type, mode)}
         headerSnapshotLookup={headerSnapshotLookup}
+        weeklyUsageByKey={weeklyUsageByKey}
+        weeklyUsageLoading={weeklyUsageLoading}
+        weeklyUsageError={weeklyUsageError}
       />
       <QuotaSection
         config={CLAUDE_CONFIG}
@@ -230,6 +325,9 @@ export function QuotaPage() {
         onViewModeChange={(viewMode) => setSectionViewMode(CLAUDE_CONFIG.type, viewMode)}
         accountDisplayMode={getAccountDisplayMode(CLAUDE_CONFIG.type)}
         onAccountDisplayModeChange={(mode) => setAccountDisplayMode(CLAUDE_CONFIG.type, mode)}
+        weeklyUsageByKey={weeklyUsageByKey}
+        weeklyUsageLoading={weeklyUsageLoading}
+        weeklyUsageError={weeklyUsageError}
       />
       <QuotaSection
         config={ANTIGRAVITY_CONFIG}
@@ -241,9 +339,10 @@ export function QuotaPage() {
         viewMode={getSectionViewMode(ANTIGRAVITY_CONFIG.type)}
         onViewModeChange={(viewMode) => setSectionViewMode(ANTIGRAVITY_CONFIG.type, viewMode)}
         accountDisplayMode={getAccountDisplayMode(ANTIGRAVITY_CONFIG.type)}
-        onAccountDisplayModeChange={(mode) =>
-          setAccountDisplayMode(ANTIGRAVITY_CONFIG.type, mode)
-        }
+        onAccountDisplayModeChange={(mode) => setAccountDisplayMode(ANTIGRAVITY_CONFIG.type, mode)}
+        weeklyUsageByKey={weeklyUsageByKey}
+        weeklyUsageLoading={weeklyUsageLoading}
+        weeklyUsageError={weeklyUsageError}
       />
       <QuotaSection
         config={KIMI_CONFIG}
@@ -256,6 +355,9 @@ export function QuotaPage() {
         onViewModeChange={(viewMode) => setSectionViewMode(KIMI_CONFIG.type, viewMode)}
         accountDisplayMode={getAccountDisplayMode(KIMI_CONFIG.type)}
         onAccountDisplayModeChange={(mode) => setAccountDisplayMode(KIMI_CONFIG.type, mode)}
+        weeklyUsageByKey={weeklyUsageByKey}
+        weeklyUsageLoading={weeklyUsageLoading}
+        weeklyUsageError={weeklyUsageError}
       />
       <QuotaSection
         config={XAI_CONFIG}
@@ -268,6 +370,9 @@ export function QuotaPage() {
         onViewModeChange={(viewMode) => setSectionViewMode(XAI_CONFIG.type, viewMode)}
         accountDisplayMode={getAccountDisplayMode(XAI_CONFIG.type)}
         onAccountDisplayModeChange={(mode) => setAccountDisplayMode(XAI_CONFIG.type, mode)}
+        weeklyUsageByKey={weeklyUsageByKey}
+        weeklyUsageLoading={weeklyUsageLoading}
+        weeklyUsageError={weeklyUsageError}
       />
 
       <CodexReauthDialog

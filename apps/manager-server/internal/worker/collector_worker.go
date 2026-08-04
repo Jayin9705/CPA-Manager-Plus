@@ -27,14 +27,20 @@ func NewCollectorWorker(cfg config.Config, store *store.Store, collectorService 
 func (w *CollectorWorker) Start(ctx context.Context) {
 	if w.cfg.CPAUpstreamURL != "" && w.cfg.ManagementKey != "" {
 		_ = w.collectorService.StartRuntime(ctx, collectorpkg.RuntimeConfig{
-			CPAUpstreamURL: w.cfg.CPAUpstreamURL,
-			ManagementKey:  w.cfg.ManagementKey,
-			CollectorMode:  w.cfg.CollectorMode,
-			Queue:          w.cfg.Queue,
-			PopSide:        w.cfg.PopSide,
-			BatchSize:      w.cfg.BatchSize,
-			PollInterval:   w.cfg.PollInterval,
-			TLSSkipVerify:  w.cfg.TLSSkipVerify,
+			CPAUpstreamURL:     w.cfg.CPAUpstreamURL,
+			ManagementKey:      w.cfg.ManagementKey,
+			CollectorMode:      w.cfg.CollectorMode,
+			Queue:              w.cfg.Queue,
+			PopSide:            w.cfg.PopSide,
+			BatchSize:          w.cfg.BatchSize,
+			PollInterval:       w.cfg.PollInterval,
+			TLSSkipVerify:      w.cfg.TLSSkipVerify,
+			UsageSink:          w.cfg.UsageSink,
+			UsageRedisAddr:     w.cfg.UsageRedisAddr,
+			UsageRedisPassword: w.cfg.UsageRedisPassword,
+			UsageRedisDB:       w.cfg.UsageRedisDB,
+			UsageRedisStream:   w.cfg.UsageRedisStream,
+			UsageRedisGroup:    w.cfg.UsageRedisGroup,
 		})
 		return
 	}
@@ -52,14 +58,20 @@ func (w *CollectorWorker) Start(ctx context.Context) {
 
 	if setup, ok, err := w.store.LoadSetup(ctx); err == nil && ok {
 		_ = w.collectorService.StartRuntime(ctx, collectorpkg.RuntimeConfig{
-			CPAUpstreamURL: setup.CPAUpstreamURL,
-			ManagementKey:  setup.ManagementKey,
-			CollectorMode:  w.cfg.CollectorMode,
-			Queue:          setup.Queue,
-			PopSide:        setup.PopSide,
-			BatchSize:      w.cfg.BatchSize,
-			PollInterval:   w.cfg.PollInterval,
-			TLSSkipVerify:  w.cfg.TLSSkipVerify,
+			CPAUpstreamURL:     setup.CPAUpstreamURL,
+			ManagementKey:      setup.ManagementKey,
+			CollectorMode:      w.cfg.CollectorMode,
+			Queue:              setup.Queue,
+			PopSide:            setup.PopSide,
+			BatchSize:          w.cfg.BatchSize,
+			PollInterval:       w.cfg.PollInterval,
+			TLSSkipVerify:      w.cfg.TLSSkipVerify,
+			UsageSink:          w.cfg.UsageSink,
+			UsageRedisAddr:     w.cfg.UsageRedisAddr,
+			UsageRedisPassword: w.cfg.UsageRedisPassword,
+			UsageRedisDB:       w.cfg.UsageRedisDB,
+			UsageRedisStream:   w.cfg.UsageRedisStream,
+			UsageRedisGroup:    w.cfg.UsageRedisGroup,
 		})
 	} else if err != nil {
 		log.Printf("load setup: %v", err)

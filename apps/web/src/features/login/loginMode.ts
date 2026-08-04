@@ -1,4 +1,4 @@
-import { isUsageServiceId, type UsageServiceInfo } from '@/services/api/usageService';
+import { isUsageServiceId, type UsageServiceInfo } from './loginApi';
 
 export const resolveUsageServiceLoginMode = (info?: UsageServiceInfo | null) => {
   const hostedByUsageService = isUsageServiceId(info?.service);

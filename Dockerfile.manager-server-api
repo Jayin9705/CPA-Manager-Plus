@@ -1,0 +1,25 @@
+# Pure Go API/worker image for the separated console. This file deliberately
+# has no Node stage and never copies apps/web or any management panel assets.
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+WORKDIR /src
+COPY apps/manager-server ./apps/manager-server
+WORKDIR /src/apps/manager-server
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags api_only -trimpath \
+  -ldflags="-s -w -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.Version=${VERSION} -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.Commit=${COMMIT} -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.BuildDate=${BUILD_DATE}" \
+  -o /out/cpa-manager-plus ./cmd/cpa-manager-plus
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+  -ldflags="-s -w" -o /out/cpamp-migration ./cmd/cpamp-migration
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates wget tzdata \
+  && mkdir -p /host/proc/net /host/etc
+COPY --from=build /out/cpa-manager-plus /usr/local/bin/cpa-manager-plus
+COPY --from=build /out/cpamp-migration /usr/local/bin/cpamp-migration
+EXPOSE 18317
+ENTRYPOINT ["/usr/local/bin/cpa-manager-plus"]

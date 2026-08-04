@@ -152,6 +152,27 @@ describe('useMonitoringAnalytics', () => {
     expect(getAnalyticsMock).toHaveBeenCalledTimes(2);
   });
 
+  it('shares an exact in-flight request across hook instances', async () => {
+    const requests = installDeferredAnalyticsMock();
+
+    await act(async () => {
+      renderer = create(
+        <>
+          <Harness dataScopeKey="shared" nowMs={10_000} />
+          <Harness dataScopeKey="shared" nowMs={10_000} />
+        </>
+      );
+      await flushPromises();
+    });
+
+    expect(getAnalyticsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      requests[0]?.resolve(createResponse(1));
+      await flushPromises();
+    });
+  });
+
   it('starts a new request when the analytics scope changes', async () => {
     installDeferredAnalyticsMock();
 

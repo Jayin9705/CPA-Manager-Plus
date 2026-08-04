@@ -1,5 +1,11 @@
 @use '@/styles/variables' as v;
 
+/* The legacy page is kept structurally identical. The wrapper only becomes a
+   layout surface in the separated console build. */
+.page {
+  display: contents;
+}
+
 .header {
   display: flex;
   justify-content: space-between;
@@ -392,5 +398,351 @@
 
   .bottomSummaryRow .configCard .configGrid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ------------------------------------------------------------------------- *
+ * Separated console dashboard
+ * ------------------------------------------------------------------------- */
+
+:global(html[data-console='separated-v2']) {
+  .page {
+    --dashboard-panel: var(--sc-surface);
+    --dashboard-panel-subtle: var(--sc-surface-subtle);
+    --dashboard-border: var(--sc-border);
+    --dashboard-copy: var(--sc-copy);
+    --dashboard-copy-secondary: var(--sc-copy-secondary);
+    --dashboard-copy-muted: var(--sc-copy-muted);
+
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+  }
+
+  .header {
+    min-height: 68px;
+    padding: 12px 16px;
+    border: 1px solid var(--dashboard-border);
+    border-left: 3px solid var(--sc-brand);
+    border-radius: 8px;
+    background: var(--dashboard-panel);
+    box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
+    backdrop-filter: none;
+  }
+
+  .header .headerLeft,
+  .header .headerRight {
+    gap: 20px;
+  }
+
+  .connectionStatus .statusDot {
+    width: 8px;
+    height: 8px;
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 14%, transparent);
+  }
+
+  .connectionStatus .statusInfo .statusLabel,
+  .apiBaseBlock .apiLabel {
+    color: var(--dashboard-copy-muted);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .connectionStatus .statusInfo .statusValue {
+    color: var(--sc-success);
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .apiBaseBlock .apiValue {
+    color: var(--sc-brand);
+    font-family: v.$font-mono;
+    font-size: 12px;
+  }
+
+  .timeDisplay .time {
+    color: var(--dashboard-copy);
+    font-family: v.$font-mono;
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .timeDisplay .date {
+    color: var(--dashboard-copy-muted);
+    font-size: 11px;
+  }
+
+  .headerActions .actionBtn {
+    min-height: 34px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 6px;
+    background: var(--dashboard-panel-subtle);
+    color: var(--dashboard-copy-secondary);
+    box-shadow: none;
+    transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+  }
+
+  .headerActions .actionBtn:hover {
+    border-color: var(--sc-brand);
+    background: var(--sc-brand-soft);
+    color: var(--sc-brand-hover);
+    transform: none;
+  }
+
+  .overviewRow,
+  .metricsRow,
+  .chartsRow,
+  .dataRow,
+  .bottomSummaryRow {
+    min-width: 0;
+  }
+
+  .overviewRow {
+    margin: 0;
+  }
+
+  .overviewRow :global(.dashboard-version-card) {
+    grid-template-columns: minmax(0, 1.45fr) minmax(360px, 1fr);
+    gap: 16px;
+  }
+
+  .overviewRow :global(.dashboard-version-card) > section,
+  .chartsRow :global(.dashboard-charts-grid) > section,
+  .dataRow :global(.dashboard-data-card),
+  .dataRow :global(.dashboard-rank-card) {
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    background: var(--dashboard-panel);
+    box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
+    backdrop-filter: none;
+  }
+
+  .overviewRow :global(.dashboard-version-card) > section {
+    padding: 16px;
+  }
+
+  .overviewRow :global(.dashboard-version-card) > section > h2,
+  .sectionTitle {
+    margin-bottom: 12px;
+    color: var(--dashboard-copy);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .sectionTitle {
+    display: flex;
+    align-items: center;
+    margin: 0 0 10px;
+  }
+
+  .sectionTitle::before {
+    width: 3px;
+    height: 14px;
+    border-radius: 0;
+    background: var(--sc-brand);
+  }
+
+  .metricsRow {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .metricsRow :global(.dashboard-metrics-grid) {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .metricsRow :global(.dashboard-metrics-grid) > div {
+    min-height: 132px;
+    padding: 14px;
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    background: var(--dashboard-panel);
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
+  .metricsRow :global(.dashboard-metrics-grid) > div:hover {
+    border-color: var(--dashboard-border);
+    box-shadow: none;
+    transform: none;
+  }
+
+  .metricsRow :global(.dashboard-metrics-grid) > div :global(.dashboard-metric-value) {
+    color: var(--dashboard-copy);
+    font-family: v.$font-mono;
+    font-size: 22px;
+  }
+
+  .metricsRow :global(.dashboard-metrics-grid) > div :global(.dashboard-metric-label),
+  .metricsRow :global(.dashboard-metrics-grid) > div :global(.dashboard-metric-subvalue) {
+    color: var(--dashboard-copy-muted);
+  }
+
+  .chartsRow :global(.dashboard-charts-grid) {
+    grid-template-columns: minmax(0, 1.4fr) minmax(300px, 1fr) minmax(240px, 0.8fr);
+    gap: 12px;
+  }
+
+  .chartsRow :global(.dashboard-charts-grid) > section {
+    min-height: 290px;
+    padding: 16px;
+  }
+
+  .chartsRow :global(.dashboard-charts-grid) > section h3,
+  .dataRow :global(.dashboard-data-card) h3,
+  .dataRow :global(.dashboard-rank-card) h3 {
+    color: var(--dashboard-copy);
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .dataRow {
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .dataRow :global(.dashboard-data-card),
+  .dataRow :global(.dashboard-rank-card) {
+    min-height: 230px;
+    padding: 16px;
+  }
+
+  .bottomSummaryRow {
+    grid-template-columns: minmax(0, 1.7fr) minmax(320px, 0.9fr);
+    gap: 12px;
+  }
+
+  .bottomSummaryRow .quickStatsPanel,
+  .bottomSummaryRow .configCard {
+    border: 1px solid var(--dashboard-border);
+    border-radius: 8px;
+    background: var(--dashboard-panel);
+    box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
+    backdrop-filter: none;
+  }
+
+  .bottomSummaryRow .bentoCard {
+    min-height: 152px;
+    padding: 16px;
+    border-right-color: var(--dashboard-border);
+  }
+
+  .bottomSummaryRow .bentoCard:hover {
+    background: var(--dashboard-panel-subtle);
+    transform: none;
+  }
+
+  .bottomSummaryRow .bentoValue {
+    color: var(--dashboard-copy);
+    font-family: v.$font-mono;
+    font-size: 26px;
+  }
+
+  .bottomSummaryRow .bentoLabel,
+  .bottomSummaryRow .bentoSublabel,
+  .bottomSummaryRow .configLabel {
+    color: var(--dashboard-copy-muted);
+  }
+
+  .bottomSummaryRow .configCard {
+    padding: 16px;
+  }
+
+  .bottomSummaryRow .configHeader h3 {
+    color: var(--dashboard-copy);
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .bottomSummaryRow .configValue,
+  .bottomSummaryRow .configValueMono {
+    color: var(--dashboard-copy);
+    font-family: v.$font-mono;
+  }
+
+  @media (max-width: 1360px) {
+    .metricsRow :global(.dashboard-metrics-grid) {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .chartsRow :global(.dashboard-charts-grid) {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .chartsRow :global(.dashboard-charts-grid) > section:first-child {
+      grid-column: 1 / -1;
+    }
+
+    .dataRow {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 768px) {
+    .header {
+      align-items: stretch;
+      gap: 12px;
+      padding: 12px;
+    }
+
+    .overviewRow :global(.dashboard-version-card) {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .header .headerLeft,
+    .header .headerRight {
+      gap: 10px;
+    }
+
+    .metricsRow :global(.dashboard-metrics-grid),
+    .chartsRow :global(.dashboard-charts-grid),
+    .dataRow,
+    .bottomSummaryRow {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .chartsRow :global(.dashboard-charts-grid) > section:first-child {
+      grid-column: auto;
+    }
+
+    .chartsRow :global(.dashboard-charts-grid) > section,
+    .dataRow :global(.dashboard-data-card),
+    .dataRow :global(.dashboard-rank-card) {
+      min-height: 220px;
+    }
+
+    .bottomSummaryRow .quickStatsPanel,
+    .bottomSummaryRow .configCard {
+      grid-column: 1 / -1;
+    }
+  }
+
+  @media (max-width: 520px) {
+    .metricsRow :global(.dashboard-metrics-grid) {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .chartsRow :global(.dashboard-charts-grid),
+    .dataRow,
+    .bottomSummaryRow {
+      grid-template-columns: 1fr;
+    }
+
+    .header .headerLeft,
+    .header .headerRight {
+      flex-wrap: wrap;
+    }
+
+    .timeDisplay {
+      align-items: flex-start;
+      width: 100%;
+    }
   }
 }

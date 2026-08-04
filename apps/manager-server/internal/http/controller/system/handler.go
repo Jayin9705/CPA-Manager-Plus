@@ -57,12 +57,12 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, http.StatusInternalServerError, err)
 		return
 	}
-	response.JSON(w, http.StatusOK, map[string]any{
-		"service":     h.App.ServiceID,
-		"dbPath":      h.App.Config.DBPath,
-		"events":      events,
-		"deadLetters": deadLetters,
-		"collector":   status,
+	payload := map[string]any{
+		"service":            h.App.ServiceID,
+		"persistenceBackend": h.App.Config.PersistenceBackend,
+		"events":             events,
+		"deadLetters":        deadLetters,
+		"collector":          status,
 		"dataMigration": dataMigrationStatus{
 			Name:          migration.Name,
 			Status:        migration.Status,
@@ -74,5 +74,9 @@ func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
 			UpdatedAtMS:   migration.UpdatedAtMS,
 			FinishedAtMS:  migration.FinishedAtMS,
 		},
-	})
+	}
+	if h.App.Config.PersistenceBackend != "postgres" {
+		payload["dbPath"] = h.App.Config.DBPath
+	}
+	response.JSON(w, http.StatusOK, payload)
 }

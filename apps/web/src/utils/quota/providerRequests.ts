@@ -89,6 +89,7 @@ export type ClaudeQuotaData = {
   windows: ClaudeQuotaWindow[];
   extraUsage?: ClaudeExtraUsage | null;
   planType?: string | null;
+  weeklyResetAtMs?: number | null;
 };
 
 export type AntigravityQuotaData = {
@@ -291,6 +292,7 @@ export const buildCodexQuotaWindows = (
     usedPercent: window.usedPercent,
     resetLabel: window.resetLabel,
     limitWindowSeconds: window.limitWindowSeconds,
+    resetAtMs: window.resetAtMs,
   }));
 
 const resolveCodexRateLimitResetCreditsAvailableCount = (
@@ -501,7 +503,9 @@ const resolveClaudeBaseLimitWindowId = (
   return null;
 };
 
-type ClaudeLimitWindowValues = Pick<ClaudeQuotaWindow, 'usedPercent' | 'resetLabel'>;
+type ClaudeLimitWindowValues = Pick<ClaudeQuotaWindow, 'usedPercent' | 'resetLabel'> & {
+  resetAtMs: number | null;
+};
 
 const resolveClaudeLimitResetAt = (limit: Record<string, unknown>): string => {
   const rawResetAt = limit.resets_at ?? limit.resetsAt ?? limit.reset_at ?? limit.resetAt;
@@ -521,7 +525,12 @@ const parseClaudeLimitWindowValues = (
   const resetAt = resolveClaudeLimitResetAt(limit);
   const resetLabel = formatQuotaResetTime(resetAt || undefined);
   if (usedPercent === null && resetLabel === '-') return null;
-  return { usedPercent, resetLabel };
+  const parsedResetAtMs = Date.parse(resetAt);
+  return {
+    usedPercent,
+    resetLabel,
+    resetAtMs: Number.isFinite(parsedResetAtMs) ? parsedResetAtMs : null,
+  };
 };
 
 const findClaudeModelDisplayName = (value: unknown): string | null => {
@@ -719,7 +728,8 @@ const buildClaudeScopedWeeklyWindows = (payload: ClaudeUsagePayload): ClaudeQuot
         window: {
           id: `weekly-scoped-${idPart}`,
           label,
-          ...values,
+          usedPercent: values.usedPercent,
+          resetLabel: values.resetLabel,
         },
       };
       const targetMap = modelId ? idWindowsByModel : labelOnlyWindowsByModel;
@@ -774,10 +784,11 @@ const buildClaudeScopedWeeklyWindows = (payload: ClaudeUsagePayload): ClaudeQuot
 const buildClaudeQuotaWindows = (
   payload: ClaudeUsagePayload,
   t: TFunction
-): ClaudeQuotaWindow[] => {
+): { windows: ClaudeQuotaWindow[]; weeklyResetAtMs: number | null } => {
   const windows: ClaudeQuotaWindow[] = [];
   const baseLimitFallbacks = buildClaudeBaseLimitFallbacks(payload);
   const scopedWeeklyWindows = buildClaudeScopedWeeklyWindows(payload);
+  let weeklyResetAtMs: number | null = null;
 
   for (const { key, id, labelKey } of CLAUDE_USAGE_WINDOW_KEYS) {
     const window = payload[key as keyof ClaudeUsagePayload];
@@ -786,6 +797,7 @@ const buildClaudeQuotaWindows = (
       const typedWindow = window as { utilization: number; resets_at: string };
       const usedPercent = normalizeNumberValue(typedWindow.utilization);
       const resetLabel = formatQuotaResetTime(typedWindow.resets_at);
+      const parsedResetAtMs = Date.parse(typedWindow.resets_at);
       if (usedPercent !== null || resetLabel !== '-') {
         windows.push({
           id,
@@ -794,6 +806,9 @@ const buildClaudeQuotaWindows = (
           usedPercent,
           resetLabel,
         });
+        if (id === 'seven-day' && Number.isFinite(parsedResetAtMs)) {
+          weeklyResetAtMs = parsedResetAtMs;
+        }
         renderedTopLevelWindow = true;
       }
     }
@@ -804,8 +819,10 @@ const buildClaudeQuotaWindows = (
           id,
           label: t(labelKey),
           labelKey,
-          ...fallback,
+          usedPercent: fallback.usedPercent,
+          resetLabel: fallback.resetLabel,
         });
+        if (id === 'seven-day') weeklyResetAtMs = fallback.resetAtMs;
       }
     }
     if (key === 'seven_day') {
@@ -813,7 +830,7 @@ const buildClaudeQuotaWindows = (
     }
   }
 
-  return windows;
+  return { windows, weeklyResetAtMs };
 };
 
 export const fetchClaudeQuota = async (
@@ -856,7 +873,7 @@ export const fetchClaudeQuota = async (
     throw new Error(t('claude_quota.empty_windows'));
   }
 
-  const windows = buildClaudeQuotaWindows(payload, t);
+  const { windows, weeklyResetAtMs } = buildClaudeQuotaWindows(payload, t);
   const planType =
     profileResult.status === 'fulfilled' &&
     profileResult.value.statusCode >= 200 &&
@@ -866,7 +883,7 @@ export const fetchClaudeQuota = async (
         )
       : null;
 
-  return { windows, extraUsage: payload.extra_usage, planType };
+  return { windows, extraUsage: payload.extra_usage, planType, weeklyResetAtMs };
 };
 
 export const fetchKimiQuota = async (file: AuthFileItem, t: TFunction): Promise<KimiQuotaRow[]> => {

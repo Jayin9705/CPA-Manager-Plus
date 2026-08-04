@@ -3,7 +3,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const bundlePath = path.resolve(repoRoot, process.argv[2] || 'apps/web/dist/index.html');
+const requestedPath = process.argv[2];
+const defaultPath = existsSync(path.resolve(repoRoot, 'apps/web/dist/index.html'))
+  ? 'apps/web/dist/index.html'
+  : 'apps/web/dist-bundle/index.html';
+const bundlePath = path.resolve(repoRoot, requestedPath || defaultPath);
 
 const forbiddenMarkers = [
   '#/demo',

@@ -1,0 +1,444 @@
+@use '@/styles/mixins' as *;
+
+.page {
+  --playground-surface: var(--bg-primary);
+  --playground-muted: var(--surface-subtle);
+  --playground-border: var(--border-color);
+  --playground-text: var(--text-primary);
+  --playground-secondary: var(--text-secondary);
+  --playground-primary: var(--primary-color);
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 16px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  color: var(--playground-text);
+}
+
+.workspacePanel {
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  border: 1px solid var(--playground-border);
+  border-radius: 18px;
+  background: var(--playground-surface);
+  box-shadow: var(--shadow-lg);
+  min-height: 0;
+}
+
+.toolbarRow,
+.composerFooter,
+.imageFormFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.subtleText {
+  min-width: 0;
+  color: var(--playground-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspacePanel {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.modeTabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--playground-border) 76%, transparent);
+  background: color-mix(in srgb, var(--playground-muted) 38%, var(--playground-surface));
+}
+
+.modeTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--playground-secondary);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+
+  &:hover {
+    background: color-mix(in srgb, var(--playground-primary) 6%, transparent);
+    color: var(--playground-text);
+  }
+}
+
+.modeTabActive,
+.modeTabActive:hover {
+  border-color: color-mix(in srgb, var(--playground-primary) 22%, var(--playground-border));
+  background: color-mix(in srgb, var(--playground-primary) 11%, var(--playground-surface));
+  color: var(--playground-primary);
+}
+
+.modeTabIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.workspaceContent {
+  display: grid;
+  gap: 14px;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 18px;
+}
+
+.toolbarRow {
+  align-items: flex-end;
+}
+
+.modelField {
+  flex: 1 1 auto;
+  min-width: 180px;
+
+  :global(.form-group) {
+    margin-bottom: 0;
+  }
+}
+
+.compactField {
+  display: grid;
+  gap: 6px;
+  min-width: 146px;
+
+  label {
+    color: var(--playground-text);
+    font-size: 13px;
+    font-weight: 600;
+  }
+}
+
+.chatPanel {
+  display: grid;
+  align-content: start;
+  gap: 18px;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  padding: 22px;
+  overflow-y: auto;
+  border: 1px solid var(--playground-border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--playground-muted) 36%, var(--playground-surface));
+}
+
+.messageRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  max-width: min(92%, 880px);
+}
+
+.messageRowUser {
+  justify-self: end;
+  flex-direction: row-reverse;
+}
+
+.messageAvatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--playground-primary) 25%, var(--playground-border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--playground-primary) 12%, var(--playground-surface));
+  color: var(--playground-primary);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.messageBody {
+  min-width: 0;
+  padding: 10px 13px;
+  border: 1px solid var(--playground-border);
+  border-radius: 13px;
+  background: var(--playground-surface);
+  box-shadow: 0 3px 12px rgba(15, 23, 42, 0.04);
+}
+
+.messageRowUser .messageBody {
+  border-color: color-mix(in srgb, var(--playground-primary) 20%, var(--playground-border));
+  background: color-mix(in srgb, var(--playground-primary) 7%, var(--playground-surface));
+}
+
+.messageRole {
+  margin-bottom: 4px;
+  color: var(--playground-secondary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.messageText {
+  color: var(--playground-text);
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.emptyState,
+.imageEmptyState {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  min-height: 260px;
+  gap: 7px;
+  color: var(--playground-secondary);
+  text-align: center;
+
+  strong {
+    color: var(--playground-text);
+    font-size: 14px;
+  }
+
+  span {
+    max-width: 400px;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+}
+
+.emptyIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  margin-bottom: 4px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--playground-primary) 10%, var(--playground-muted));
+  color: var(--playground-primary);
+  font-size: 23px;
+}
+
+.loadingDots {
+  display: inline-flex;
+  gap: 4px;
+  padding: 5px 0 2px;
+
+  span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--playground-primary);
+    animation: playground-bounce 1.1s infinite ease-in-out;
+  }
+
+  span:nth-child(2) {
+    animation-delay: 0.12s;
+  }
+
+  span:nth-child(3) {
+    animation-delay: 0.24s;
+  }
+}
+
+@keyframes playground-bounce {
+  0%,
+  70%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+
+  35% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.composer,
+.imageForm {
+  display: grid;
+  gap: 9px;
+}
+
+.composerInput,
+.promptInput {
+  resize: vertical;
+  min-height: 76px;
+  font: inherit;
+  line-height: 1.55;
+}
+
+.promptInput {
+  min-height: 132px;
+}
+
+.composerFooter,
+.imageFormFooter {
+  align-items: center;
+}
+
+.errorBox {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--color-danger) 28%, var(--playground-border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-danger) 7%, var(--playground-surface));
+  color: var(--color-danger);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.promptField {
+  display: grid;
+  gap: 6px;
+
+  label {
+    color: var(--playground-text);
+    font-size: 13px;
+    font-weight: 600;
+  }
+}
+
+.imageForm {
+  padding-bottom: 4px;
+}
+
+.imageResults {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  height: 100%;
+  min-height: 0;
+  padding: 14px;
+  overflow: auto;
+  border: 1px solid var(--playground-border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--playground-muted) 36%, var(--playground-surface));
+}
+
+.imageCard {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--playground-border);
+  border-radius: 12px;
+  background: var(--playground-surface);
+
+  img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    background: var(--playground-muted);
+  }
+
+  figcaption {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px;
+    color: var(--playground-secondary);
+    font-size: 11px;
+    line-height: 1.45;
+  }
+
+  figcaption span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+  }
+
+  a {
+    flex: 0 0 auto;
+    color: var(--playground-primary);
+    font-weight: 700;
+    text-decoration: none;
+  }
+
+  a:hover {
+    text-decoration: underline;
+  }
+}
+
+@include mobile {
+  .page {
+    height: auto;
+  }
+
+  .workspacePanel {
+    height: auto;
+    grid-template-rows: auto auto;
+  }
+
+  .workspaceContent {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+    padding: 14px;
+  }
+
+  .toolbarRow,
+  .composerFooter,
+  .imageFormFooter {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .composerFooter > *,
+  .imageFormFooter > * {
+    width: 100%;
+  }
+
+  .toolbarRow {
+    align-items: stretch;
+  }
+
+  .compactField {
+    width: 100%;
+  }
+
+  .chatPanel {
+    min-height: 280px;
+    height: auto;
+    padding: 14px;
+  }
+
+  .messageRow {
+    max-width: 100%;
+  }
+
+  .imageResults {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    height: auto;
+    min-height: 260px;
+    overflow: visible;
+    padding: 10px;
+  }
+}

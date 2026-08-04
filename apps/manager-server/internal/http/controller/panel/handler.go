@@ -14,3 +14,7 @@ type Handler struct {
 func (h *Handler) ManagementHTML(w http.ResponseWriter, r *http.Request) {
 	h.App.PanelService.ServeManagementHTML(w, r, response.Error)
 }
+
+func (h *Handler) ManagementAssets(w http.ResponseWriter, r *http.Request) {
+	h.App.PanelService.ServeManagementAssets(w, r, response.Error)
+}

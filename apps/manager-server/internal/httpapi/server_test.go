@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,15 @@ type observedRequest struct {
 	path  string
 	query string
 	auth  string
+}
+
+type observedPlaygroundRequest struct {
+	path          string
+	query         string
+	auth          string
+	cpaAPIKey     string
+	managerCookie string
+	body          string
 }
 
 func newTestHandler(t *testing.T, upstreamURL string, saveSetup bool) http.Handler {
@@ -55,7 +65,9 @@ func newTestHandler(t *testing.T, upstreamURL string, saveSetup bool) http.Handl
 	}
 
 	manager := collector.NewManager(cfg, db)
-	return New(cfg, db, manager).Handler()
+	server := New(cfg, db, manager)
+	installTestAdminAuth(t, server)
+	return server.Handler()
 }
 
 func newTestHandlerWithConfig(t *testing.T, cfg config.Config) http.Handler {
@@ -77,7 +89,9 @@ func newTestHandlerWithConfig(t *testing.T, cfg config.Config) http.Handler {
 	})
 
 	manager := collector.NewManager(cfg, db)
-	return New(cfg, db, manager).Handler()
+	server := New(cfg, db, manager)
+	installTestAdminAuth(t, server)
+	return server.Handler()
 }
 
 func stubModelPriceSyncURLs(t *testing.T, liteLLMURL string, openRouterURL string, modelsDevURLs ...string) {
@@ -144,6 +158,68 @@ func TestModelListProxyPreservesAuthorization(t *testing.T) {
 				t.Fatalf("proxied authorization = %q", got.auth)
 			}
 		})
+	}
+}
+
+func TestPlaygroundProxyUsesCallerAPIKeyAndRewritesCPAPath(t *testing.T) {
+	observed := make(chan observedPlaygroundRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		observed <- observedPlaygroundRequest{
+			path:          r.URL.Path,
+			query:         r.URL.RawQuery,
+			auth:          r.Header.Get("Authorization"),
+			cpaAPIKey:     r.Header.Get("X-CPA-API-Key"),
+			managerCookie: r.Header.Get("Cookie"),
+			body:          string(body),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"url":"https://cdn.example/image.png"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler := newTestHandler(t, upstream.URL, true)
+	login := httptest.NewRequest(http.MethodPost, "/usage-service/auth/login", strings.NewReader(
+		`{"email":"`+testutil.AdminEmail+`","password":"`+testutil.AdminPassword+`"}`,
+	))
+	login.Header.Set("Content-Type", "application/json")
+	loginRR := httptest.NewRecorder()
+	handler.ServeHTTP(loginRR, login)
+	testutil.RequireStatus(t, loginRR, http.StatusOK)
+	cookies := loginRR.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login cookies = %#v", cookies)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/playground/images/generations?request=1",
+		strings.NewReader(`{"model":"gpt-image-2","prompt":"a lighthouse"}`),
+	)
+	req.AddCookie(cookies[0])
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CPA-API-Key", "client-key")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	testutil.RequireStatus(t, rr, http.StatusOK)
+
+	var got observedPlaygroundRequest
+	select {
+	case got = <-observed:
+	default:
+		t.Fatal("upstream was not called")
+	}
+	if got.path != "/v1/images/generations" || got.query != "request=1" {
+		t.Fatalf("upstream request path/query = %q?%s", got.path, got.query)
+	}
+	if got.auth != "Bearer client-key" {
+		t.Fatalf("upstream authorization = %q", got.auth)
+	}
+	if got.cpaAPIKey != "" || got.managerCookie != "" {
+		t.Fatalf("manager credentials leaked upstream: api key=%q cookie=%q", got.cpaAPIKey, got.managerCookie)
+	}
+	if got.body != `{"model":"gpt-image-2","prompt":"a lighthouse"}` {
+		t.Fatalf("upstream body = %q", got.body)
 	}
 }
 

@@ -287,6 +287,7 @@ export interface ClaudeQuotaState {
   windows: ClaudeQuotaWindow[];
   extraUsage?: ClaudeExtraUsage | null;
   planType?: string | null;
+  weeklyResetAtMs?: number | null;
   error?: string;
   errorStatus?: number;
 }
@@ -332,6 +333,7 @@ export interface CodexQuotaWindow {
   usedPercent: number | null;
   resetLabel: string;
   limitWindowSeconds?: number | null;
+  resetAtMs?: number | null;
 }
 
 export interface CodexQuotaState {

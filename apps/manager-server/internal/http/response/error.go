@@ -82,6 +82,10 @@ func UsageServiceErrorCode(err error) string {
 		return "invalid_existing_management_key"
 	case strings.Contains(message, "invalid admin key"):
 		return "invalid_admin_key"
+	case strings.Contains(message, "invalid session"):
+		return "invalid_session"
+	case strings.Contains(message, "authentication service unavailable"):
+		return "authentication_unavailable"
 	case strings.Contains(message, "invalid management key"):
 		return "invalid_management_key"
 	case strings.Contains(message, "usage service is not configured"):

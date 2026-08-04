@@ -5,18 +5,25 @@ import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
 import { isUsageServiceId, usageServiceApi } from '@/services/api/usageService';
 import { detectApiBaseFromLocation } from '@/utils/connection';
 
+const LOGIN_REDIRECT_STORAGE_KEY = 'config-management:login-redirect';
+
 export function ProtectedRoute({ children }: { children: ReactElement }) {
   const location = useLocation();
   const navigate = useNavigate();
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const managementKey = useAuthStore((state) => state.managementKey);
   const apiBase = useAuthStore((state) => state.apiBase);
+  const sessionMode = useAuthStore((state) => state.sessionMode);
   const restoreSession = useAuthStore((state) => state.restoreSession);
   const [checking, setChecking] = useState(false);
 
   useEffect(() => {
     const tryRestore = async () => {
-      if (!isAuthenticated && managementKey && apiBase) {
+      if (
+        !isAuthenticated &&
+        apiBase &&
+        (sessionMode === 'manager_embedded' || Boolean(managementKey))
+      ) {
         setChecking(true);
         try {
           const detectedBase = detectApiBaseFromLocation();
@@ -28,8 +35,7 @@ export function ProtectedRoute({ children }: { children: ReactElement }) {
             detectedUsageService = false;
           }
           const hostedManagementPage =
-            typeof window !== 'undefined' &&
-            /\/management\.html$/i.test(window.location.pathname);
+            typeof window !== 'undefined' && /\/management\.html$/i.test(window.location.pathname);
           const result = await restoreSession({
             expectedMode: detectedUsageService ? 'manager_embedded' : 'external_panel',
             expectedPanelBase:
@@ -45,7 +51,7 @@ export function ProtectedRoute({ children }: { children: ReactElement }) {
       }
     };
     tryRestore();
-  }, [apiBase, isAuthenticated, managementKey, navigate, restoreSession]);
+  }, [apiBase, isAuthenticated, managementKey, navigate, restoreSession, sessionMode]);
 
   if (checking) {
     return (
@@ -56,6 +62,15 @@ export function ProtectedRoute({ children }: { children: ReactElement }) {
   }
 
   if (!isAuthenticated) {
+    try {
+      const requestedPath = `${location.pathname}${location.search}${location.hash}`;
+      sessionStorage.setItem(
+        LOGIN_REDIRECT_STORAGE_KEY,
+        requestedPath === '/' ? '/dashboard' : requestedPath
+      );
+    } catch {
+      // Session storage may be unavailable in private browsing; root is a safe fallback.
+    }
     return <Navigate to="/login" replace state={{ from: location }} />;
   }
 

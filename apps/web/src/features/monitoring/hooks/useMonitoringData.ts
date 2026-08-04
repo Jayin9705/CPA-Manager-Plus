@@ -39,8 +39,6 @@ import {
 import { buildEventRows } from '../model/eventRows';
 import {
   buildMonitoringCenterAnalyticsInclude,
-  buildMonitoringFilterSelectorsScopeKey,
-  buildMonitoringFilterSelectorsInclude,
   mergeMonitoringAccountOptionRows,
 } from '../model/monitoringAnalyticsModel';
 import {
@@ -101,7 +99,10 @@ export {
   buildRealtimeMonitorRows,
 } from '../model/rowBuilders';
 
-const MONITORING_EVENTS_PAGE_LIMIT = 500;
+// Keep the first realtime page small enough to paint quickly on a mobile or
+// high-latency connection. Pagination still exposes the complete event
+// history, so reducing this transport page does not remove any functionality.
+const MONITORING_EVENTS_PAGE_LIMIT = 200;
 export const MONITORING_EVENTS_RETENTION_LIMIT = 2_000;
 const MONITORING_PRESENTATION_CACHE_LIMIT = 4;
 const EMPTY_MONITORING_ANALYTICS_EVENT_ROWS: MonitoringAnalyticsEventRow[] = [];
@@ -506,32 +507,8 @@ export function useMonitoringData({
     include: analyticsInclude,
     throttleMs: 1_000,
   });
-  const filterSelectorsInclude = useMemo(() => buildMonitoringFilterSelectorsInclude(), []);
-  const filterSelectorsScopeKey = useMemo(
-    () =>
-      buildMonitoringFilterSelectorsScopeKey(
-        timeRange,
-        analyticsBounds,
-        searchQuery,
-        searchApiKeyHash
-      ),
-    [analyticsBounds, searchApiKeyHash, searchQuery, timeRange]
-  );
-  const filterSelectorsAnalytics = useMonitoringAnalytics({
-    fromMs: analyticsBounds?.startMs,
-    toMs: analyticsBounds?.endMs,
-    nowMs: analyticsNowMs,
-    dataScopeKey: filterSelectorsScopeKey,
-    searchQuery,
-    searchApiKeyHash,
-    include: filterSelectorsInclude,
-    throttleMs: 1_000,
-  });
   const analyticsData = analytics.data;
   const currentAnalyticsData = analytics.dataStale ? null : analyticsData;
-  const currentFilterSelectorsData = filterSelectorsAnalytics.dataStale
-    ? null
-    : filterSelectorsAnalytics.data;
   const displayEventItems = useMemo(
     () =>
       resolveMonitoringDisplayEventItems({
@@ -834,8 +811,7 @@ export function useMonitoringData({
   },
     [apiKeyDisplayMap, rangeFilteredRows]
   );
-  const analyticsFilterOptions =
-    currentFilterSelectorsData?.filter_options ?? currentAnalyticsData?.filter_options;
+  const analyticsFilterOptions = currentAnalyticsData?.filter_options;
   const filterOptions = useMemo(() => {
     const selectorOptions = analyticsFilterOptions
       ? buildFilterOptionsFromAnalytics(
@@ -1018,7 +994,7 @@ export function useMonitoringData({
 
   return {
     loading: loading || analytics.loading,
-    error: [error, analytics.error, filterSelectorsAnalytics.error].filter(Boolean).join('；'),
+    error: [error, analytics.error].filter(Boolean).join('；'),
     authFiles,
     channels,
     summary: presentationSnapshot.summary,

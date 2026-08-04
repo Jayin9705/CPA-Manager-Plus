@@ -51,10 +51,17 @@ export interface UsageImportOptions {
 
 export interface UseUsageDataOptions {
   loadUsageEvents?: boolean;
+  /**
+   * Analytics already receives pricing from the manager response and only
+   * needs aliases for display. Callers that own a critical first paint can
+   * load these optional endpoints after the primary request has completed.
+   */
+  loadAuxiliaryData?: boolean;
 }
 
 export function useUsageData({
   loadUsageEvents = true,
+  loadAuxiliaryData = true,
 }: UseUsageDataOptions = {}): UseUsageDataReturn {
   const managementKey = useAuthStore((state) => state.managementKey);
   const featureAvailability = usePanelFeatureAvailability();
@@ -220,10 +227,12 @@ export function useUsageData({
   }, [loadUsageEvents, managementKey, usageEventsServiceBase]);
 
   useEffect(() => {
-    void loadModelPricesFromStorage();
-    void loadApiKeyAliases();
+    if (loadAuxiliaryData) {
+      void loadModelPricesFromStorage();
+      void loadApiKeyAliases();
+    }
     void loadUsage();
-  }, [loadApiKeyAliases, loadModelPricesFromStorage, loadUsage]);
+  }, [loadApiKeyAliases, loadAuxiliaryData, loadModelPricesFromStorage, loadUsage]);
 
   const setModelPrices = useCallback(
     async (prices: Record<string, ModelPrice>) => {

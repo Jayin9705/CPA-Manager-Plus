@@ -1,6 +1,7 @@
 package monitoring
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -31,6 +32,10 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		h.handleAccountHistory(w, r)
 		return
 	}
+	if path == "/v0/management/monitoring/quota-weekly-usage" {
+		handleQuotaWeeklyUsage(h, w, r)
+		return
+	}
 	if path != "/v0/management/monitoring/analytics" {
 		response.MethodNotAllowed(w)
 		return
@@ -52,7 +57,31 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.App.MonitoringService.Analytics(r.Context(), req)
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, err)
+		response.Error(w, monitoringErrorStatus(err), err)
+		return
+	}
+	response.JSON(w, http.StatusOK, result)
+}
+
+func handleQuotaWeeklyUsage(h *Handler, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+	var req monitoringsvc.QuotaWeeklyUsageRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		response.Error(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := monitoringsvc.ValidateQuotaWeeklyUsageRequest(req); err != nil {
+		response.Error(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := h.App.MonitoringService.QuotaWeeklyUsage(r.Context(), req)
+	if err != nil {
+		response.Error(w, monitoringErrorStatus(err), err)
 		return
 	}
 	response.JSON(w, http.StatusOK, result)
@@ -76,7 +105,7 @@ func (h *Handler) handleAccountHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := h.App.MonitoringService.AccountHistory(r.Context(), req)
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, err)
+		response.Error(w, monitoringErrorStatus(err), err)
 		return
 	}
 	response.JSON(w, http.StatusOK, result)
@@ -103,10 +132,20 @@ func (h *Handler) handleHeaderSnapshots(w http.ResponseWriter, r *http.Request) 
 		Limit: limit,
 	})
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, err)
+		response.Error(w, monitoringErrorStatus(err), err)
 		return
 	}
 	response.JSON(w, http.StatusOK, result)
+}
+
+func monitoringErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	if errors.Is(err, monitoringsvc.ErrQuotaWeeklyUsageUnavailable) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusInternalServerError
 }
 
 func validateRequest(req monitoringsvc.Request) error {

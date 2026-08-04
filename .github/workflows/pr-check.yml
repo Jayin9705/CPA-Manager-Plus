@@ -95,7 +95,12 @@ jobs:
         run: npm run test
 
       - name: Build
-        run: npm --workspace apps/web run build:bundle
+        run: npm --workspace apps/web run build
+        env:
+          VERSION: ci
+
+      - name: Build separated console
+        run: npm run build:separated
         env:
           VERSION: ci
 
@@ -121,6 +126,14 @@ jobs:
       - name: Test
         working-directory: apps/manager-server
         run: go test ./...
+
+      - name: Test API-only build
+        working-directory: apps/manager-server
+        run: go test -tags api_only ./...
+
+      - name: Build API-only binary
+        working-directory: apps/manager-server
+        run: go build -tags api_only -trimpath -o "$RUNNER_TEMP/cpamp-api" ./cmd/cpa-manager-plus
 
   manager-server-windows-sqlite:
     name: Manager Server SQLite (Windows)
@@ -199,6 +212,14 @@ jobs:
       - name: Validate Docker Compose configuration
         run: docker compose -f docker-compose.manager.yml config
 
+      - name: Validate separated Docker Compose configuration
+        run: docker compose -f docker-compose.separated.yml --profile separated --profile separated-api config
+
+      - name: Validate full-stack bootstrap and Docker Compose configuration
+        run: |
+          ./bin/bootstrap-stack.sh --init-only
+          ./bin/stack.sh config
+
       - name: Build Manager Server image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -208,6 +229,23 @@ jobs:
           build-args: |
             VERSION=ci
 
+      - name: Build API-only image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.manager-server-api
+          push: false
+          build-args: |
+            VERSION=ci
+
+      - name: Build separated console image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.web
+          push: false
+          build-args: |
+            VERSION=ci
   demo-docs:
     name: Demo and Docs
     needs: changes

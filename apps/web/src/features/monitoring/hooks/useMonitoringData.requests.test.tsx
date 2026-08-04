@@ -216,18 +216,30 @@ const legacySelectorResponse: MonitoringAnalyticsResponse = {
 
 let currentSelectorResponse = selectorResponse;
 let currentSelectorError = '';
+let mockResponseCache = new WeakMap<
+  MonitoringAnalyticsResponse,
+  { selector: MonitoringAnalyticsResponse; response: MonitoringAnalyticsResponse }
+>();
+
+const responseWithSelectors = (base: MonitoringAnalyticsResponse) => {
+  const cached = mockResponseCache.get(base);
+  if (cached?.selector === currentSelectorResponse) return cached.response;
+  const response = { ...base, filter_options: currentSelectorResponse.filter_options };
+  mockResponseCache.set(base, { selector: currentSelectorResponse, response });
+  return response;
+};
 
 const resultFor = (params: UseMonitoringAnalyticsParams) => ({
   enabled: true,
   loading: false,
-  error: params.include?.filter_selectors ? currentSelectorError : '',
-  data: params.include?.filter_selectors
-    ? currentSelectorResponse
-    : params.include?.account_stats
+  error: currentSelectorError,
+  data: responseWithSelectors(
+    params.include?.account_stats
       ? accountsResponse
       : params.include?.api_key_stats
         ? apiKeysResponse
-        : realtimeResponse,
+        : realtimeResponse
+  ),
   dataStale: false,
   lastRefreshedAt,
   serviceBase: 'http://manager.local',
@@ -266,6 +278,7 @@ describe('useMonitoringData analytics requests', () => {
     latestResult = null;
     currentSelectorResponse = selectorResponse;
     currentSelectorError = '';
+    mockResponseCache = new WeakMap();
     refresh.mockClear();
     useMonitoringAnalyticsMock.mockReset();
     useMonitoringAnalyticsMock.mockImplementation(resultFor);
@@ -289,41 +302,38 @@ describe('useMonitoringData analytics requests', () => {
     });
   };
 
-  it('switches the main include by tab while keeping one tab-independent selector scope', async () => {
+  it('keeps selector data on the main request while switching the visible data tab', async () => {
     await renderTab('accounts');
 
     const accounts = lastParams((params) => Boolean(params.include?.summary));
-    const selectors = lastParams((params) => Boolean(params.include?.filter_selectors));
     expect(accounts?.include).toEqual({
       summary: true,
       summary_profile: 'compact',
+      filter_options: true,
+      filter_selectors: true,
       account_stats: true,
-      events_page: { limit: 500, before_ms: null, before_id: null },
+      events_page: { limit: 200, before_ms: null, before_id: null },
       granularity: 'hour',
     });
     expect(JSON.parse(accounts?.dataScopeKey ?? '{}')).toMatchObject({
       activeDataTab: 'accounts',
     });
     expect(accounts?.filters).toEqual({ models: ['gpt-active'] });
-    expect(selectors?.include).toEqual({ filter_options: true, filter_selectors: true });
-    expect(selectors?.filters).toBeUndefined();
-    const selectorScope = selectors?.dataScopeKey;
 
     await renderTab('apiKeys');
     const apiKeys = lastParams((params) => Boolean(params.include?.summary));
     expect(apiKeys?.include).toEqual({
       summary: true,
       summary_profile: 'compact',
+      filter_options: true,
+      filter_selectors: true,
       api_key_stats: true,
-      events_page: { limit: 500, before_ms: null, before_id: null },
+      events_page: { limit: 200, before_ms: null, before_id: null },
       granularity: 'hour',
     });
     expect(JSON.parse(apiKeys?.dataScopeKey ?? '{}')).toMatchObject({
       activeDataTab: 'apiKeys',
     });
-    expect(lastParams((params) => Boolean(params.include?.filter_selectors))?.dataScopeKey).toBe(
-      selectorScope
-    );
     expect(latestResult?.filterOptions.accountRows.map((row) => row.account)).toContain(
       'alice@example.com'
     );
@@ -340,7 +350,7 @@ describe('useMonitoringData analytics requests', () => {
     await renderTab('realtime');
 
     expect(lastParams((params) => Boolean(params.include?.summary))?.include?.events_page).toEqual({
-      limit: 500,
+      limit: 200,
       before_ms: null,
       before_id: null,
     });
@@ -353,21 +363,21 @@ describe('useMonitoringData analytics requests', () => {
     });
 
     expect(lastParams((params) => Boolean(params.include?.summary))?.include?.events_page).toEqual({
-      limit: 500,
+      limit: 200,
       before_ms: 1_799_999_999_000,
       before_id: 7,
     });
 
     await renderTab('accounts');
     expect(lastParams((params) => Boolean(params.include?.summary))?.include?.events_page).toEqual({
-      limit: 500,
+      limit: 200,
       before_ms: null,
       before_id: null,
     });
 
     await renderTab('realtime');
     expect(lastParams((params) => Boolean(params.include?.summary))?.include?.events_page).toEqual({
-      limit: 500,
+      limit: 200,
       before_ms: null,
       before_id: null,
     });

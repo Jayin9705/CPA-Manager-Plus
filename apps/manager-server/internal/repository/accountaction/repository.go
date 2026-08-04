@@ -97,10 +97,11 @@ func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandid
 		}
 	}
 	if !found {
-		res, execErr := tx.ExecContext(ctx, `insert into account_action_candidates (
+		execErr := tx.QueryRowContext(ctx, `insert into account_action_candidates (
 			action_type, status, provider, auth_file_name, auth_index, account_snapshot, account_id_snapshot, auth_label,
 			reason_code, reason, auto_disable_eligible, evidence_json, first_seen_at_ms, last_seen_at_ms, hit_count, created_at_ms, updated_at_ms
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+		returning id`,
 			input.ActionType,
 			model.AccountActionStatusPending,
 			nullString(input.Provider),
@@ -117,13 +118,9 @@ func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandid
 			seenAt,
 			now,
 			now,
-		)
+		).Scan(&id)
 		if execErr != nil {
 			return model.AccountActionCandidate{}, execErr
-		}
-		id, err = res.LastInsertId()
-		if err != nil {
-			return model.AccountActionCandidate{}, err
 		}
 	} else {
 		_, err = tx.ExecContext(ctx, `update account_action_candidates set
@@ -134,13 +131,13 @@ func (r *repository) Upsert(ctx context.Context, input model.AccountActionCandid
 			auth_label = coalesce(nullif(?, ''), auth_label),
 			reason_code = coalesce(nullif(?, ''), reason_code),
 			reason = coalesce(nullif(?, ''), reason),
-			auto_disable_eligible = max(auto_disable_eligible, ?),
+			auto_disable_eligible = case when auto_disable_eligible >= ? then auto_disable_eligible else ? end,
 			evidence_json = coalesce(nullif(?, ''), evidence_json),
 			last_error = null,
 			last_seen_at_ms = ?,
 			hit_count = hit_count + 1,
 			updated_at_ms = ?
-				where id = ?`, input.Provider, input.AuthIndex, input.AccountSnapshot, input.AccountIDSnapshot, input.AuthLabel, input.ReasonCode, input.Reason, boolInt(input.AutoDisableEligible), input.EvidenceJSON, seenAt, now, id)
+			where id = ?`, input.Provider, input.AuthIndex, input.AccountSnapshot, input.AccountIDSnapshot, input.AuthLabel, input.ReasonCode, input.Reason, boolInt(input.AutoDisableEligible), boolInt(input.AutoDisableEligible), input.EvidenceJSON, seenAt, now, id)
 		if err != nil {
 			return model.AccountActionCandidate{}, err
 		}

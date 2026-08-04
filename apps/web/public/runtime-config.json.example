@@ -1,0 +1,7 @@
+{
+  "mode": "full",
+  "apiOrigin": "https://api.example.com",
+  "oauthReturnOrigin": "https://console.example.com",
+  "pluginRuntimeOrigin": "https://console.example.com",
+  "environmentName": "production"
+}

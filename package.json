@@ -11,6 +11,7 @@
     "dev": "npm --workspace apps/web run dev",
     "dev:demo": "npm --workspace apps/web run dev:demo",
     "build": "npm --workspace apps/web run build",
+    "build:separated": "npm --workspace apps/web run build:separated",
     "build:demo": "npm --workspace apps/web run build:demo",
     "docs:dev": "npm --workspace apps/docs run dev",
     "docs:build": "npm --workspace apps/docs run build",

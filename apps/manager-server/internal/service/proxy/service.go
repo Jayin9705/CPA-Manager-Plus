@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -27,6 +28,8 @@ import (
 type Service struct {
 	managerConfigService *managerconfig.Service
 	store                *store.Store
+	managementTransport  http.RoundTripper
+	playgroundTransport  http.RoundTripper
 	authFileMutations    *cpaauthfiles.MutationCoordinator
 }
 
@@ -84,6 +87,7 @@ const cpaPluginResourcePrefix = "/v0/resource/plugins"
 const cpaManagementPrefix = "/v0/management"
 const codexInviteOriginHeader = "X-Codex-Invite-Origin"
 const managementOriginJSONField = "management_origin"
+const playgroundCPAAPIKeyHeader = "X-CPA-API-Key"
 const authFilePhysicalNameHeader = "X-CPAMP-Auth-File-Physical-Name"
 const authFileDeleteIdentitiesHeader = "X-CPAMP-Auth-File-Delete-Identities"
 const authFileMutationIdentityHeader = "X-CPAMP-Auth-File-Mutation-Identity"
@@ -93,6 +97,17 @@ const authFileWriteContentSHA256Header = "X-CPAMP-Auth-File-Write-Content-SHA256
 const maxAuthFileMutationRequestBytes int64 = 10*1024*1024 + 64*1024
 const maxAuthFileMutationResponseBytes int64 = 1024 * 1024
 const authFileOwnershipPersistenceTimeout = 5 * time.Second
+
+const (
+	proxyDialTimeout         = 5 * time.Second
+	proxyTLSHandshakeTimeout = 5 * time.Second
+	// CPA's generic management api-call endpoint may spend up to a minute
+	// waiting for an upstream provider before it sends response headers.
+	proxyResponseHeaderTimeout      = 75 * time.Second
+	playgroundResponseHeaderTimeout = 3 * time.Minute
+	proxyIdleConnTimeout            = 90 * time.Second
+	proxySetupTimeout               = 3 * time.Second
+)
 
 var errAuthFileMutationBodyTooLarge = errors.New("auth file mutation body is too large")
 
@@ -134,11 +149,85 @@ func NewWithMutationCoordinator(
 	if len(stores) > 0 {
 		service.store = stores[0]
 	}
+	service.managementTransport = newCPAProxyTransport(proxyResponseHeaderTimeout)
+	service.playgroundTransport = newCPAProxyTransport(playgroundResponseHeaderTimeout)
 	return service
+}
+
+func newCPAProxyTransport(responseHeaderTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: proxyDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		MaxConnsPerHost:       64,
+		IdleConnTimeout:       proxyIdleConnTimeout,
+		TLSHandshakeTimeout:   proxyTLSHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 func (s *Service) ProxyManagement(w http.ResponseWriter, r *http.Request, writeError func(http.ResponseWriter, int, error)) {
 	s.proxyWithSavedManagementKey(w, r, writeError)
+}
+
+// ProxyPlayground forwards the long-running OpenAI-compatible playground
+// requests directly to CPA. CPA's generic management api-call endpoint has a
+// fixed 60-second timeout, which is too short for some image generations.
+// The controller authenticates the Manager session before calling this method;
+// this service only accepts the caller's CPA API key and never forwards it as
+// a Manager credential.
+func (s *Service) ProxyPlayground(w http.ResponseWriter, r *http.Request, writeError func(http.ResponseWriter, int, error)) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+
+	upstreamPath, ok := playgroundUpstreamPath(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("playground proxy path is not supported"))
+		return
+	}
+	apiKey := strings.TrimSpace(r.Header.Get(playgroundCPAAPIKeyHeader))
+	if apiKey == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("CPA API key is required"))
+		return
+	}
+
+	setup, ok, err := s.resolveSetup(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusPreconditionRequired, errors.New("usage service is not configured"))
+		return
+	}
+	target, err := url.Parse(setup.CPAUpstreamURL)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = s.playgroundTransport
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = joinProxyPath(target.Path, upstreamPath)
+		req.URL.RawPath = ""
+		req.Host = target.Host
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Del(playgroundCPAAPIKeyHeader)
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
+		writeError(w, http.StatusBadGateway, proxyErr)
+	}
+	proxy.ServeHTTP(w, r)
 }
 
 func (s *Service) ProxyPluginManagement(w http.ResponseWriter, r *http.Request, writeError func(http.ResponseWriter, int, error)) {
@@ -179,6 +268,25 @@ func (s *Service) proxyWithSavedManagementKey(w http.ResponseWriter, r *http.Req
 		return
 	}
 	s.proxyToSavedSetup(w, r, writeError, true, false)
+}
+
+func playgroundUpstreamPath(path string) (string, bool) {
+	switch strings.TrimRight(path, "/") {
+	case "/v0/management/playground/chat/completions":
+		return "/v1/chat/completions", true
+	case "/v0/management/playground/images/generations":
+		return "/v1/images/generations", true
+	default:
+		return "", false
+	}
+}
+
+func joinProxyPath(basePath string, path string) string {
+	base := strings.TrimRight(basePath, "/")
+	if base == "" {
+		return path
+	}
+	return base + path
 }
 
 func (s *Service) proxyToSavedSetup(w http.ResponseWriter, r *http.Request, writeError func(http.ResponseWriter, int, error), useSavedManagementKey bool, rewritePluginOrigin bool) {
@@ -242,6 +350,7 @@ func (s *Service) proxyToSavedSetup(w http.ResponseWriter, r *http.Request, writ
 		ownershipMutation.fileNames = ownershipFileNames(revokedOwnership)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = s.managementTransport
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
@@ -1387,6 +1496,7 @@ func (s *Service) ProxyModelList(w http.ResponseWriter, r *http.Request, writeEr
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = s.managementTransport
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
@@ -1436,5 +1546,7 @@ func IsCPAPluginResourcePath(path string) bool {
 }
 
 func (s *Service) resolveSetup(ctx context.Context) (store.Setup, bool, error) {
-	return s.managerConfigService.ResolveSetup(ctx)
+	setupCtx, cancel := context.WithTimeout(ctx, proxySetupTimeout)
+	defer cancel()
+	return s.managerConfigService.ResolveSetup(setupCtx)
 }

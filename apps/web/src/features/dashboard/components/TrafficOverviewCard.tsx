@@ -281,7 +281,7 @@ export function TrafficOverviewCard({
   );
 
   return (
-    <div className={styles.chartsGrid}>
+    <div className={`${styles.chartsGrid} dashboard-charts-grid`}>
       {/* 1. 流量趋势 */}
       <section className={`${styles.chartCard} ${styles.activityCard}`}>
         <div className={styles.cardHeader}>

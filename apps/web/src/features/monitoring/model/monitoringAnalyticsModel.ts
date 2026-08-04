@@ -20,6 +20,12 @@ export const buildMonitoringCenterAnalyticsInclude = (
   const include: MonitoringAnalyticsInclude = {
     summary: true,
     summary_profile: 'compact',
+    // Selector data is scoped to the time/search window by the server. The
+    // server deliberately removes dimension filters for this part, so keeping
+    // it on the main response avoids a second full analytics request during
+    // the first paint of the monitoring page.
+    filter_options: true,
+    filter_selectors: true,
     granularity,
   };
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useMonitoringAnalytics } from '@/features/monitoring/hooks/useMonitoringAnalytics';
 import { useUsageData } from '@/features/monitoring/hooks/useUsageData';
@@ -92,7 +92,10 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
 
 export function useUsageAnalytics() {
   const config = useConfigStore((state) => state.config);
-  const { apiKeyAliases, loadApiKeyAliases } = useUsageData({ loadUsageEvents: false });
+  const { apiKeyAliases, loadApiKeyAliases } = useUsageData({
+    loadUsageEvents: false,
+    loadAuxiliaryData: false,
+  });
   const [monitoringMeta, setMonitoringMeta] = useState<UsageAnalyticsMonitoringMeta>(
     EMPTY_USAGE_ANALYTICS_MONITORING_META
   );
@@ -120,6 +123,7 @@ export function useUsageAnalytics() {
   const [selectedHeatmapCell, setSelectedHeatmapCell] = useState<UsageHeatmapCellSelection | null>(
     null
   );
+  const auxiliaryLoadStartedRef = useRef(false);
   const browserTimeZone = useMemo(() => getBrowserTimeZone(), []);
   const apiKeyDisplayMap = useMemo(
     () => buildApiKeyDisplayMap(config?.apiKeys || [], apiKeyAliases || []),
@@ -131,25 +135,6 @@ export function useUsageAnalytics() {
       authFiles: payload.authFiles,
       channels: payload.channels,
     });
-  }, [config]);
-  useEffect(() => {
-    let cancelled = false;
-    loadMonitoringMetaPayload(config)
-      .then((payload) => {
-        if (cancelled) return;
-        setMonitoringMeta({
-          authFiles: payload.authFiles,
-          channels: payload.channels,
-        });
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setMonitoringMeta(EMPTY_USAGE_ANALYTICS_MONITORING_META);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [config]);
   const authMetaMap = useMemo(
     () => buildMonitoringAuthMetaMap(monitoringMeta.authFiles),
@@ -288,6 +273,29 @@ export function useUsageAnalytics() {
     throttleMs: 0,
   });
 
+  // The main response is the only request required to paint the first view.
+  // Auth-file/channel metadata and aliases are useful for labels, but they
+  // should not compete with the analytics query when the user enters from a
+  // different menu. Start them after the first scoped response is available.
+  useEffect(() => {
+    if (!analytics.data || analytics.dataStale || auxiliaryLoadStartedRef.current) return;
+    auxiliaryLoadStartedRef.current = true;
+    const timer = setTimeout(() => {
+      void loadApiKeyAliases();
+      void loadMonitoringMetaPayload(config)
+        .then((payload) => {
+          setMonitoringMeta({
+            authFiles: payload.authFiles,
+            channels: payload.channels,
+          });
+        })
+        .catch(() => {
+          setMonitoringMeta(EMPTY_USAGE_ANALYTICS_MONITORING_META);
+        });
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [analytics.data, analytics.dataStale, config, loadApiKeyAliases]);
+
   const filterSelectorsInclude = useMemo(() => buildUsageAnalyticsFilterSelectorsInclude(), []);
   const filterSelectorsDataScopeKey = useMemo(
     () =>
@@ -298,6 +306,7 @@ export function useUsageAnalytics() {
     [bounds, debouncedSearchQuery]
   );
   const filterSelectorsAnalytics = useMonitoringAnalytics({
+    enabled: Boolean(analytics.data && !analytics.dataStale),
     fromMs: bounds?.fromMs,
     toMs: bounds?.toMs,
     nowMs,
@@ -714,22 +723,26 @@ export function useUsageAnalytics() {
 
   const refresh = useCallback(() => {
     setNowMs(Date.now());
-    void loadApiKeyAliases();
-    void loadMonitoringMeta();
-    void analytics.refresh({ force: true });
-    void filterSelectorsAnalytics.refresh({ force: true });
-    if (selectedApiKeyTimelineAnalytics.enabled) {
-      void selectedApiKeyTimelineAnalytics.refresh({ force: true });
-    }
-    if (apiKeyTrendAnalytics.enabled) {
-      void apiKeyTrendAnalytics.refresh({ force: true });
-    }
-    if (selectedCredentialTimelineAnalytics.enabled) {
-      void selectedCredentialTimelineAnalytics.refresh({ force: true });
-    }
-    if (selectedHeatmapDate) {
-      void heatmapDateAnalytics.refresh({ force: true });
-    }
+    void Promise.resolve(analytics.refresh({ force: true })).then(() => {
+      // Keep all non-critical work behind the primary response. This also
+      // makes the manual refresh button follow the same scheduling policy as
+      // entering the page from the sidebar.
+      void loadApiKeyAliases();
+      void loadMonitoringMeta();
+      void filterSelectorsAnalytics.refresh({ force: true });
+      if (selectedApiKeyTimelineAnalytics.enabled) {
+        void selectedApiKeyTimelineAnalytics.refresh({ force: true });
+      }
+      if (apiKeyTrendAnalytics.enabled) {
+        void apiKeyTrendAnalytics.refresh({ force: true });
+      }
+      if (selectedCredentialTimelineAnalytics.enabled) {
+        void selectedCredentialTimelineAnalytics.refresh({ force: true });
+      }
+      if (selectedHeatmapDate) {
+        void heatmapDateAnalytics.refresh({ force: true });
+      }
+    });
   }, [
     analytics,
     apiKeyTrendAnalytics,

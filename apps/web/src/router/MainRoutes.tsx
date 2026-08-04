@@ -1,4 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactElement,
+} from 'react';
 import {
   Navigate,
   useLocation,
@@ -6,33 +15,6 @@ import {
   type Location,
   type RouteObject,
 } from 'react-router-dom';
-import { DashboardPage } from '@/pages/DashboardPage';
-import { AiProvidersPage } from '@/pages/AiProvidersPage';
-import { AiProvidersClaudeEditLayout } from '@/pages/AiProvidersClaudeEditLayout';
-import { AiProvidersClaudeEditPage } from '@/pages/AiProvidersClaudeEditPage';
-import { AiProvidersClaudeModelsPage } from '@/pages/AiProvidersClaudeModelsPage';
-import { AiProvidersCodexEditPage } from '@/pages/AiProvidersCodexEditPage';
-import { AiProvidersGeminiEditPage } from '@/pages/AiProvidersGeminiEditPage';
-import { AiProvidersOpenAIEditLayout } from '@/pages/AiProvidersOpenAIEditLayout';
-import { AiProvidersOpenAIEditPage } from '@/pages/AiProvidersOpenAIEditPage';
-import { AiProvidersOpenAIModelsPage } from '@/pages/AiProvidersOpenAIModelsPage';
-import { AiProvidersVertexEditPage } from '@/pages/AiProvidersVertexEditPage';
-import { AuthFilesPage } from '@/pages/AuthFilesPage';
-import { AuthFilesOAuthExcludedEditPage } from '@/pages/AuthFilesOAuthExcludedEditPage';
-import { AuthFilesOAuthModelAliasEditPage } from '@/pages/AuthFilesOAuthModelAliasEditPage';
-import { OAuthPage } from '@/pages/OAuthPage';
-import { QuotaPage } from '@/pages/QuotaPage';
-import { UsageAnalyticsPage } from '@/pages/UsageAnalyticsPage';
-import { MonitoringCenterPage } from '@/pages/MonitoringCenterPage';
-import { AccountActionCandidatesPage } from '@/pages/AccountActionCandidatesPage';
-import { ModelPricesPage } from '@/pages/ModelPricesPage';
-import { CodexInspectionPage } from '@/pages/CodexInspectionPage';
-import { ServerCodexInspectionPage } from '@/pages/ServerCodexInspectionPage';
-import { ConfigPage } from '@/pages/ConfigPage';
-import { LogsPage } from '@/pages/LogsPage';
-import { PluginResourcePage } from '@/pages/PluginResourcePage';
-import { PluginsPage } from '@/pages/PluginsPage';
-import { SystemPage } from '@/pages/SystemPage';
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
 import { CodexInspectionModeTabs } from '@/features/monitoring/components/CodexInspectionModeTabs';
 import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability';
@@ -40,6 +22,102 @@ import { isLogsRouteAvailable } from '@/features/logs/logFeatureAvailability';
 import { ensureRouteBasePathname, isDemoMode } from '@/features/demo/demoMode';
 import { useAuthStore, useConfigStore } from '@/stores';
 import codexInspectionStyles from '@/features/monitoring/CodexInspectionPage.module.scss';
+
+const lazyRouteComponent = <TModule extends object, TName extends keyof TModule>(
+  load: () => Promise<TModule>,
+  name: TName
+) =>
+  lazy(async () => {
+    const routeModule = await load();
+    return { default: routeModule[name] as ComponentType };
+  });
+
+const DashboardPage = lazyRouteComponent(() => import('@/pages/DashboardPage'), 'DashboardPage');
+const AiProvidersPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersPage'),
+  'AiProvidersPage'
+);
+const AiProvidersClaudeEditLayout = lazyRouteComponent(
+  () => import('@/pages/AiProvidersClaudeEditLayout'),
+  'AiProvidersClaudeEditLayout'
+);
+const AiProvidersClaudeEditPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersClaudeEditPage'),
+  'AiProvidersClaudeEditPage'
+);
+const AiProvidersClaudeModelsPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersClaudeModelsPage'),
+  'AiProvidersClaudeModelsPage'
+);
+const AiProvidersCodexEditPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersCodexEditPage'),
+  'AiProvidersCodexEditPage'
+);
+const AiProvidersGeminiEditPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersGeminiEditPage'),
+  'AiProvidersGeminiEditPage'
+);
+const AiProvidersOpenAIEditLayout = lazyRouteComponent(
+  () => import('@/pages/AiProvidersOpenAIEditLayout'),
+  'AiProvidersOpenAIEditLayout'
+);
+const AiProvidersOpenAIEditPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersOpenAIEditPage'),
+  'AiProvidersOpenAIEditPage'
+);
+const AiProvidersOpenAIModelsPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersOpenAIModelsPage'),
+  'AiProvidersOpenAIModelsPage'
+);
+const AiProvidersVertexEditPage = lazyRouteComponent(
+  () => import('@/pages/AiProvidersVertexEditPage'),
+  'AiProvidersVertexEditPage'
+);
+const AuthFilesPage = lazyRouteComponent(() => import('@/pages/AuthFilesPage'), 'AuthFilesPage');
+const AuthFilesOAuthExcludedEditPage = lazyRouteComponent(
+  () => import('@/pages/AuthFilesOAuthExcludedEditPage'),
+  'AuthFilesOAuthExcludedEditPage'
+);
+const AuthFilesOAuthModelAliasEditPage = lazyRouteComponent(
+  () => import('@/pages/AuthFilesOAuthModelAliasEditPage'),
+  'AuthFilesOAuthModelAliasEditPage'
+);
+const OAuthPage = lazyRouteComponent(() => import('@/pages/OAuthPage'), 'OAuthPage');
+const QuotaPage = lazyRouteComponent(() => import('@/pages/QuotaPage'), 'QuotaPage');
+const UsageAnalyticsPage = lazyRouteComponent(
+  () => import('@/pages/UsageAnalyticsPage'),
+  'UsageAnalyticsPage'
+);
+const MonitoringCenterPage = lazyRouteComponent(
+  () => import('@/pages/MonitoringCenterPage'),
+  'MonitoringCenterPage'
+);
+const AccountActionCandidatesPage = lazyRouteComponent(
+  () => import('@/pages/AccountActionCandidatesPage'),
+  'AccountActionCandidatesPage'
+);
+const ModelPricesPage = lazyRouteComponent(
+  () => import('@/pages/ModelPricesPage'),
+  'ModelPricesPage'
+);
+const CodexInspectionPage = lazyRouteComponent(
+  () => import('@/pages/CodexInspectionPage'),
+  'CodexInspectionPage'
+);
+const ServerCodexInspectionPage = lazyRouteComponent(
+  () => import('@/pages/ServerCodexInspectionPage'),
+  'ServerCodexInspectionPage'
+);
+const ConfigPage = lazyRouteComponent(() => import('@/pages/ConfigPage'), 'ConfigPage');
+const LogsPage = lazyRouteComponent(() => import('@/pages/LogsPage'), 'LogsPage');
+const PluginResourcePage = lazyRouteComponent(
+  () => import('@/pages/PluginResourcePage'),
+  'PluginResourcePage'
+);
+const PluginsPage = lazyRouteComponent(() => import('@/pages/PluginsPage'), 'PluginsPage');
+const SystemPage = lazyRouteComponent(() => import('@/pages/SystemPage'), 'SystemPage');
+const OperationsPage = lazyRouteComponent(() => import('@/pages/OperationsPage'), 'OperationsPage');
+const PlaygroundPage = lazyRouteComponent(() => import('@/pages/PlaygroundPage'), 'PlaygroundPage');
 
 type FeatureKey = 'requestMonitoring' | 'modelPrices' | 'serverCodexInspection';
 
@@ -49,7 +127,7 @@ function PluginGate({ children }: { children: ReactElement }) {
     return children;
   }
   if (!supportsPlugin) {
-    return <Navigate to="/" replace />;
+    return <Navigate to="/dashboard" replace />;
   }
   return children;
 }
@@ -79,6 +157,17 @@ function FeatureGate({
     return <Navigate to="/config" replace />;
   }
 
+  return children;
+}
+
+function ManagerServiceGate({ children }: { children: ReactElement }) {
+  const availability = usePanelFeatureAvailability();
+  if (availability.checking) {
+    return <LoadingSpinner />;
+  }
+  if (!availability.managerServiceAvailable) {
+    return <Navigate to="/system" replace />;
+  }
   return children;
 }
 
@@ -150,8 +239,9 @@ function LogsGate({ children }: { children: ReactElement }) {
 }
 
 const mainRoutes: RouteObject[] = [
-  { path: '/', element: <DashboardPage /> },
+  { path: '/', element: <Navigate to="/dashboard" replace /> },
   { path: '/dashboard', element: <DashboardPage /> },
+  { path: '/playground', element: <PlaygroundPage /> },
   { path: '/settings', element: <Navigate to="/config" replace /> },
   { path: '/api-keys', element: <Navigate to="/config" replace /> },
   { path: '/ai-providers/gemini/new', element: <AiProvidersGeminiEditPage /> },
@@ -286,7 +376,7 @@ const mainRoutes: RouteObject[] = [
   },
   { path: '/plugins/*', element: <Navigate to="/plugins" replace /> },
   { path: '/plugin-store/*', element: <Navigate to="/plugins?tab=store" replace /> },
-  { path: '/plugin-pages/*', element: <Navigate to="/" replace /> },
+  { path: '/plugin-pages/*', element: <Navigate to="/dashboard" replace /> },
   { path: '/config', element: <ConfigPage /> },
   {
     path: '/logs',
@@ -297,7 +387,15 @@ const mainRoutes: RouteObject[] = [
     ),
   },
   { path: '/system', element: <SystemPage /> },
-  { path: '*', element: <Navigate to="/" replace /> },
+  {
+    path: '/operations',
+    element: (
+      <ManagerServiceGate>
+        <OperationsPage />
+      </ManagerServiceGate>
+    ),
+  },
+  { path: '*', element: <Navigate to="/dashboard" replace /> },
 ];
 
 const ensureRouteLocationBase = (
@@ -315,17 +413,13 @@ const ensureRouteLocationBase = (
   };
 };
 
-export function MainRoutes({
-  location,
-  routeBase,
-}: {
-  location?: Location;
-  routeBase?: string;
-}) {
+export function MainRoutes({ location, routeBase }: { location?: Location; routeBase?: string }) {
   const routeLocation = useMemo(
     () => ensureRouteLocationBase(location, routeBase),
     [location, routeBase]
   );
 
-  return useRoutes(mainRoutes, routeLocation);
+  const routeElement = useRoutes(mainRoutes, routeLocation);
+
+  return <Suspense fallback={<LoadingSpinner />}>{routeElement}</Suspense>;
 }

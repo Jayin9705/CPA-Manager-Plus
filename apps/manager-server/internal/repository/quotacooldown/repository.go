@@ -112,11 +112,12 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 		}
 	}
 	if !found {
-		res, execErr := tx.ExecContext(ctx, `insert into quota_cooldowns (
+		execErr := tx.QueryRowContext(ctx, `insert into quota_cooldowns (
 			auth_file_name, auth_index, account_snapshot, provider, reason_code, window_kind, evidence_json, recover_at_ms,
 			owner, event_hash, pre_disabled_state, status, disabled_at_ms,
 			created_at_ms, updated_at_ms
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		returning id`,
 			cooldown.AuthFileName,
 			nullString(cooldown.AuthIndex),
 			nullString(cooldown.AccountSnapshot),
@@ -132,13 +133,9 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 			cooldown.DisabledAtMS,
 			now,
 			now,
-		)
+		).Scan(&id)
 		if execErr != nil {
 			return model.QuotaCooldown{}, execErr
-		}
-		id, err = res.LastInsertId()
-		if err != nil {
-			return model.QuotaCooldown{}, err
 		}
 	} else {
 		_, err = tx.ExecContext(ctx, `update quota_cooldowns set
@@ -157,12 +154,12 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 				when ? >= recover_at_ms then coalesce(nullif(?, ''), evidence_json)
 				else evidence_json
 			end,
-			recover_at_ms = max(recover_at_ms, ?),
+			recover_at_ms = case when recover_at_ms >= ? then recover_at_ms else ? end,
 			event_hash = case
 				when ? >= recover_at_ms then coalesce(nullif(?, ''), event_hash)
 				else event_hash
 			end,
-			disabled_at_ms = min(disabled_at_ms, ?),
+			disabled_at_ms = case when disabled_at_ms <= ? then disabled_at_ms else ? end,
 			last_error = null,
 			updated_at_ms = ?
 		where id = ?`,
@@ -177,7 +174,9 @@ func (r *repository) UpsertActive(ctx context.Context, cooldown model.QuotaCoold
 			cooldown.EvidenceJSON,
 			cooldown.RecoverAtMS,
 			cooldown.RecoverAtMS,
+			cooldown.RecoverAtMS,
 			cooldown.EventHash,
+			cooldown.DisabledAtMS,
 			cooldown.DisabledAtMS,
 			now,
 			id,

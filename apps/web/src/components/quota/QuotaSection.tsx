@@ -38,6 +38,10 @@ import {
   type QuotaAccountDisplayMode,
   type QuotaSectionViewMode,
 } from '@/features/quota/quotaPageUiState';
+import {
+  getQuotaWeeklyUsageTargetKey,
+  type QuotaWeeklyUsageLookup,
+} from '@/features/quota/quotaWeeklyUsage';
 import { useGridColumns } from './useGridColumns';
 import { IconEye, IconEyeOff, IconRefreshCw } from '@/components/ui/icons';
 import styles from '@/features/quota/QuotaPage.module.scss';
@@ -136,6 +140,9 @@ interface QuotaSectionProps<TState extends QuotaStatusState, TData> {
   accountDisplayMode?: QuotaAccountDisplayMode;
   onAccountDisplayModeChange?: (mode: QuotaAccountDisplayMode) => void;
   headerSnapshotLookup?: UsageHeaderSnapshotLookup;
+  weeklyUsageByKey?: QuotaWeeklyUsageLookup;
+  weeklyUsageLoading?: boolean;
+  weeklyUsageError?: string;
 }
 
 export function QuotaSection<TState extends QuotaStatusState, TData>({
@@ -151,6 +158,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
   accountDisplayMode,
   onAccountDisplayModeChange,
   headerSnapshotLookup,
+  weeklyUsageByKey = {},
+  weeklyUsageLoading = false,
+  weeklyUsageError = '',
 }: QuotaSectionProps<TState, TData>) {
   const { t } = useTranslation();
   const resolvedTheme: ResolvedTheme = useThemeStore((state) => state.resolvedTheme);
@@ -390,10 +400,7 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
             ...prev,
             [storeKey]: config.buildSuccessState(data, file),
           }));
-          showNotification(
-            t('auth_files.quota_refresh_success', { name: displayName }),
-            'success'
-          );
+          showNotification(t('auth_files.quota_refresh_success', { name: displayName }), 'success');
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : t('common.unknown_error');
@@ -635,6 +642,9 @@ export function QuotaSection<TState extends QuotaStatusState, TData>({
                   canReauth={canReauth}
                   onReauth={canReauth ? () => onReauthAccount?.(item) : undefined}
                   renderQuotaItems={config.renderQuotaItems}
+                  weeklyUsage={weeklyUsageByKey[getQuotaWeeklyUsageTargetKey(config.type, item)]}
+                  weeklyUsageLoading={weeklyUsageLoading}
+                  weeklyUsageError={weeklyUsageError}
                 />
               );
             })}

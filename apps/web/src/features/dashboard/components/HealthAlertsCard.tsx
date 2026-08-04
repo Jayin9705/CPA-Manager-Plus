@@ -155,7 +155,7 @@ export function HealthAlertsCard({
   return (
     <>
       {/* 1. 渠道健康状态 */}
-      <section className={styles.dataCard}>
+      <section className={`${styles.dataCard} dashboard-data-card`}>
         <div className={styles.cardHeader}>
           <h3>{t('dashboard.channel_health_status')}</h3>
         </div>
@@ -191,7 +191,7 @@ export function HealthAlertsCard({
       </section>
 
       {/* 2. 最近失败请求 */}
-      <section className={styles.dataCard}>
+      <section className={`${styles.dataCard} dashboard-data-card`}>
         <div className={styles.cardHeader}>
           <h3>{t('dashboard.recent_failed_requests')}</h3>
         </div>

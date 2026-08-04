@@ -15,6 +15,7 @@ import (
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/datamigration"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/deadletter"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/modelprice"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/postgrescore"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/quotacooldown"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/setting"
 	sqliterepo "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/sqlite"
@@ -137,6 +138,31 @@ func Open(path string, protector ...*security.Protector) (*Store, error) {
 		return nil, err
 	}
 	return New(db, protector...), nil
+}
+
+// OpenPostgres opens the durable Manager Server core store. Usage events and
+// their legacy SQLite migration/rollup repositories are intentionally not
+// attached: callers must use the PostgreSQL usage readers and Redis stream
+// pipeline for those paths.
+func OpenPostgres(ctx context.Context, dsn string, protector ...*security.Protector) (*Store, error) {
+	db, err := postgrescore.Open(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return newPostgres(db, protector...), nil
+}
+
+func newPostgres(db *sql.DB, protector ...*security.Protector) *Store {
+	return &Store{
+		db:               db,
+		Settings:         setting.NewPostgres(db, protector...),
+		DeadLetters:      deadletter.New(db),
+		ModelPrices:      modelprice.New(db),
+		APIKeyAliases:    apikeyalias.New(db),
+		AccountActions:   accountaction.New(db),
+		CodexInspections: codexinspection.NewPostgres(db),
+		QuotaCooldowns:   quotacooldown.New(db),
+	}
 }
 
 func New(db *sql.DB, protector ...*security.Protector) *Store {
@@ -385,6 +411,12 @@ func (s *Store) InsertEvents(ctx context.Context, events []usage.Event) (InsertR
 }
 
 func (s *Store) UsageCacheAccountingMigrationState(ctx context.Context) (DataMigrationState, error) {
+	if s == nil || s.DataMigrations == nil {
+		return DataMigrationState{
+			Name:   datamigration.UsageCacheAccountingMigrationName,
+			Status: datamigration.StatusCompleted,
+		}, nil
+	}
 	state, found, err := s.DataMigrations.UsageCacheAccountingState(ctx)
 	if err != nil {
 		return DataMigrationState{}, err

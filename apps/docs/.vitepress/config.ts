@@ -64,6 +64,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
       { text: '原生包后台控制', link: '/deployment/native-background-control' },
       { text: '反向代理', link: '/deployment/reverse-proxy' },
       { text: 'Manager Server', link: '/operations/manager-server' },
+      { text: 'CPA + Redis + PostgreSQL 架构与安装', link: '/operations/cpa-redis-postgresql' },
       { text: '准备 CPA 网关', link: '/gateway/configuration' },
       { text: '客户端接入', link: '/gateway/clients' },
       { text: '配置与数据目录', link: '/operations/configuration' },

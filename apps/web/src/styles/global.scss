@@ -8,6 +8,7 @@
 @use './themes.scss';
 @use './components.scss';
 @use './layout.scss';
+@use './separated-console.scss';
 
 body {
   background-color: var(--app-bg);
@@ -17,11 +18,28 @@ body {
     color $transition-normal;
 }
 
+:where(button, a, input, textarea, select):focus-visible {
+  outline: 3px solid var(--focus-ring, #2563eb);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
 html,
 body,
 #root {
   width: 100%;
   min-height: 100%;
+  overflow-x: hidden;
 }
 
 html.modal-open,
@@ -37,6 +55,120 @@ body.modal-open .content {
   position: relative;
   z-index: 1;
   min-height: 100%;
+}
+
+.runtime-config-error {
+  display: grid;
+  min-height: 100svh;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg-canvas, #f8fafc);
+  color: var(--text-primary, #0f172a);
+}
+
+.runtime-config-error__card {
+  width: min(100%, 520px);
+  padding: 32px;
+  border: 1px solid var(--border-subtle, #e2e8f0);
+  border-radius: 16px;
+  background: var(--bg-surface, #fff);
+  box-shadow: 0 16px 48px rgb(15 23 42 / 10%);
+}
+
+.runtime-config-error__eyebrow {
+  margin-bottom: 8px;
+  color: var(--brand, #1d4ed8);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.runtime-config-error h1 {
+  margin-bottom: 12px;
+  font-size: clamp(24px, 5vw, 32px);
+  line-height: 1.2;
+}
+
+.runtime-config-error__hint {
+  margin-top: 12px;
+  color: var(--text-secondary, #475569);
+}
+
+.route-loading {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 100svh;
+  overflow: hidden;
+  padding: 20px;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(93, 202, 246, 0.2), transparent 34%),
+    linear-gradient(135deg, #f8fcff 0%, #f1f8fd 54%, #e7f3fb 100%);
+
+  &::before {
+    display: grid;
+    width: min(320px, calc(100vw - 40px));
+    height: 176px;
+    padding-bottom: 42px;
+    place-items: center;
+    border: 1px solid rgba(72, 135, 181, 0.28);
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.76);
+    box-shadow:
+      0 30px 90px rgba(27, 80, 112, 0.18),
+      0 0 0 1px rgba(255, 255, 255, 0.48) inset;
+    color: #102a40;
+    content: 'JAY AI';
+    font-family:
+      'Space Grotesk', 'Inter', 'SF Pro Display', 'Segoe UI Variable', 'PingFang SC',
+      'Microsoft YaHei', sans-serif;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+
+  &::after {
+    position: absolute;
+    top: calc(50% + 22px);
+    left: calc(50% - 13px);
+    width: 26px;
+    height: 26px;
+    border: 2px solid rgba(27, 128, 180, 0.18);
+    border-top-color: #1ba9e5;
+    border-radius: 50%;
+    content: '';
+    animation: route-loading-spin 0.8s linear infinite;
+  }
+}
+
+@keyframes route-loading-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .route-loading {
+    background:
+      radial-gradient(circle at 50% 38%, rgba(41, 184, 232, 0.14), transparent 36%),
+      linear-gradient(135deg, #07111b 0%, #0a1724 54%, #0d1830 100%);
+
+    &::before {
+      border-color: rgba(91, 177, 219, 0.24);
+      background: rgba(10, 24, 38, 0.82);
+      box-shadow:
+        0 30px 90px rgba(0, 0, 0, 0.36),
+        0 0 0 1px rgba(118, 212, 245, 0.06) inset;
+      color: #e7f8ff;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .route-loading::after {
+    animation-duration: 1.8s;
+  }
 }
 
 // 滚动条样式
@@ -91,4 +223,18 @@ body.modal-open .content {
 .fade-exit-active {
   opacity: 0;
   transition: opacity $transition-normal;
+}
+
+@media (max-width: $breakpoint-mobile) {
+  .notification-container {
+    right: 12px;
+    left: 12px;
+    max-width: none;
+  }
+
+  .notification .close-btn {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+  }
 }

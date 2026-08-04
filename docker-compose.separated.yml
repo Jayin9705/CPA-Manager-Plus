@@ -1,0 +1,46 @@
+# Optional deployment manifests. The console can be served in parallel, but do
+# not start cpamp-api against the live Redis Stream/CPA while the existing
+# Manager worker is running: that would create a second collector/persist
+# consumer. Build it now and activate it only during the planned backend
+# cutover (or point it at an isolated test data plane).
+services:
+  cpamp-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.manager-server-api
+      args:
+        VERSION: ${CPAMP_API_VERSION:-dev}
+        COMMIT: ${CPAMP_API_COMMIT:-none}
+        BUILD_DATE: ${CPAMP_API_BUILD_DATE:-unknown}
+    profiles: [separated-api]
+    ports:
+      - '${CPAMP_API_BIND_ADDRESS:-127.0.0.1}:${CPAMP_API_PORT:-18318}:18317'
+    env_file:
+      - ${CPAMP_API_ENV_FILE:-deploy/separated/api.env.example}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:18317/readyz']
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  cpamp-console:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        VERSION: ${CPAMP_WEB_VERSION:-dev}
+    profiles: [separated]
+    ports:
+      - '${CPAMP_CONSOLE_BIND_ADDRESS:-127.0.0.1}:${CPAMP_CONSOLE_PORT:-18080}:8080'
+    volumes:
+      - ${CPAMP_RUNTIME_CONFIG_FILE:-./deploy/separated/runtime-config.json.example}:/usr/share/nginx/html/runtime-config.json:ro
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped

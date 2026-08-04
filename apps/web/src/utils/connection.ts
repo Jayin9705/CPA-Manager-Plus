@@ -1,4 +1,5 @@
 import { DEFAULT_API_PORT, MANAGEMENT_API_PREFIX } from './constants';
+import { getRuntimeApiOrigin, isSeparatedSite } from '@/config/runtimeConfig';
 
 export const DEFAULT_DOCKER_CPA_BASE_URL = 'http://host.docker.internal:8317';
 
@@ -45,12 +46,20 @@ export const resolveDefaultCPAConnectionBase = (options?: {
 };
 
 export const detectApiBaseFromLocation = (): string => {
+  const runtimeOrigin = getRuntimeApiOrigin();
+  if (runtimeOrigin) return normalizeApiBase(runtimeOrigin);
+  if (isSeparatedSite()) {
+    // A separated build must never silently fall back to the page origin or a
+    // localhost port when its deployment configuration is missing.
+    return '';
+  }
   try {
     const { protocol, hostname, port } = window.location;
     const normalizedPort = port ? `:${port}` : '';
     return normalizeApiBase(`${protocol}//${hostname}${normalizedPort}`);
   } catch (error) {
-    console.warn('Failed to detect api base from location, fallback to default', error);
+    console.warn('Failed to detect api base from location', error);
+    if (isSeparatedSite()) return '';
     return normalizeApiBase(`http://localhost:${DEFAULT_API_PORT}`);
   }
 };

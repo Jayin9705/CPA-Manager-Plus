@@ -20,6 +20,7 @@ import { configApi, versionApi } from '@/services/api';
 import type { UsageServiceStatus } from '@/services/api/usageService';
 import type { ConnectionStatus } from '@/types';
 import { compareVersions, type VersionComparison } from '@/utils/version';
+import { formatServerBuildDate } from '@/utils/serverMetadata';
 import { readApiLatestVersion, readManagerLatestTag } from '@/features/system/versionChecks';
 import styles from './VersionCard.module.scss';
 
@@ -304,9 +305,8 @@ export function VersionCard({
     [apiVersion, latest.latestApi, t]
   );
 
-  const buildTimeDisplay = serverBuildDate
-    ? new Date(serverBuildDate).toLocaleString(i18n.language)
-    : t('dashboard.version_unknown');
+  const buildTimeDisplay =
+    formatServerBuildDate(serverBuildDate, i18n.language) || t('dashboard.version_unknown');
 
   const collector = collectorStatus?.collector;
   const collectorLastError = collector?.lastError?.trim() || '';
@@ -395,7 +395,7 @@ export function VersionCard({
   const healthItems = [usageState, collectorState, queueState, errorLogState];
 
   return (
-    <div className={styles.container}>
+    <div className={`${styles.container} dashboard-version-card`}>
       <section className={styles.section}>
         <h2 className={styles.heading}>{t('dashboard.system_overview')}</h2>
         <div className={`${styles.grid} ${styles.systemGrid}`}>

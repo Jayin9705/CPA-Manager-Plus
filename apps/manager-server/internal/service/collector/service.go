@@ -67,14 +67,20 @@ func RuntimeConfigFromManagerConfigWithFallback(managerCfg store.ManagerConfig, 
 		batchSize = base.BatchSize
 	}
 	return collectorpkg.RuntimeConfig{
-		CPAUpstreamURL: managerCfg.CPAConnection.CPABaseURL,
-		ManagementKey:  managerCfg.CPAConnection.ManagementKey,
-		CollectorMode:  valueOr(managerCfg.Collector.CollectorMode, base.CollectorMode),
-		Queue:          valueOr(managerCfg.Collector.Queue, base.Queue),
-		PopSide:        valueOr(managerCfg.Collector.PopSide, base.PopSide),
-		BatchSize:      batchSize,
-		PollInterval:   pollInterval,
-		TLSSkipVerify:  managerCfg.Collector.TLSSkipVerify,
+		CPAUpstreamURL:     managerCfg.CPAConnection.CPABaseURL,
+		ManagementKey:      managerCfg.CPAConnection.ManagementKey,
+		CollectorMode:      valueOr(managerCfg.Collector.CollectorMode, base.CollectorMode),
+		Queue:              valueOr(managerCfg.Collector.Queue, base.Queue),
+		PopSide:            valueOr(managerCfg.Collector.PopSide, base.PopSide),
+		BatchSize:          batchSize,
+		PollInterval:       pollInterval,
+		TLSSkipVerify:      managerCfg.Collector.TLSSkipVerify,
+		UsageSink:          base.UsageSink,
+		UsageRedisAddr:     base.UsageRedisAddr,
+		UsageRedisPassword: base.UsageRedisPassword,
+		UsageRedisDB:       base.UsageRedisDB,
+		UsageRedisStream:   base.UsageRedisStream,
+		UsageRedisGroup:    base.UsageRedisGroup,
 	}
 }
 

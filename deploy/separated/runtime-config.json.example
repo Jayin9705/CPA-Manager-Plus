@@ -1,0 +1,7 @@
+{
+  "mode": "full",
+  "apiOrigin": "http://localhost:18318",
+  "oauthReturnOrigin": "http://localhost:18080",
+  "pluginRuntimeOrigin": "http://localhost:18080",
+  "environmentName": "parallel-validation"
+}

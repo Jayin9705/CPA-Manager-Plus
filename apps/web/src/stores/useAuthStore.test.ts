@@ -28,6 +28,9 @@ const fetchConfigMock = vi.fn();
 const clearConfigCacheMock = vi.fn();
 const clearModelsCacheMock = vi.fn();
 const usageServiceGetManagerConfigMock = vi.fn();
+const usageServiceLoginMock = vi.fn();
+const usageServiceGetSessionMock = vi.fn();
+const usageServiceLogoutMock = vi.fn();
 
 vi.mock('@/services/api/client', () => ({
   apiClient: {
@@ -61,6 +64,9 @@ vi.mock('@/services/api/usageService', async () => {
     usageServiceApi: {
       ...actual.usageServiceApi,
       getManagerConfig: usageServiceGetManagerConfigMock,
+      login: usageServiceLoginMock,
+      getSession: usageServiceGetSessionMock,
+      logout: usageServiceLogoutMock,
     },
   };
 });
@@ -75,6 +81,10 @@ describe('useAuthStore logout', () => {
     clearConfigCacheMock.mockClear();
     clearModelsCacheMock.mockClear();
     usageServiceGetManagerConfigMock.mockReset();
+    usageServiceLoginMock.mockReset();
+    usageServiceGetSessionMock.mockReset();
+    usageServiceLogoutMock.mockReset();
+    usageServiceLogoutMock.mockResolvedValue(undefined);
     storage = createMemoryStorage();
     vi.stubGlobal('localStorage', storage);
   });
@@ -106,7 +116,7 @@ describe('useAuthStore logout', () => {
     });
     storage.setItem('isLoggedIn', 'true');
 
-    useAuthStore.getState().logout();
+    await useAuthStore.getState().logout();
 
     expect(useUsageServiceStore.getState()).toMatchObject({
       enabled: false,
@@ -114,7 +124,11 @@ describe('useAuthStore logout', () => {
       panelBase: '',
       panelHostMode: '',
     });
-    expect(apiClientSetConfig).toHaveBeenCalledWith({ apiBase: '', managementKey: '' });
+    expect(apiClientSetConfig).toHaveBeenCalledWith({
+      apiBase: '',
+      managementKey: '',
+      withCredentials: false,
+    });
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: false,
       apiBase: '',
@@ -122,6 +136,40 @@ describe('useAuthStore logout', () => {
       connectionStatus: 'disconnected',
     });
     expect(storage.getItem('isLoggedIn')).toBeNull();
+  });
+
+  it('revokes the Manager cookie session on logout', async () => {
+    const { useAuthStore } = await import('./useAuthStore');
+    let resolveLogout!: () => void;
+    usageServiceLogoutMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveLogout = resolve;
+        })
+    );
+    useAuthStore.setState({
+      isAuthenticated: true,
+      apiBase: 'http://manager.local:18317',
+      managementKey: '',
+      sessionMode: 'manager_embedded',
+    });
+
+    const logoutPromise = useAuthStore.getState().logout();
+
+    await Promise.resolve();
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+
+    resolveLogout();
+    await logoutPromise;
+
+    expect(usageServiceLogoutMock).toHaveBeenCalledWith('http://manager.local:18317');
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: false,
+      apiBase: '',
+      managementKey: '',
+      rememberPassword: false,
+      sessionMode: '',
+    });
   });
 });
 
@@ -135,6 +183,15 @@ describe('useAuthStore manager embedded login recovery', () => {
     clearConfigCacheMock.mockClear();
     clearModelsCacheMock.mockClear();
     usageServiceGetManagerConfigMock.mockReset();
+    usageServiceLoginMock.mockReset();
+    usageServiceGetSessionMock.mockReset();
+    usageServiceLogoutMock.mockReset();
+    usageServiceLoginMock.mockResolvedValue({
+      authenticated: true,
+      user: { id: 1, email: 'admin@example.com' },
+      expiresAt: Date.now() + 60_000,
+    });
+    usageServiceLogoutMock.mockResolvedValue(undefined);
     storage = createMemoryStorage();
     vi.stubGlobal('localStorage', storage);
   });
@@ -144,7 +201,7 @@ describe('useAuthStore manager embedded login recovery', () => {
     vi.clearAllMocks();
   });
 
-  it('allows Manager Server admin login to recover when the saved CPA key can no longer fetch CPA config', async () => {
+  it('uses a cookie session for Manager login and recovers through Manager config', async () => {
     fetchConfigMock.mockRejectedValue(new Error('invalid management key'));
     usageServiceGetManagerConfigMock.mockResolvedValue({
       config: {
@@ -174,21 +231,24 @@ describe('useAuthStore manager embedded login recovery', () => {
 
     const result = await useAuthStore.getState().login({
       apiBase: 'http://manager.local:18317',
-      managementKey: 'manager-admin-key',
+      email: 'admin@example.com',
+      password: 'legacy-sub2-password',
       rememberPassword: true,
       sessionMode: 'manager_embedded',
       sessionPanelBase: 'http://manager.local:18317',
     });
 
+    expect(usageServiceLoginMock).toHaveBeenCalledWith('http://manager.local:18317', {
+      email: 'admin@example.com',
+      password: 'legacy-sub2-password',
+      remember: true,
+    });
     expect(result).toEqual({ recoveryMode: 'manager_config' });
-    expect(usageServiceGetManagerConfigMock).toHaveBeenCalledWith(
-      'http://manager.local:18317',
-      'manager-admin-key'
-    );
+    expect(usageServiceGetManagerConfigMock).toHaveBeenCalledWith('http://manager.local:18317');
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: true,
       apiBase: 'http://manager.local:18317',
-      managementKey: 'manager-admin-key',
+      managementKey: '',
       sessionMode: 'manager_embedded',
       connectionStatus: 'connected',
     });
@@ -198,7 +258,12 @@ describe('useAuthStore manager embedded login recovery', () => {
       panelBase: 'http://manager.local:18317',
       panelHostMode: 'manager_embedded',
     });
-    expect(storage.getItem('isLoggedIn')).toBe('true');
+    expect(storage.getItem('isLoggedIn')).toBeNull();
+    expect(apiClientSetConfig).toHaveBeenCalledWith({
+      apiBase: 'http://manager.local:18317',
+      managementKey: '',
+      withCredentials: true,
+    });
     expect(clearConfigCacheMock).toHaveBeenCalled();
   });
 
@@ -219,6 +284,36 @@ describe('useAuthStore manager embedded login recovery', () => {
     expect(useAuthStore.getState()).toMatchObject({
       isAuthenticated: false,
       connectionStatus: 'error',
+    });
+  });
+
+  it('restores a Manager session from the HttpOnly cookie without a stored key', async () => {
+    fetchConfigMock.mockResolvedValue(undefined);
+    usageServiceGetSessionMock.mockResolvedValue({
+      authenticated: true,
+      user: { id: 1, email: 'admin@example.com' },
+      expiresAt: Date.now() + 60_000,
+    });
+    const { useAuthStore } = await import('./useAuthStore');
+    useAuthStore.setState({
+      apiBase: 'http://manager.local:18317',
+      managementKey: '',
+      sessionMode: 'manager_embedded',
+      sessionPanelBase: 'http://manager.local:18317',
+    });
+
+    const result = await useAuthStore.getState().restoreSession({
+      expectedMode: 'manager_embedded',
+      expectedPanelBase: 'http://manager.local:18317',
+    });
+
+    expect(result).toEqual({});
+    expect(usageServiceGetSessionMock).toHaveBeenCalledWith('http://manager.local:18317');
+    expect(usageServiceLoginMock).not.toHaveBeenCalled();
+    expect(useAuthStore.getState()).toMatchObject({
+      isAuthenticated: true,
+      managementKey: '',
+      sessionMode: 'manager_embedded',
     });
   });
 });

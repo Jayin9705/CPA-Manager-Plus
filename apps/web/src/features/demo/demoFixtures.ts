@@ -38,6 +38,7 @@ type DemoApiCallPayload = {
   method?: string;
   url?: string;
   authIndex?: string;
+  data?: string;
 };
 
 const clone = <T>(value: T): T => {
@@ -4399,6 +4400,53 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
         'x-request-id': ['demo-forbidden-request'],
       },
       body: JSON.stringify({ error: { code: 16, message: 'Forbidden' } }),
+    };
+  }
+
+  if (requestUrl.includes('/v1/chat/completions')) {
+    return {
+      status_code: 200,
+      has_status_code: true,
+      header: {
+        'content-type': ['application/json'],
+        'x-request-id': ['demo-playground-chat'],
+      },
+      body: JSON.stringify({
+        id: 'chatcmpl-demo-playground',
+        object: 'chat.completion',
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content:
+                '这是演示站的模拟回复。真实环境中，这条消息会通过 Manager Server 的 api-call 代理到 CPA。',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+      }),
+    };
+  }
+
+  if (requestUrl.includes('/v1/images/generations')) {
+    return {
+      status_code: 200,
+      has_status_code: true,
+      header: {
+        'content-type': ['application/json'],
+        'x-request-id': ['demo-playground-image'],
+      },
+      body: JSON.stringify({
+        created: Math.floor(Date.now() / 1000),
+        data: [
+          {
+            b64_json:
+              'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+            revised_prompt: 'A one-pixel demo image returned by CPA Manager Plus.',
+          },
+        ],
+      }),
     };
   }
 
