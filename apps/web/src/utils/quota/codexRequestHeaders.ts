@@ -29,3 +29,10 @@ export const buildCodexResetCreditsRequestHeaders = (
   'OpenAI-Beta': 'codex-1',
   Originator: 'Codex Desktop',
 });
+
+export const buildCodexAccountsCheckRequestHeaders = (
+  accountId?: string | null
+): Record<string, string> => ({
+  ...buildCodexUsageRequestHeaders(accountId),
+  Accept: 'application/json',
+});

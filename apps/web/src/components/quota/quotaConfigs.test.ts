@@ -6,8 +6,10 @@ import type { ClaudeQuotaState, CodexQuotaState, XaiQuotaState } from '@/types';
 import type { QuotaRenderHelpers } from './QuotaCard';
 import {
   CLAUDE_CONFIG,
+  CODEX_CONFIG,
   getCodexQuotaStoreKey,
   getSortedCodexResetCreditExpiries,
+  resolveCodexEntitlementExpiryInfo,
   resolveQuotaDisplayState,
   XAI_CONFIG,
 } from './quotaConfigs';
@@ -85,6 +87,140 @@ describe('getSortedCodexResetCreditExpiries', () => {
       new Date('2026-07-18T08:31:33Z').getTime(),
       new Date('2026-07-19T00:42:09Z').getTime(),
     ]);
+  });
+});
+
+describe('resolveCodexEntitlementExpiryInfo', () => {
+  const expiresAtMs = Date.UTC(2026, 7, 31, 16, 30, 0);
+  const activeNowMs = Date.UTC(2026, 7, 1, 0, 0, 0);
+
+  it('normalizes ISO dates and Unix timestamps in seconds or milliseconds', () => {
+    expect(resolveCodexEntitlementExpiryInfo('2026-08-31T16:30:00Z', activeNowMs)).toEqual({
+      expiresAtMs,
+      isExpired: false,
+    });
+    expect(resolveCodexEntitlementExpiryInfo(expiresAtMs / 1000, activeNowMs)).toEqual({
+      expiresAtMs,
+      isExpired: false,
+    });
+    expect(resolveCodexEntitlementExpiryInfo(String(expiresAtMs), activeNowMs)).toEqual({
+      expiresAtMs,
+      isExpired: false,
+    });
+  });
+
+  it('marks elapsed entitlements as expired and rejects missing or invalid values', () => {
+    expect(resolveCodexEntitlementExpiryInfo(expiresAtMs, expiresAtMs)).toEqual({
+      expiresAtMs,
+      isExpired: true,
+    });
+    expect(resolveCodexEntitlementExpiryInfo(null, activeNowMs)).toBeNull();
+    expect(resolveCodexEntitlementExpiryInfo('not-a-date', activeNowMs)).toBeNull();
+    expect(resolveCodexEntitlementExpiryInfo('0', activeNowMs)).toBeNull();
+  });
+});
+
+describe('CODEX_CONFIG.renderQuotaItems entitlement expiry', () => {
+  const helpers: QuotaRenderHelpers = {
+    styles: new Proxy(
+      {},
+      {
+        get: (_target, property) => String(property),
+      }
+    ) as QuotaRenderHelpers['styles'],
+    QuotaProgressBar: ({ percent }) =>
+      React.createElement('div', { className: 'progress', 'data-percent': percent }),
+  };
+  const t = ((key: string) =>
+    ({
+      'codex_quota.entitlement_expiry_label': 'Entitlement expiry',
+      'codex_quota.entitlement_expiry_active': 'Active',
+      'codex_quota.entitlement_expiry_expired': 'Expired',
+      'codex_quota.entitlement_expiry_unavailable': 'Not provided',
+      'codex_quota.empty_windows': 'No quota data available',
+      'codex_quota.plan_label': 'Plan',
+      'codex_quota.plan_plus': 'Plus',
+    })[key] ?? key) as TFunction;
+
+  it('shows the account entitlement expiry as a semantic time with a text status', () => {
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(
+        React.createElement(
+          React.Fragment,
+          null,
+          CODEX_CONFIG.renderQuotaItems(
+            {
+              status: 'success',
+              windows: [],
+              planType: 'plus',
+              subscriptionActiveUntil: '2099-08-31T16:30:00Z',
+            },
+            t,
+            helpers
+          )
+        )
+      );
+    });
+
+    const output = JSON.stringify(renderer.toJSON());
+    const time = renderer.root.findByType('time');
+    expect(time.props.dateTime).toBe('2099-08-31T16:30:00.000Z');
+    expect(output).toContain('Entitlement expiry');
+    expect(output).toContain('Active');
+  });
+
+  it('keeps the expiry row visible when the provider does not return a date', () => {
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(
+        React.createElement(
+          React.Fragment,
+          null,
+          CODEX_CONFIG.renderQuotaItems(
+            {
+              status: 'success',
+              windows: [],
+              planType: 'plus',
+              subscriptionActiveUntil: null,
+            },
+            t,
+            helpers
+          )
+        )
+      );
+    });
+
+    const output = JSON.stringify(renderer.toJSON());
+    expect(renderer.root.findAllByType('time')).toHaveLength(0);
+    expect(output).toContain('Entitlement expiry');
+    expect(output).toContain('Not provided');
+  });
+
+  it('labels an elapsed entitlement as expired instead of relying on color alone', () => {
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(
+        React.createElement(
+          React.Fragment,
+          null,
+          CODEX_CONFIG.renderQuotaItems(
+            {
+              status: 'success',
+              windows: [],
+              planType: 'plus',
+              subscriptionActiveUntil: '2000-01-01T00:00:00Z',
+            },
+            t,
+            helpers
+          )
+        )
+      );
+    });
+
+    const output = JSON.stringify(renderer.toJSON());
+    expect(output).toContain('Expired');
+    expect(output).toContain('entitlementExpiryStatusExpired');
   });
 });
 
@@ -314,6 +450,7 @@ describe('resolveQuotaDisplayState', () => {
       status: 'success',
       fetchedAtMs: 1_000,
       planType: 'plus',
+      subscriptionActiveUntil: '2026-08-31T16:30:00Z',
       windows: [
         {
           id: 'five-hour',
@@ -376,6 +513,7 @@ describe('resolveQuotaDisplayState', () => {
     expect(result.observedAtMs).toBe(2_000);
     expect(result.observedFromUsageHeaders).toBe(true);
     expect(result.observedResetCreditsUnknown).toBeUndefined();
+    expect(result.subscriptionActiveUntil).toBe('2026-08-31T16:30:00Z');
     expect(result.rateLimitResetCreditsAvailableCount).toBe(2);
     expect(result.rateLimitResetCredits).toHaveLength(1);
     expect(result.windows.map((window) => window.id)).toEqual([

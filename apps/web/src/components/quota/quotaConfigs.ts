@@ -56,6 +56,7 @@ import {
 } from '@/utils/usageHeaderSnapshots';
 import { normalizeAuthIndex } from '@/utils/authIndex';
 import { formatXaiBillingDiagnostics } from '@/utils/quota/xaiPresentation';
+import { parseTimestampMs } from '@/utils/timestamp';
 import type { QuotaRenderHelpers } from './QuotaCard';
 import styles from '@/features/quota/QuotaPage.module.scss';
 
@@ -661,6 +662,136 @@ type CodexQuotaTooltipRow = {
   value: string;
 };
 
+export type CodexEntitlementExpiryInfo = {
+  expiresAtMs: number;
+  isExpired: boolean;
+};
+
+const parseCodexEntitlementExpiryMs = (value: string | number): number | null => {
+  const normalized = String(value).trim();
+  if (!normalized) return null;
+
+  const numericPattern = /^[+-]?(?:\d+\.?\d*|\.\d+)$/;
+  const numeric = Number(normalized);
+  let expiresAtMs: number;
+
+  if (numericPattern.test(normalized) && Number.isFinite(numeric)) {
+    if (numeric <= 0) return null;
+    const absolute = Math.abs(numeric);
+    expiresAtMs =
+      absolute < 1e11
+        ? numeric * 1000
+        : absolute < 1e14
+          ? numeric
+          : absolute < 1e17
+            ? numeric / 1000
+            : numeric / 1e6;
+  } else {
+    expiresAtMs = parseTimestampMs(normalized);
+  }
+
+  const rounded = Math.round(expiresAtMs);
+  if (!Number.isFinite(rounded) || rounded <= 0 || Number.isNaN(new Date(rounded).getTime())) {
+    return null;
+  }
+  return rounded;
+};
+
+export const resolveCodexEntitlementExpiryInfo = (
+  value: string | number | null | undefined,
+  nowMs = Date.now()
+): CodexEntitlementExpiryInfo | null => {
+  if (value === null || value === undefined) return null;
+  const expiresAtMs = parseCodexEntitlementExpiryMs(value);
+  if (expiresAtMs === null) return null;
+  return {
+    expiresAtMs,
+    isExpired: expiresAtMs <= nowMs,
+  };
+};
+
+const formatCodexEntitlementExpiryTime = (
+  expiresAtMs: number,
+  options?: { includeTimeZone?: boolean }
+): string =>
+  new Date(expiresAtMs).toLocaleString(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    ...(options?.includeTimeZone ? { timeZoneName: 'short' } : {}),
+  });
+
+const renderCodexEntitlementExpiry = (
+  quota: CodexQuotaState,
+  t: TFunction,
+  styleMap: QuotaRenderHelpers['styles']
+): ReactNode => {
+  const { createElement: h } = React;
+  const expiry = resolveCodexEntitlementExpiryInfo(quota.subscriptionActiveUntil);
+  const visibleTime = expiry
+    ? formatCodexEntitlementExpiryTime(expiry.expiresAtMs)
+    : t('codex_quota.entitlement_expiry_unavailable');
+  const statusLabel = expiry
+    ? t(
+        expiry.isExpired
+          ? 'codex_quota.entitlement_expiry_expired'
+          : 'codex_quota.entitlement_expiry_active'
+      )
+    : null;
+
+  return h(
+    'div',
+    {
+      key: 'entitlement-expiry',
+      className: styleMap.entitlementExpiry,
+      ...(expiry
+        ? {
+            title: formatCodexEntitlementExpiryTime(expiry.expiresAtMs, {
+              includeTimeZone: true,
+            }),
+          }
+        : {}),
+    },
+    h(
+      'span',
+      { className: styleMap.entitlementExpiryLabel },
+      t('codex_quota.entitlement_expiry_label')
+    ),
+    expiry
+      ? h(
+          'time',
+          {
+            className: styleMap.entitlementExpiryValue,
+            dateTime: new Date(expiry.expiresAtMs).toISOString(),
+          },
+          visibleTime
+        )
+      : h(
+          'span',
+          {
+            className: `${styleMap.entitlementExpiryValue} ${styleMap.entitlementExpiryValueUnknown}`,
+          },
+          visibleTime
+        ),
+    expiry && statusLabel
+      ? h(
+          'span',
+          {
+            className: `${styleMap.entitlementExpiryStatus} ${
+              expiry.isExpired
+                ? styleMap.entitlementExpiryStatusExpired
+                : styleMap.entitlementExpiryStatusActive
+            }`,
+          },
+          statusLabel
+        )
+      : null
+  );
+};
+
 export type CodexResetCreditExpiryInfo = {
   id: string;
   expiresAt: string;
@@ -854,6 +985,8 @@ const renderCodexItems = (
 
     nodes.push(h('div', { key: 'plan', className: styleMap.codexPlan }, ...planNodes));
   }
+
+  nodes.push(renderCodexEntitlementExpiry(quota, t, styleMap));
 
   if (windows.length === 0) {
     nodes.push(

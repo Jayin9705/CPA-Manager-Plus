@@ -36,6 +36,7 @@ import {
   CLAUDE_REQUEST_HEADERS,
   CLAUDE_USAGE_URL,
   CLAUDE_USAGE_WINDOW_KEYS,
+  CODEX_ACCOUNTS_CHECK_URL,
   CODEX_RATE_LIMIT_RESET_CREDITS_URL,
   CODEX_USAGE_URL,
   KIMI_REQUEST_HEADERS,
@@ -67,6 +68,7 @@ import {
 import { resolveCodexChatgptAccountId, resolveCodexPlanType } from './resolvers';
 import { buildCodexQuotaWindowInfos } from './codexQuota';
 import {
+  buildCodexAccountsCheckRequestHeaders,
   buildCodexResetCreditsRequestHeaders,
   buildCodexUsageRequestHeaders,
 } from './codexRequestHeaders';
@@ -74,6 +76,7 @@ import { normalizeCodexResetCreditsPayload } from './resetCredits';
 import { classifyXaiProbe, parseXaiErrorEnvelope, XaiProbeError } from './xaiErrors';
 
 const DEFAULT_ANTIGRAVITY_PROJECT_ID = 'bamboo-precept-lgxtn';
+const CODEX_ACCOUNTS_CHECK_REQUEST_TIMEOUT_MS = 5000;
 const CODEX_RESET_CREDITS_REQUEST_TIMEOUT_MS = 8000;
 
 export type CodexQuotaData = {
@@ -305,6 +308,81 @@ const resolveCodexRateLimitResetCreditsAvailableCount = (
 const resolveCodexSubscriptionActiveUntil = (payload: CodexUsagePayload): string | null =>
   normalizeStringValue(payload.subscription_active_until ?? payload.subscriptionActiveUntil);
 
+const parseRecordPayload = (input: unknown): Record<string, unknown> | null => {
+  if (isRecord(input)) return input;
+  if (typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const resolveCodexWebsiteEntitlementExpiry = (
+  input: unknown,
+  accountId?: string | null
+): string | null => {
+  const payload = parseRecordPayload(input);
+  if (!payload) return null;
+
+  const accounts = isRecord(payload.accounts) ? payload.accounts : null;
+  const candidates: Record<string, unknown>[] = [];
+  const appendCandidate = (value: unknown) => {
+    if (isRecord(value) && !candidates.includes(value)) candidates.push(value);
+  };
+
+  if (accounts) {
+    const normalizedAccountId = normalizeStringValue(accountId);
+    if (normalizedAccountId) appendCandidate(accounts[normalizedAccountId]);
+    appendCandidate(accounts.default);
+
+    if (Array.isArray(payload.account_ordering)) {
+      payload.account_ordering.forEach((value) => {
+        const orderedAccountId = normalizeStringValue(value);
+        if (orderedAccountId) appendCandidate(accounts[orderedAccountId]);
+      });
+    }
+    Object.values(accounts).forEach(appendCandidate);
+  }
+  appendCandidate(payload);
+
+  for (const candidate of candidates) {
+    const entitlement = isRecord(candidate.entitlement) ? candidate.entitlement : null;
+    const expiry = normalizeStringValue(
+      entitlement?.expires_at ??
+        entitlement?.expiresAt ??
+        entitlement?.active_until ??
+        entitlement?.activeUntil
+    );
+    if (expiry) return expiry;
+  }
+  return null;
+};
+
+const fetchCodexWebsiteEntitlementExpiry = async (
+  authIndex: string,
+  accountId?: string | null
+): Promise<string | null> => {
+  try {
+    const result = await apiCallApi.request(
+      {
+        authIndex,
+        method: 'GET',
+        url: CODEX_ACCOUNTS_CHECK_URL,
+        header: buildCodexAccountsCheckRequestHeaders(accountId),
+      },
+      { timeout: CODEX_ACCOUNTS_CHECK_REQUEST_TIMEOUT_MS }
+    );
+    if (result.statusCode < 200 || result.statusCode >= 300) return null;
+    return resolveCodexWebsiteEntitlementExpiry(result.body ?? result.bodyText, accountId);
+  } catch {
+    return null;
+  }
+};
+
 type CodexResetCreditsData = {
   availableCount: number | null;
   credits: CodexRateLimitResetCredit[];
@@ -379,12 +457,14 @@ export const fetchCodexQuota = async (
 
   const planTypeFromFile = resolveCodexPlanType(file);
   const accountId = resolveCodexChatgptAccountId(file);
-  const result = await apiCallApi.request({
+  const usageRequest = apiCallApi.request({
     authIndex,
     method: 'GET',
     url: CODEX_USAGE_URL,
     header: buildCodexUsageRequestHeaders(accountId),
   });
+  const websiteEntitlementExpiryRequest = fetchCodexWebsiteEntitlementExpiry(authIndex, accountId);
+  const result = await usageRequest;
 
   if (result.statusCode < 200 || result.statusCode >= 300) {
     throw createStatusError(getApiCallErrorMessage(result), result.statusCode);
@@ -399,11 +479,15 @@ export const fetchCodexQuota = async (
   const planType = planTypeFromUsage ?? planTypeFromFile;
   const windows = buildCodexQuotaWindows(payload, t, planType);
   const usageResetCreditsAvailableCount = resolveCodexRateLimitResetCreditsAvailableCount(payload);
-  const resetCredits = await fetchCodexResetCredits(authIndex, accountId, t);
+  const [resetCredits, websiteEntitlementExpiry] = await Promise.all([
+    fetchCodexResetCredits(authIndex, accountId, t),
+    websiteEntitlementExpiryRequest,
+  ]);
   return {
     planType,
     windows,
-    subscriptionActiveUntil: resolveCodexSubscriptionActiveUntil(payload),
+    subscriptionActiveUntil:
+      websiteEntitlementExpiry ?? resolveCodexSubscriptionActiveUntil(payload),
     rateLimitResetCreditsAvailableCount: resolveCodexResetCreditsAvailableCount(
       resetCredits,
       usageResetCreditsAvailableCount

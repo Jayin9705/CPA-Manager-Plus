@@ -433,6 +433,19 @@ const accountActionCandidate = (
   ...overrides,
 });
 
+const codexWebsiteEntitlementResponse = () => ({
+  statusCode: 200,
+  body: JSON.stringify({
+    accounts: {
+      default: {
+        entitlement: {
+          expires_at: '2026-08-28T13:42:25+00:00',
+        },
+      },
+    },
+  }),
+});
+
 describe('AuthFilesPage quota cooldown derived badge', () => {
   beforeEach(() => {
     mocks.list.mockReset();
@@ -718,6 +731,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
           },
         }),
       })
+      .mockResolvedValueOnce(codexWebsiteEntitlementResponse())
       .mockResolvedValueOnce({
         statusCode: 200,
         body: JSON.stringify({ available_count: 1, credits: [] }),
@@ -729,7 +743,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(2);
+      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(3);
     });
 
     await act(async () => {
@@ -774,6 +788,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
           rate_limit_reset_credits: { available_count: 1 },
         }),
       })
+      .mockResolvedValueOnce(codexWebsiteEntitlementResponse())
       .mockResolvedValueOnce({
         statusCode: 200,
         body: JSON.stringify({ available_count: 1, credits: [] }),
@@ -800,7 +815,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(2);
+      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(3);
     });
 
     await act(async () => {
@@ -847,6 +862,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
           rate_limit_reset_credits: { available_count: 1 },
         }),
       })
+      .mockResolvedValueOnce(codexWebsiteEntitlementResponse())
       .mockResolvedValueOnce({
         statusCode: 200,
         body: JSON.stringify({ available_count: 1, credits: [] }),
@@ -873,10 +889,11 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(2);
+      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(3);
     });
 
     expect(mocks.apiCallRequest.mock.calls.map(([payload]) => payload.authIndex)).toEqual([
+      '1',
       '1',
       '1',
     ]);
@@ -925,6 +942,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
           rate_limit_reset_credits: { available_count: 1 },
         }),
       })
+      .mockResolvedValueOnce(codexWebsiteEntitlementResponse())
       .mockResolvedValueOnce({
         statusCode: 200,
         body: JSON.stringify({ available_count: 1, credits: [] }),
@@ -951,10 +969,11 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(2);
+      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(3);
     });
 
     expect(mocks.apiCallRequest.mock.calls.map(([payload]) => payload.authIndex)).toEqual([
+      '0',
       '0',
       '0',
     ]);
@@ -1029,6 +1048,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
     mocks.getHeaderSnapshots.mockImplementation(async () => buildExpiredHeaderResponse());
     mocks.apiCallRequest
       .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce(codexWebsiteEntitlementResponse())
       .mockResolvedValueOnce({
         statusCode: 200,
         body: JSON.stringify({
@@ -1042,6 +1062,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
           },
         }),
       })
+      .mockResolvedValueOnce(codexWebsiteEntitlementResponse())
       .mockResolvedValueOnce({
         statusCode: 200,
         body: JSON.stringify({ available_count: 1, credits: [] }),
@@ -1063,7 +1084,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
         )
       ).toBe(true);
     });
-    expect(mocks.apiCallRequest).toHaveBeenCalledTimes(1);
+    expect(mocks.apiCallRequest).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       renderer!.update(<AuthFilesPage />);
@@ -1071,7 +1092,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
       await Promise.resolve();
     });
 
-    expect(mocks.apiCallRequest).toHaveBeenCalledTimes(1);
+    expect(mocks.apiCallRequest).toHaveBeenCalledTimes(2);
 
     const quotaInterval = mocks.intervalCallbacks.find((item) => item.delay === 60_000);
     await act(async () => {
@@ -1081,7 +1102,7 @@ describe('AuthFilesPage quota cooldown derived badge', () => {
     });
 
     await vi.waitFor(() => {
-      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(3);
+      expect(mocks.apiCallRequest).toHaveBeenCalledTimes(5);
     });
 
     await act(async () => {

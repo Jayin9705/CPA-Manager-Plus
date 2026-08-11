@@ -28,6 +28,7 @@ import {
   ANTIGRAVITY_USER_AGENT,
   CLAUDE_PROFILE_URL,
   CLAUDE_USAGE_URL,
+  CODEX_ACCOUNTS_CHECK_URL,
   CODEX_RATE_LIMIT_RESET_CREDITS_URL,
   CODEX_USAGE_URL,
   XAI_BILLING_MONTHLY_URL,
@@ -75,7 +76,7 @@ beforeEach(() => {
 });
 
 describe('fetchCodexQuota', () => {
-  it('fetches reset credit details after usage and prefers detail counts', async () => {
+  it('prefers the ChatGPT website entitlement expiry and fetches it with the account credential', async () => {
     mocks.request
       .mockResolvedValueOnce({
         statusCode: 200,
@@ -84,8 +85,25 @@ describe('fetchCodexQuota', () => {
         bodyText: '',
         body: {
           plan_type: 'plus',
+          subscription_active_until: '2026-08-31T16:30:00Z',
           rate_limit_reset_credits: {
             available_count: 1,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        statusCode: 200,
+        hasStatusCode: true,
+        header: {},
+        bodyText: '',
+        body: {
+          accounts: {
+            'acct-1': {
+              entitlement: {
+                has_active_subscription: true,
+                expires_at: '2026-08-28T13:42:25+00:00',
+              },
+            },
           },
         },
       })
@@ -118,7 +136,7 @@ describe('fetchCodexQuota', () => {
       t
     );
 
-    expect(mocks.request).toHaveBeenCalledTimes(2);
+    expect(mocks.request).toHaveBeenCalledTimes(3);
     expect(mocks.request.mock.calls[0][0]).toMatchObject({
       authIndex: 'auth-1',
       method: 'GET',
@@ -131,6 +149,17 @@ describe('fetchCodexQuota', () => {
     expect(mocks.request.mock.calls[1][0]).toMatchObject({
       authIndex: 'auth-1',
       method: 'GET',
+      url: CODEX_ACCOUNTS_CHECK_URL,
+      header: expect.objectContaining({
+        Authorization: 'Bearer $TOKEN$',
+        Accept: 'application/json',
+        'Chatgpt-Account-Id': 'acct-1',
+      }),
+    });
+    expect(mocks.request.mock.calls[1][1]).toMatchObject({ timeout: 5000 });
+    expect(mocks.request.mock.calls[2][0]).toMatchObject({
+      authIndex: 'auth-1',
+      method: 'GET',
       url: CODEX_RATE_LIMIT_RESET_CREDITS_URL,
       header: expect.objectContaining({
         Accept: 'application/json',
@@ -139,13 +168,14 @@ describe('fetchCodexQuota', () => {
         'Chatgpt-Account-Id': 'acct-1',
       }),
     });
-    expect(mocks.request.mock.calls[1][1]).toMatchObject({ timeout: 8000 });
+    expect(mocks.request.mock.calls[2][1]).toMatchObject({ timeout: 8000 });
     expect(result.rateLimitResetCreditsAvailableCount).toBe(2);
     expect(result.rateLimitResetCredits).toHaveLength(1);
     expect(result.rateLimitResetCreditsError).toBeNull();
+    expect(result.subscriptionActiveUntil).toBe('2026-08-28T13:42:25+00:00');
   });
 
-  it('keeps usage quota data when reset credit details fail', async () => {
+  it('falls back to the usage expiry when the website session is unauthorized', async () => {
     mocks.request
       .mockResolvedValueOnce({
         statusCode: 200,
@@ -154,10 +184,18 @@ describe('fetchCodexQuota', () => {
         bodyText: '',
         body: {
           plan_type: 'plus',
+          subscription_active_until: '2026-08-31T16:30:00Z',
           rate_limit_reset_credits: {
             available_count: 1,
           },
         },
+      })
+      .mockResolvedValueOnce({
+        statusCode: 401,
+        hasStatusCode: true,
+        header: {},
+        bodyText: 'unauthorized',
+        body: null,
       })
       .mockResolvedValueOnce({
         statusCode: 502,
@@ -179,9 +217,10 @@ describe('fetchCodexQuota', () => {
     expect(result.rateLimitResetCreditsAvailableCount).toBe(1);
     expect(result.rateLimitResetCredits).toEqual([]);
     expect(result.rateLimitResetCreditsError).toBe('502 bad gateway');
+    expect(result.subscriptionActiveUntil).toBe('2026-08-31T16:30:00Z');
   });
 
-  it('uses localized reset credit errors for invalid detail payloads', async () => {
+  it('falls back safely when the website payload shape changes', async () => {
     mocks.request
       .mockResolvedValueOnce({
         statusCode: 200,
@@ -190,9 +229,19 @@ describe('fetchCodexQuota', () => {
         bodyText: '',
         body: {
           plan_type: 'plus',
+          subscription_active_until: '2026-09-01T00:00:00Z',
           rate_limit_reset_credits: {
             available_count: 1,
           },
+        },
+      })
+      .mockResolvedValueOnce({
+        statusCode: 200,
+        hasStatusCode: true,
+        header: {},
+        bodyText: '',
+        body: {
+          unexpected: true,
         },
       })
       .mockResolvedValueOnce({
@@ -217,6 +266,7 @@ describe('fetchCodexQuota', () => {
     expect(result.rateLimitResetCreditsAvailableCount).toBe(1);
     expect(result.rateLimitResetCredits).toEqual([]);
     expect(result.rateLimitResetCreditsError).toBe('codex_quota.reset_credits_invalid_payload');
+    expect(result.subscriptionActiveUntil).toBe('2026-09-01T00:00:00Z');
   });
 });
 

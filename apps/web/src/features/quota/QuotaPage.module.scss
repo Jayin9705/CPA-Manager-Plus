@@ -748,6 +748,63 @@
   text-overflow: ellipsis;
 }
 
+.entitlementExpiry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-radius: $radius-sm;
+  background: color-mix(in srgb, var(--surface-subtle) 82%, transparent);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.entitlementExpiryLabel {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.entitlementExpiryValue {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.entitlementExpiryValueUnknown {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.entitlementExpiryStatus {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.entitlementExpiryStatusActive {
+  border-color: var(--success-badge-border);
+  background: var(--success-badge-bg);
+  color: var(--success-badge-text);
+}
+
+.entitlementExpiryStatusExpired {
+  border-color: var(--failure-badge-border);
+  background: var(--failure-badge-bg);
+  color: var(--failure-badge-text);
+}
+
 // Compact chip: keep premium plans highlighted without dominating the plan row.
 .premiumPlanValue {
   display: inline-flex;
