@@ -17,6 +17,7 @@ import (
 
 const maxUsageImportBytes int64 = 64 * 1024 * 1024
 const maxUsageImportSessionCreateBytes int64 = 64 * 1024
+const maxCompatibleUsageEvents = 2000
 const usageImportSessionsPath = "/v0/management/usage/import-sessions"
 
 type Handler struct {
@@ -44,7 +45,7 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		writer := &countingWriter{writer: w}
-		err := h.App.UsageService.WriteCompatibleUsage(r.Context(), writer, h.App.Config.QueryLimit)
+		err := h.App.UsageService.WriteCompatibleUsage(r.Context(), writer, compatibleUsageLimit(h.App.Config.QueryLimit))
 		if err != nil {
 			if writer.written == 0 {
 				response.Error(w, http.StatusInternalServerError, err)
@@ -62,6 +63,13 @@ func (h *Handler) Handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		response.MethodNotAllowed(w)
 	}
+}
+
+func compatibleUsageLimit(configured int) int {
+	if configured <= 0 || configured > maxCompatibleUsageEvents {
+		return maxCompatibleUsageEvents
+	}
+	return configured
 }
 
 type createImportSessionRequest struct {

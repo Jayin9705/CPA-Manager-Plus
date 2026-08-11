@@ -76,3 +76,22 @@ func TestParseImportSessionPath(t *testing.T) {
 		}
 	}
 }
+
+func TestCompatibleUsageLimit(t *testing.T) {
+	cases := []struct {
+		configured int
+		want       int
+	}{
+		{configured: -1, want: maxCompatibleUsageEvents},
+		{configured: 0, want: maxCompatibleUsageEvents},
+		{configured: 1, want: 1},
+		{configured: maxCompatibleUsageEvents, want: maxCompatibleUsageEvents},
+		{configured: maxCompatibleUsageEvents + 1, want: maxCompatibleUsageEvents},
+		{configured: 50000, want: maxCompatibleUsageEvents},
+	}
+	for _, test := range cases {
+		if got := compatibleUsageLimit(test.configured); got != test.want {
+			t.Errorf("compatibleUsageLimit(%d) = %d, want %d", test.configured, got, test.want)
+		}
+	}
+}
