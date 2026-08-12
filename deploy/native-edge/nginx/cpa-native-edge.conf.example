@@ -1,0 +1,131 @@
+# This file is included from nginx's http {} context. Replace every
+# public.example.com and certificate path before enabling it.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+upstream cpa_native_api {
+    server 127.0.0.1:8317;
+    keepalive 32;
+}
+
+upstream cpamp_separated_api {
+    server 127.0.0.1:18318;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name public.example.com;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name public.example.com;
+
+    ssl_certificate ssl/public.example.com/fullchain.crt;
+    ssl_certificate_key ssl/public.example.com/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 100m;
+
+    location = /separated-console {
+        return 308 /separated-console/;
+    }
+
+    location = /separated-console/ {
+        rewrite ^ /separated-console/index.html last;
+    }
+
+    location = /separated-console/index.html {
+        alias /opt/cpa-manager-plus-separated/console/index.html;
+        add_header Cache-Control "no-cache" always;
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    location = /separated-console/runtime-config.json {
+        alias /opt/cpa-manager-plus-separated/console/runtime-config.json;
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    location ^~ /separated-console/assets/ {
+        alias /opt/cpa-manager-plus-separated/console/assets/;
+        access_log off;
+        log_not_found off;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    location ^~ /separated-console/ {
+        alias /opt/cpa-manager-plus-separated/console/;
+        try_files $uri $uri/ /separated-console/index.html;
+        add_header Cache-Control "no-cache" always;
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    location = /separated-api {
+        return 308 /separated-api/;
+    }
+
+    location ^~ /separated-api/ {
+        proxy_pass http://cpamp_separated_api/;
+        include snippets/cpa-proxy-common.conf;
+    }
+
+    # Manager APIs and compatibility routes belong to the separated API.
+    location ^~ /v0/management/ {
+        proxy_pass http://cpamp_separated_api;
+        include snippets/cpa-proxy-common.conf;
+    }
+
+    location ^~ /usage-service/ {
+        proxy_pass http://cpamp_separated_api;
+        include snippets/cpa-proxy-common.conf;
+    }
+
+    location ^~ /v0/resource/plugins/ {
+        proxy_pass http://cpamp_separated_api;
+        include snippets/cpa-proxy-common.conf;
+    }
+
+    location ~ ^/(health|status|setup|models)$ {
+        proxy_pass http://cpamp_separated_api;
+        include snippets/cpa-proxy-common.conf;
+    }
+
+    location = /management.html {
+        return 301 /separated-console/;
+    }
+
+    location = /cpa {
+        return 308 /cpa/;
+    }
+
+    location = /cpa/management.html {
+        return 301 /separated-console/;
+    }
+
+    # The trailing slash strips /cpa/ before forwarding to CPA.
+    location ^~ /cpa/ {
+        proxy_pass http://cpa_native_api/;
+        include snippets/cpa-proxy-common.conf;
+    }
+
+    location = / {
+        return 301 /separated-console/;
+    }
+
+    # All model APIs, OAuth callbacks, WebSocket paths, and future CPA routes
+    # fall through to CPA. Do not replace this with a short allowlist.
+    location / {
+        proxy_pass http://cpa_native_api;
+        include snippets/cpa-proxy-common.conf;
+    }
+}

@@ -1,0 +1,24 @@
+[Unit]
+Description=CPA Manager Plus PostgreSQL daily usage rollup
+After=postgresql.service
+Requires=postgresql.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cpa-manager-plus
+Group=cpa-manager-plus
+EnvironmentFile=/etc/cpa-manager-plus-separated/worker.env
+ExecStartPre=/usr/bin/pg_isready -q -h /var/run/postgresql
+ExecStart=/opt/cpa-manager-plus/cpamp-migration rollup --kind daily --batch-size 500 --max-batches 0 --follow --poll-interval 5s
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

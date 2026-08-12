@@ -1,0 +1,121 @@
+#!/bin/bash
+set -euo pipefail
+
+public_origin=${CPAMP_PUBLIC_ORIGIN:-}
+auth_dir=${CPA_AUTH_DIR:-/var/lib/cliproxyapi/auth}
+backup_dir=${CPAMP_BACKUP_DIR:-/var/backups/cpa-manager-plus/postgresql}
+backup_databases=${CPAMP_BACKUP_DATABASES:-cpamp_usage sub2api}
+failures=0
+
+pass() { printf 'PASS %s\n' "$1"; }
+fail() { printf 'FAIL %s\n' "$1" >&2; failures=$((failures + 1)); }
+
+check_active() {
+    if systemctl is-active --quiet "$1"; then pass "unit $1 is active"; else fail "unit $1 is not active"; fi
+}
+
+if nginx -t >/dev/null 2>&1; then pass "nginx configuration"; else fail "nginx configuration"; fi
+
+for unit in \
+    nginx.service \
+    cliproxyapi.service \
+    mihomo.service \
+    cpa-manager-plus-separated-api.service \
+    cpamp-usage-redis.service \
+    cpamp-usage-persist.service \
+    cpamp-usage-rollup-hourly.service \
+    cpamp-usage-rollup-daily.service \
+    cpa-web-ingress-allow.timer \
+    cpamp-postgres-backup.timer; do
+    check_active "$unit"
+done
+
+for old_unit in cpa-manager-plus.service cpamp-usage-relay.service; do
+    if systemctl list-unit-files "$old_unit" --no-legend 2>/dev/null | grep -q .; then
+        if systemctl is-active --quiet "$old_unit" || systemctl is-enabled --quiet "$old_unit"; then
+            fail "legacy unit $old_unit is enabled or active"
+        else
+            pass "legacy unit $old_unit is disabled and inactive"
+        fi
+    fi
+done
+
+if command -v iptables >/dev/null 2>&1 && \
+   [ "$(iptables -w 5 -S INPUT | awk '$1 == "-A" { print; exit }')" = "-A INPUT -j CPA-WEB-INGRESS" ]; then
+    pass "IPv4 web allow chain is first"
+else
+    fail "IPv4 web allow chain is not first"
+fi
+
+if command -v ip6tables >/dev/null 2>&1 && \
+   [ "$(ip6tables -w 5 -S INPUT | awk '$1 == "-A" { print; exit }')" = "-A INPUT -j CPA-WEB-INGRESS" ]; then
+    pass "IPv6 web allow chain is first"
+else
+    fail "IPv6 web allow chain is not first"
+fi
+
+if iptables -w 5 -S YJ-FIREWALL-INPUT >/dev/null 2>&1; then
+    yj_first=$(iptables -w 5 -S YJ-FIREWALL-INPUT | awk '$1 == "-A" { print; exit }')
+    if [ "$yj_first" = "-A YJ-FIREWALL-INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT" ]; then
+        pass "cloud source-IP reject chain preserves web ingress"
+    else
+        fail "cloud source-IP reject chain can block web ingress"
+    fi
+fi
+
+if command -v fail2ban-client >/dev/null 2>&1; then
+    if systemctl is-active --quiet fail2ban.service && fail2ban-client status sshd >/dev/null 2>&1; then
+        pass "Fail2ban SSH jail"
+    else
+        fail "Fail2ban SSH jail"
+    fi
+fi
+
+if /usr/local/sbin/cpa-auth-proxy-audit --auth-dir "$auth_dir" >/dev/null; then
+    pass "CPA auth proxy overrides and permissions"
+else
+    fail "CPA auth proxy overrides or permissions"
+fi
+
+if curl --noproxy '*' --connect-timeout 3 --max-time 10 -fsS http://127.0.0.1:18318/health >/dev/null; then
+    pass "separated API local health"
+else
+    fail "separated API local health"
+fi
+
+cpa_status=$(curl --noproxy '*' --connect-timeout 3 --max-time 10 -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8317/v1/models || true)
+if [ "$cpa_status" = "401" ] || [ "$cpa_status" = "200" ]; then
+    pass "CPA local HTTP endpoint"
+else
+    fail "CPA local HTTP endpoint returned $cpa_status"
+fi
+
+if redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG; then pass "Redis"; else fail "Redis"; fi
+if pg_isready -q -h 127.0.0.1 -p 5432; then pass "PostgreSQL"; else fail "PostgreSQL"; fi
+
+for database in $backup_databases; do
+    case "$database" in
+        ''|*[!A-Za-z0-9_]*) fail "invalid backup database name"; continue ;;
+    esac
+    if [ -d "$backup_dir" ] && find "$backup_dir" -maxdepth 1 -type f -name "$database.*.dump" -mtime -2 -print -quit | grep -q .; then
+        pass "recent PostgreSQL backup for $database"
+    else
+        fail "recent PostgreSQL backup for $database"
+    fi
+done
+
+if [ -n "$public_origin" ]; then
+    origin=${public_origin%/}
+    public_health=$(curl --noproxy '*' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' "$origin/health" || true)
+    public_console=$(curl --noproxy '*' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' "$origin/separated-console/" || true)
+    preflight=$(curl --noproxy '*' --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' -X OPTIONS "$origin/v1/responses" || true)
+    [ "$public_health" = "200" ] && pass "public health" || fail "public health returned $public_health"
+    [ "$public_console" = "200" ] && pass "public separated console" || fail "public separated console returned $public_console"
+    [ "$preflight" = "204" ] && pass "public API preflight" || fail "public API preflight returned $preflight"
+fi
+
+if [ "$failures" -ne 0 ]; then
+    printf 'verification_failures=%s\n' "$failures" >&2
+    exit 1
+fi
+printf 'verification_failures=0\n'

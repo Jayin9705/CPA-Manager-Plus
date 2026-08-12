@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+PATH=${CPA_SYSTEM_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+
+chain=${CPA_WEB_INGRESS_CHAIN:-CPA-WEB-INGRESS}
+cloud_chain=${CPA_CLOUD_FIREWALL_CHAIN:-YJ-FIREWALL-INPUT}
+web_ports=${CPA_WEB_PORTS:-80,443}
+
+validate_chain_name() {
+    value=$1
+    case "$value" in
+        ''|*[!A-Za-z0-9_-]*)
+            echo "invalid iptables chain name: $value" >&2
+            exit 2
+            ;;
+    esac
+}
+
+validate_chain_name "$chain"
+validate_chain_name "$cloud_chain"
+case "$web_ports" in
+    ''|*[!0-9,]*)
+        echo "invalid comma-separated TCP port list" >&2
+        exit 2
+        ;;
+esac
+
+apply_rules() {
+    firewall=$1
+
+    if ! command -v "$firewall" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! "$firewall" -w 5 -S >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! "$firewall" -w 5 -S "$chain" >/dev/null 2>&1; then
+        "$firewall" -w 5 -N "$chain"
+    fi
+
+    rule_count=$("$firewall" -w 5 -S "$chain" | awk '$1 == "-A" { count++ } END { print count + 0 }')
+    if [ "$rule_count" -ne 2 ] || \
+       ! "$firewall" -w 5 -C "$chain" -p tcp -m multiport --dports "$web_ports" -j ACCEPT >/dev/null 2>&1 || \
+       ! "$firewall" -w 5 -C "$chain" -j RETURN >/dev/null 2>&1; then
+        "$firewall" -w 5 -F "$chain"
+        "$firewall" -w 5 -A "$chain" -p tcp -m multiport --dports "$web_ports" -j ACCEPT
+        "$firewall" -w 5 -A "$chain" -j RETURN
+    fi
+
+    first_rule=$("$firewall" -w 5 -S INPUT | awk '$1 == "-A" { print; exit }')
+    jump_count=$("$firewall" -w 5 -S INPUT | awk -v target="$chain" '$1 == "-A" && $2 == "INPUT" && $3 == "-j" && $4 == target { count++ } END { print count + 0 }')
+
+    if [ "$first_rule" != "-A INPUT -j $chain" ] || [ "$jump_count" -ne 1 ]; then
+        while "$firewall" -w 5 -C INPUT -j "$chain" >/dev/null 2>&1; do
+            "$firewall" -w 5 -D INPUT -j "$chain"
+        done
+        "$firewall" -w 5 -I INPUT 1 -j "$chain"
+    fi
+
+    # Cloud host-security agents can periodically restore a source-IP reject
+    # chain at the head of INPUT. Keep the web exception inside that chain as
+    # a fallback while leaving SSH and every non-web port under its control.
+    if "$firewall" -w 5 -S "$cloud_chain" >/dev/null 2>&1; then
+        expected="-A $cloud_chain -p tcp -m multiport --dports $web_ports -j ACCEPT"
+        cloud_first=$("$firewall" -w 5 -S "$cloud_chain" | awk '$1 == "-A" { print; exit }')
+        cloud_count=$("$firewall" -w 5 -S "$cloud_chain" | awk -v expected="$expected" '$0 == expected { count++ } END { print count + 0 }')
+
+        if [ "$cloud_first" != "$expected" ] || [ "$cloud_count" -ne 1 ]; then
+            while "$firewall" -w 5 -C "$cloud_chain" -p tcp -m multiport --dports "$web_ports" -j ACCEPT >/dev/null 2>&1; do
+                "$firewall" -w 5 -D "$cloud_chain" -p tcp -m multiport --dports "$web_ports" -j ACCEPT
+            done
+            "$firewall" -w 5 -I "$cloud_chain" 1 -p tcp -m multiport --dports "$web_ports" -j ACCEPT
+        fi
+    fi
+}
+
+apply_rules iptables
+apply_rules ip6tables

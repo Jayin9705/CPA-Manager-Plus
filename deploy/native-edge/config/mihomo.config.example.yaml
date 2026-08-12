@@ -1,0 +1,17 @@
+# Safe local listener only. Add proxy nodes/providers in the private installed
+# /etc/mihomo/config.yaml; never commit subscription URLs or credentials.
+mixed-port: 7890
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: warning
+external-controller: 127.0.0.1:9090
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+rules:
+  - MATCH,DIRECT

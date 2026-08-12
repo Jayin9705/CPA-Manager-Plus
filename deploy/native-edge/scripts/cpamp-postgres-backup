@@ -1,0 +1,59 @@
+#!/bin/bash
+set -euo pipefail
+set -f
+
+backup_dir=${CPAMP_BACKUP_DIR:-/var/backups/cpa-manager-plus/postgresql}
+databases=${CPAMP_BACKUP_DATABASES:-cpamp_usage sub2api}
+retention_days=${CPAMP_BACKUP_RETENTION_DAYS:-14}
+pg_host=${CPAMP_BACKUP_PG_HOST:-/var/run/postgresql}
+pg_port=${CPAMP_BACKUP_PG_PORT:-5432}
+pg_user=${CPAMP_BACKUP_PG_USER:-postgres}
+timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+current_partial=
+
+case "$backup_dir" in
+    /*) ;;
+    *) echo "backup directory must be absolute" >&2; exit 2 ;;
+esac
+if [ "$backup_dir" = "/" ] || [ ! -d "$backup_dir" ] || [ -L "$backup_dir" ]; then
+    echo "backup directory is missing or unsafe: $backup_dir" >&2
+    exit 2
+fi
+case "$retention_days" in ''|*[!0-9]*) echo "invalid retention days" >&2; exit 2 ;; esac
+case "$pg_port" in ''|*[!0-9]*) echo "invalid PostgreSQL port" >&2; exit 2 ;; esac
+case "$pg_user" in ''|*[!A-Za-z0-9_.-]*) echo "invalid PostgreSQL user" >&2; exit 2 ;; esac
+case "$pg_host" in ''|*[!A-Za-z0-9_./:-]*) echo "invalid PostgreSQL host" >&2; exit 2 ;; esac
+
+cleanup_partial() {
+    if [ -n "$current_partial" ] && [ -f "$current_partial" ]; then
+        rm -f -- "$current_partial"
+    fi
+}
+trap cleanup_partial EXIT
+
+for database in $databases; do
+    case "$database" in
+        ''|*[!A-Za-z0-9_]* ) echo "invalid database name" >&2; exit 2 ;;
+    esac
+
+    final_path="$backup_dir/$database.$timestamp.dump"
+    current_partial="$final_path.partial"
+    pg_dump \
+        --host="$pg_host" \
+        --port="$pg_port" \
+        --username="$pg_user" \
+        --dbname="$database" \
+        --format=custom \
+        --compress=6 \
+        --file="$current_partial"
+    pg_restore --list "$current_partial" >/dev/null
+    chmod 0600 "$current_partial"
+    mv -- "$current_partial" "$final_path"
+    current_partial=
+    echo "created $final_path"
+done
+
+for database in $databases; do
+    find "$backup_dir" -maxdepth 1 -type f \
+        -name "$database.*.dump" -mtime "+$retention_days" -print -delete
+done

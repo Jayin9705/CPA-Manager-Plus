@@ -215,6 +215,16 @@ docker compose -f docker-compose.separated.yml --profile separated-api up -d cpa
 assets. The existing `Dockerfile.manager-server`, `/management.html`, and embedded
 panel remain available as the rollback path.
 
+### Native systemd edge (Nginx + separated API + Redis + PostgreSQL)
+
+For a host-native deployment where Nginx owns public `80/443` and CPA/CPAMP,
+Mihomo, Redis, PostgreSQL, persist/rollup workers, and backups are managed by
+systemd, use the checked-in [native edge package](deploy/native-edge/README.md).
+It includes same-domain routing, dynamic WebSocket headers, a narrowly scoped
+web-ingress exception for cloud source-IP reject chains, secret-file based
+configuration, OAuth proxy-override auditing, and dual-database backups. The
+templates contain no production credentials or OAuth data.
+
 ## Documentation
 
 | Task                                                      | Guide                                                                                                                                                                                                |

@@ -206,6 +206,14 @@ docker compose -f docker-compose.separated.yml --profile separated-api up -d cpa
 纯后端镜像使用 `Dockerfile.manager-server-api`，不安装 Node、也不打包 HTML/CSS/JS；
 旧的 `Dockerfile.manager-server`、`/management.html` 和内嵌面板继续保留作回滚路径。
 
+### 原生 systemd 边缘部署（Nginx + 分离 API + Redis + PostgreSQL）
+
+如果服务器由 Nginx 对外监听 `80/443`，CPA/CPAMP、Mihomo、Redis、PostgreSQL、
+persist/rollup worker 和备份均由 systemd 管理，请使用仓库内的
+[原生边缘部署包](deploy/native-edge/README_CN.md)。它包含同域路径分流、动态
+WebSocket 请求头、仅针对 Web 端口的云安全 IP 拒绝链例外、基于私有文件的密钥
+配置、OAuth 代理覆盖审计和双数据库备份。模板不包含任何生产密钥或 OAuth 数据。
+
 ## 文档
 
 | 任务                                    | 文档                                                                                                                                                                                  |

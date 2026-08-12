@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically restore unrestricted CPA web ingress
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=cpa-web-ingress-allow.service
+
+[Install]
+WantedBy=timers.target
