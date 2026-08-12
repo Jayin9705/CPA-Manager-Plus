@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep CPA HTTP and HTTPS open to every source IP
+Before=nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cpa-web-ingress-allow
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=CLIProxyAPI
+Documentation=https://github.com/router-for-me/CLIProxyAPI
+After=network-online.target mihomo.service
+Wants=network-online.target mihomo.service
+
+[Service]
+Type=simple
+User=cliproxyapi
+Group=cliproxyapi
+WorkingDirectory=/var/lib/cliproxyapi
+ExecStart=/opt/cliproxyapi/cli-proxy-api -config /etc/cliproxyapi/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/etc/cliproxyapi /var/lib/cliproxyapi
+
+[Install]
+WantedBy=multi-user.target

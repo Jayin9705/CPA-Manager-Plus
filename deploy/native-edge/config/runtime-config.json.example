@@ -1,0 +1,7 @@
+{
+  "mode": "full",
+  "apiOrigin": "https://public.example.com/separated-api",
+  "oauthReturnOrigin": "https://public.example.com/separated-console",
+  "pluginRuntimeOrigin": "https://public.example.com/separated-console",
+  "environmentName": "production"
+}

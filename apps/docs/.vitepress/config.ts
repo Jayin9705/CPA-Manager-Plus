@@ -62,6 +62,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
       { text: 'Docker 手动部署', link: '/deployment/docker' },
       { text: '原生包部署', link: '/deployment/native' },
       { text: '原生包后台控制', link: '/deployment/native-background-control' },
+      { text: '原生 systemd 边缘部署', link: '/deployment/native-edge' },
       { text: '反向代理', link: '/deployment/reverse-proxy' },
       { text: 'Manager Server', link: '/operations/manager-server' },
       { text: 'CPA + Redis + PostgreSQL 架构与安装', link: '/operations/cpa-redis-postgresql' },
@@ -133,8 +134,13 @@ const enSidebar: DefaultTheme.Sidebar = [
       { text: 'Manual Docker Deployment', link: '/en/deployment/docker' },
       { text: 'Native Packages', link: '/en/deployment/native' },
       { text: 'Native Background Control', link: '/en/deployment/native-background-control' },
+      { text: 'Native systemd Edge', link: '/en/deployment/native-edge' },
       { text: 'Reverse Proxy', link: '/en/deployment/reverse-proxy' },
       { text: 'Manager Server', link: '/en/operations/manager-server' },
+      {
+        text: 'CPA + Redis + PostgreSQL',
+        link: '/en/operations/cpa-redis-postgresql',
+      },
       { text: 'Prepare The CPA Gateway', link: '/en/gateway/configuration' },
       { text: 'Client Configuration', link: '/en/gateway/clients' },
       {

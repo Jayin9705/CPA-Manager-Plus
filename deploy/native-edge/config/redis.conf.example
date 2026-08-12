@@ -1,0 +1,17 @@
+bind 127.0.0.1
+protected-mode yes
+port 6379
+tcp-keepalive 300
+timeout 0
+dir /var/lib/redis/cpamp-usage
+dbfilename cpamp-usage.rdb
+save ""
+appendonly yes
+appendfilename cpamp-usage.aof
+appendfsync everysec
+maxmemory 256mb
+maxmemory-policy noeviction
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+logfile ""
+databases 2

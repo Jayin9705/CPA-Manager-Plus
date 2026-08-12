@@ -1,0 +1,37 @@
+[Unit]
+Description=CPA Manager Plus separated API
+Documentation=https://github.com/Jayin9705/CPA-Manager-Plus
+After=network-online.target postgresql.service cpamp-usage-redis.service cliproxyapi.service
+Requires=postgresql.service cpamp-usage-redis.service cliproxyapi.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cpa-manager-plus
+Group=cpa-manager-plus
+WorkingDirectory=/var/lib/cpa-manager-plus
+EnvironmentFile=/etc/cpa-manager-plus-separated/api.env
+ExecStart=/opt/cpa-manager-plus-separated/bin/cpa-manager-plus-api
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+UMask=0077
+MemoryAccounting=true
+MemoryHigh=256M
+MemoryMax=384M
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/cpa-manager-plus-separated /etc/cpa-manager-plus /opt/cpa-manager-plus-separated/bin/cpa-manager-plus-api
+ReadWritePaths=/var/lib/cpa-manager-plus
+
+[Install]
+WantedBy=multi-user.target

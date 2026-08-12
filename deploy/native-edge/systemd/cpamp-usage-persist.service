@@ -1,0 +1,24 @@
+[Unit]
+Description=CPA Manager Plus Redis to PostgreSQL usage persist worker
+After=cpamp-usage-redis.service postgresql.service
+Requires=cpamp-usage-redis.service postgresql.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=cpa-manager-plus
+Group=cpa-manager-plus
+EnvironmentFile=/etc/cpa-manager-plus-separated/worker.env
+ExecStartPre=/usr/bin/pg_isready -q -h /var/run/postgresql
+ExecStart=/opt/cpa-manager-plus/cpamp-migration persist --batch-size 100 --max-batches 0 --follow --claim-idle 30s --delete-after-ack
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

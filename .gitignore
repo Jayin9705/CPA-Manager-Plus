@@ -59,6 +59,7 @@ TODO.md
 **/backups/
 
 # Generated build and test artifacts
+__pycache__/
 /apps/manager-server/cpa-manager-plus
 /apps/manager-server/*.test
 /apps/manager-server/internal/httpapi/web/management-assets/assets/

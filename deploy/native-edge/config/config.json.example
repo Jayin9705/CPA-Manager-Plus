@@ -1,0 +1,14 @@
+{
+  "httpAddr": "127.0.0.1:18318",
+  "dataDir": "/var/lib/cpa-manager-plus",
+  "adminKeyFile": "/etc/cpa-manager-plus/secrets/cpamp-admin-key",
+  "dataKeyPath": "/var/lib/cpa-manager-plus/data.key",
+  "cpaUpstreamUrl": "http://127.0.0.1:8317",
+  "managementKeyFile": "/etc/cpa-manager-plus/secrets/cpa-management-key",
+  "collectorMode": "auto",
+  "queue": "usage",
+  "popSide": "right",
+  "batchSize": 100,
+  "pollIntervalMs": 500,
+  "queryLimit": 50000
+}
