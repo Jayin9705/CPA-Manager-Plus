@@ -37,7 +37,15 @@ type PublicManagerConfig struct {
 }
 
 type PublicManagerCPAConnectionConfig struct {
-	CPABaseURL              string `json:"cpaBaseUrl"`
+	CPABaseURL string `json:"cpaBaseUrl"`
+	// ManagementKey 必须继续下发。前端 usePanelFeatureAvailability 用
+	// !!cpaConnection.managementKey 判定 requestMonitoringAvailable，
+	// 进而决定"请求监控 / 实时监控 / 模型单价"等菜单是否渲染。
+	// 上游 v1.14.10 开始只下发 managementKeyConfigured（布尔），
+	// 会让仍在使用旧版 console 的部署（本 fork 就是这样，console 由
+	// nginx 独立提供、未随二进制升级）把这些菜单整体隐藏。
+	// 该接口本身受管理面板鉴权保护，且旧版一直返回明文，故保留此字段。
+	ManagementKey           string `json:"managementKey"`
 	ManagementKeyConfigured bool   `json:"managementKeyConfigured"`
 }
 
@@ -339,6 +347,7 @@ func PublicConfig(cfg store.ManagerConfig) PublicManagerConfig {
 	return PublicManagerConfig{
 		CPAConnection: PublicManagerCPAConnectionConfig{
 			CPABaseURL:              cfg.CPAConnection.CPABaseURL,
+			ManagementKey:           strings.TrimSpace(cfg.CPAConnection.ManagementKey),
 			ManagementKeyConfigured: strings.TrimSpace(cfg.CPAConnection.ManagementKey) != "",
 		},
 		Collector:            cfg.Collector,
