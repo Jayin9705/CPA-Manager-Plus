@@ -1,4 +1,5 @@
 import { modelsApi } from '@/services/api';
+import { hasMetaDcaAuthorizationHeader, isMetaDcaCredential } from '@/utils/metaProvider';
 import type { GeminiKeyConfig, OpenAIProviderConfig, ProviderKeyConfig } from '@/types';
 import { normalizeAuthIndex } from '@/utils/authIndex';
 import { hasHeader } from '@/utils/headers';
@@ -44,7 +45,7 @@ export interface ProviderHealthCheckSummary {
 
 type ProviderHealthCheckTarget =
   | { kind: 'gemini' | 'interactions'; config: GeminiKeyConfig }
-  | { kind: 'codex' | 'xai' | 'claude' | 'vertex'; config: ProviderKeyConfig }
+  | { kind: 'codex' | 'xai' | 'meta' | 'claude' | 'vertex'; config: ProviderKeyConfig }
   | { kind: 'openai'; config: OpenAIProviderConfig; keyIndex: number };
 
 const EMPTY_MODELS_ERROR = 'No models returned';
@@ -147,7 +148,7 @@ const joinProviderLabel = (kindLabel: string, identity: string): string => {
 const getKeyProviderDisplay = (
   row: Extract<
     ProviderRow,
-    { kind: 'gemini' | 'interactions' | 'codex' | 'xai' | 'claude' | 'vertex' }
+    { kind: 'gemini' | 'interactions' | 'codex' | 'xai' | 'meta' | 'claude' | 'vertex' }
   >
 ): Pick<ProviderHealthCheckItem, 'providerLabel' | 'providerSubtitle'> => {
   const kindLabel = PROVIDER_KIND_LABELS[row.kind];
@@ -195,7 +196,7 @@ const requireCredential = (
 const buildKeyProviderItem = (
   row: Extract<
     ProviderRow,
-    { kind: 'gemini' | 'interactions' | 'codex' | 'xai' | 'claude' | 'vertex' }
+    { kind: 'gemini' | 'interactions' | 'codex' | 'xai' | 'meta' | 'claude' | 'vertex' }
   >
 ): ProviderHealthCheckItem => {
   const providerDisplay = getKeyProviderDisplay(row);
@@ -234,10 +235,9 @@ const buildOpenAIProviderItems = (
         providerIndex: row.originalIndex,
         providerLabel: providerDisplay.providerLabel,
         providerSubtitle: providerDisplay.providerSubtitle,
-        targetLabel: 'Key #1',
-        targetLabelKey: 'ai_providers.health_check_key_index',
-        targetLabelValues: { index: 1 },
-        detailLabel: 'No key entries',
+        targetLabel: 'No API key configured',
+        targetLabelKey: 'ai_providers.health_check_no_key_entries',
+        detailLabel: 'No API key configured',
         detailLabelKey: 'ai_providers.health_check_no_key_entries',
         baseUrl: row.baseUrl,
         status: 'pending',
@@ -249,6 +249,7 @@ const buildOpenAIProviderItems = (
 
   return entries.map((entry, keyIndex) => {
     const credentialDetail = getCredentialDetailLabel(entry.apiKey, entry.authIndex);
+    const hasApiKey = Boolean(entry.apiKey?.trim());
     return {
       id: `${row.key}:key:${keyIndex}`,
       providerKey: row.key,
@@ -256,8 +257,10 @@ const buildOpenAIProviderItems = (
       providerIndex: row.originalIndex,
       providerLabel: providerDisplay.providerLabel,
       providerSubtitle: providerDisplay.providerSubtitle,
-      targetLabel: `Key #${keyIndex + 1}`,
-      targetLabelKey: 'ai_providers.health_check_key_index',
+      targetLabel: hasApiKey ? `Key #${keyIndex + 1}` : `Keyless #${keyIndex + 1}`,
+      targetLabelKey: hasApiKey
+        ? 'ai_providers.health_check_key_index'
+        : 'ai_providers.health_check_keyless_index',
       targetLabelValues: { index: keyIndex + 1 },
       detailLabel: credentialDetail.detailLabel,
       detailLabelKey: credentialDetail.detailLabelKey,
@@ -349,7 +352,8 @@ const testVertexByStandardModelsEndpoints = async (config: ProviderKeyConfig): P
       config.baseUrl ?? '',
       config.apiKey?.trim() || undefined,
       config.headers ?? {},
-      normalizeAuthIndex(config.authIndex) ?? undefined
+      normalizeAuthIndex(config.authIndex) ?? undefined,
+      config.proxyUrl
     );
     return ensureNonEmptyModels(models);
   } catch (err) {
@@ -361,7 +365,8 @@ const testVertexByStandardModelsEndpoints = async (config: ProviderKeyConfig): P
       config.baseUrl ?? '',
       config.apiKey?.trim() || undefined,
       config.headers ?? {},
-      normalizeAuthIndex(config.authIndex) ?? undefined
+      normalizeAuthIndex(config.authIndex) ?? undefined,
+      config.proxyUrl
     );
     return ensureNonEmptyModels(models);
   } catch (err) {
@@ -400,17 +405,30 @@ export const runProviderHealthCheckItem = async (
         target.config.baseUrl ?? '',
         target.config.apiKey?.trim() || undefined,
         target.config.headers ?? {},
-        normalizeAuthIndex(target.config.authIndex) ?? undefined
+        normalizeAuthIndex(target.config.authIndex) ?? undefined,
+        target.config.proxyUrl
       );
       modelCount = ensureNonEmptyModels(models);
-    } else if (target.kind === 'codex' || target.kind === 'xai') {
+    } else if (target.kind === 'codex' || target.kind === 'xai' || target.kind === 'meta') {
       requireCredential(target.config.apiKey, target.config.authIndex, target.config.headers);
+      if (target.kind === 'meta') {
+        if (
+          isMetaDcaCredential(target.config.apiKey) ||
+          hasMetaDcaAuthorizationHeader(target.config.headers)
+        ) {
+          throw new HealthCheckError(
+            'DCA credentials cannot be used for Meta API provider authentication',
+            'ai_providers.meta_dca_not_accepted'
+          );
+        }
+      }
       const hasCustomAuthorization = hasHeader(target.config.headers, 'authorization');
       const models = await modelsApi.fetchV1ModelsViaApiCall(
         target.config.baseUrl ?? '',
         hasCustomAuthorization ? undefined : target.config.apiKey?.trim() || undefined,
         target.config.headers ?? {},
-        normalizeAuthIndex(target.config.authIndex) ?? undefined
+        normalizeAuthIndex(target.config.authIndex) ?? undefined,
+        target.config.proxyUrl
       );
       modelCount = ensureNonEmptyModels(models);
     } else if (target.kind === 'claude') {
@@ -419,7 +437,8 @@ export const runProviderHealthCheckItem = async (
         target.config.baseUrl ?? '',
         target.config.apiKey?.trim() || undefined,
         target.config.headers ?? {},
-        normalizeAuthIndex(target.config.authIndex) ?? undefined
+        normalizeAuthIndex(target.config.authIndex) ?? undefined,
+        target.config.proxyUrl
       );
       modelCount = ensureNonEmptyModels(models);
     } else if (target.kind === 'vertex') {
@@ -427,19 +446,20 @@ export const runProviderHealthCheckItem = async (
       modelCount = await testVertexByStandardModelsEndpoints(target.config);
     } else if (target.kind === 'openai') {
       const entry = target.config.apiKeyEntries?.[target.keyIndex];
-      const authIndex =
-        normalizeAuthIndex(entry?.authIndex ?? target.config.authIndex) ?? undefined;
-      requireCredential(entry?.apiKey, authIndex, {
-        ...(target.config.headers ?? {}),
-        ...(entry?.headers ?? {}),
-      });
+      // CPA may assign an auth-index to keyless providers with no key
+      // entries. Only use an auth-index when an explicit entry exists.
+      const authIndex = entry
+        ? normalizeAuthIndex(entry.authIndex ?? target.config.authIndex) ?? undefined
+        : undefined;
       const headers = { ...(target.config.headers ?? {}), ...(entry?.headers ?? {}) };
       const hasAuthHeader = hasHeader(headers, 'authorization');
       const models = await modelsApi.fetchModelsViaApiCall(
         target.config.baseUrl ?? '',
         hasAuthHeader ? undefined : entry?.apiKey?.trim() || undefined,
         headers,
-        authIndex
+        authIndex,
+        entry?.proxyUrl,
+        !entry?.apiKey?.trim()
       );
       modelCount = ensureNonEmptyModels(models);
     }

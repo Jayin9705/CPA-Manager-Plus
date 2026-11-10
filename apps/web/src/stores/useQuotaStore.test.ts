@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CodexQuotaState } from '@/types';
+import type {
+  AntigravityQuotaState,
+  ClaudeQuotaState,
+  CodexQuotaState,
+  DevinQuotaState,
+  KimiQuotaState,
+  MetaQuotaState,
+  XaiQuotaState,
+} from '@/types';
 
 type StorageLike = {
   getItem: (key: string) => string | null;
@@ -24,13 +32,21 @@ const createMemoryStorage = (): StorageLike => {
   };
 };
 
-const readPersistedCodexQuota = async () => {
+const readPersistedQuotaState = async () => {
   const { STORAGE_KEY_QUOTA_CACHE } = await import('@/utils/constants');
   const { obfuscatedStorage } = await import('@/services/storage/secureStorage');
   const persisted = obfuscatedStorage.getItem<{
-    state?: { codexQuota?: Record<string, CodexQuotaState> };
+    state?: {
+      antigravityQuota?: Record<string, AntigravityQuotaState>;
+      claudeQuota?: Record<string, ClaudeQuotaState>;
+      codexQuota?: Record<string, CodexQuotaState>;
+      devinQuota?: Record<string, DevinQuotaState>;
+      kimiQuota?: Record<string, KimiQuotaState>;
+      metaQuota?: Record<string, MetaQuotaState>;
+      xaiQuota?: Record<string, XaiQuotaState>;
+    };
   }>(STORAGE_KEY_QUOTA_CACHE);
-  return persisted?.state?.codexQuota ?? {};
+  return persisted?.state ?? {};
 };
 
 const readPersistedQuotaScope = async () => {
@@ -55,18 +71,22 @@ describe('useQuotaStore persistence', () => {
     vi.unstubAllGlobals();
   });
 
-  it('persists only manually fetched Codex success states', async () => {
+  it('persists manually fetched Codex success and error states', async () => {
     const { useQuotaStore } = await import('./useQuotaStore');
 
     useQuotaStore.getState().setCodexQuota({
       manual: {
         status: 'success',
         windows: [],
+        authFileKey: 'manual',
+        authFileIdentityVerified: true,
         fetchedAtMs: 2_000,
       },
       observed: {
         status: 'success',
         windows: [],
+        authFileKey: 'observed',
+        authFileIdentityVerified: true,
         observedFromUsageHeaders: true,
         observedAtMs: 1_000,
       },
@@ -74,10 +94,379 @@ describe('useQuotaStore persistence', () => {
         status: 'error',
         windows: [],
         error: 'failed',
+        errorStatus: 401,
+        authFileKey: 'failed',
+        authFileIdentityVerified: true,
+      },
+      loading: {
+        status: 'loading',
+        windows: [],
       },
     });
 
-    expect(Object.keys(await readPersistedCodexQuota())).toEqual(['manual']);
+    const persisted = await readPersistedQuotaState();
+    expect(Object.keys(persisted.codexQuota ?? {})).toEqual(['manual', 'failed']);
+    expect(persisted.codexQuota?.failed).toMatchObject({
+      status: 'error',
+      error: 'failed',
+      errorStatus: 401,
+    });
+  });
+
+  it('persists success and error states for every quota provider', async () => {
+    const { useQuotaStore } = await import('./useQuotaStore');
+
+    useQuotaStore.getState().setClaudeQuota({
+      claudeSuccess: {
+        status: 'success',
+        windows: [],
+        authFileKey: 'claudeSuccess',
+        authFileIdentityVerified: true,
+      },
+      claudeError: {
+        status: 'error',
+        windows: [],
+        error: 'claude failed',
+        errorStatus: 500,
+        authFileKey: 'claudeError',
+        authFileIdentityVerified: true,
+      },
+      claudeLoading: { status: 'loading', windows: [] },
+    });
+    useQuotaStore.getState().setAntigravityQuota({
+      antigravitySuccess: {
+        status: 'success',
+        groups: [],
+        authFileKey: 'antigravitySuccess',
+        authFileIdentityVerified: true,
+      },
+      antigravityError: {
+        status: 'error',
+        groups: [],
+        error: 'antigravity failed',
+        authFileKey: 'antigravityError',
+        authFileIdentityVerified: true,
+      },
+      antigravityLoading: { status: 'loading', groups: [] },
+    });
+    useQuotaStore.getState().setKimiQuota({
+      kimiSuccess: {
+        status: 'success',
+        rows: [],
+        authFileKey: 'kimiSuccess',
+        authFileIdentityVerified: true,
+      },
+      kimiError: {
+        status: 'error',
+        rows: [],
+        error: 'kimi failed',
+        authFileKey: 'kimiError',
+        authFileIdentityVerified: true,
+      },
+      kimiLoading: { status: 'loading', rows: [] },
+    });
+    useQuotaStore.getState().setXaiQuota({
+      xaiSuccess: {
+        status: 'success',
+        billing: null,
+        authFileKey: 'xaiSuccess',
+        authFileIdentityVerified: true,
+      },
+      xaiError: {
+        status: 'error',
+        billing: null,
+        error: 'xai failed',
+        authFileKey: 'xaiError',
+        authFileIdentityVerified: true,
+      },
+      xaiLoading: { status: 'loading', billing: null },
+    });
+    useQuotaStore.getState().setDevinQuota({
+      devinSuccess: {
+        status: 'success',
+        windows: [],
+        observedAtMs: null,
+        plan: null,
+        planStartMs: null,
+        planEndMs: null,
+        authFileKey: 'devinSuccess',
+        authFileIdentityVerified: true,
+      },
+      devinError: {
+        status: 'error',
+        windows: [],
+        observedAtMs: null,
+        plan: null,
+        planStartMs: null,
+        planEndMs: null,
+        error: 'devin failed',
+        errorStatus: 500,
+        authFileKey: 'devinError',
+        authFileIdentityVerified: true,
+      },
+      devinLoading: {
+        status: 'loading',
+        windows: [],
+        observedAtMs: null,
+        plan: null,
+        planStartMs: null,
+        planEndMs: null,
+      },
+    });
+    useQuotaStore.getState().setMetaQuota({
+      metaSuccess: {
+        status: 'success',
+        windows: [
+          {
+            id: 'window',
+            usedPercent: 30,
+            resetAtMs: 1774000000000,
+            resetAccuracy: 'exact',
+            limitWindowSeconds: 18000,
+            quotaProgressObservedAtMs: 1773000000000,
+          },
+        ],
+        observedAtMs: 1773000000000,
+        plan: 'Meta Pro',
+        isSubscriptionActive: true,
+        quotaInventoryObserved: true,
+        authFileKey: 'metaSuccess',
+        authFileIdentityVerified: true,
+      },
+      metaError: {
+        status: 'error',
+        windows: [],
+        observedAtMs: 1773000000000,
+        plan: null,
+        isSubscriptionActive: null,
+        quotaInventoryObserved: false,
+        error: 'meta failed',
+        errorStatus: 401,
+        authFileKey: 'metaError',
+        authFileIdentityVerified: true,
+      },
+      metaLoading: {
+        status: 'loading',
+        windows: [],
+        observedAtMs: 1773000000000,
+        plan: null,
+        isSubscriptionActive: null,
+        quotaInventoryObserved: false,
+      },
+    });
+
+    const persisted = await readPersistedQuotaState();
+
+    expect(Object.keys(persisted.claudeQuota ?? {})).toEqual(['claudeSuccess', 'claudeError']);
+    expect(Object.keys(persisted.antigravityQuota ?? {})).toEqual([
+      'antigravitySuccess',
+      'antigravityError',
+    ]);
+    expect(Object.keys(persisted.kimiQuota ?? {})).toEqual(['kimiSuccess', 'kimiError']);
+    expect(Object.keys(persisted.xaiQuota ?? {})).toEqual(['xaiSuccess', 'xaiError']);
+    expect(Object.keys(persisted.devinQuota ?? {})).toEqual(['devinSuccess', 'devinError']);
+    expect(Object.keys(persisted.metaQuota ?? {})).toEqual(['metaSuccess', 'metaError']);
+
+    const persistedString = JSON.stringify(persisted);
+    expect(persistedString).not.toContain('dca:');
+    expect(persistedString).not.toContain('LLM|');
+  });
+
+  it('drops legacy and unverified quota cache entries while canonicalizing verified keys', async () => {
+    const { useQuotaStore } = await import('./useQuotaStore');
+
+    useQuotaStore.getState().setClaudeQuota({
+      legacy: { status: 'success', windows: [] },
+      unverified: {
+        status: 'success',
+        windows: [],
+        authFileKey: 'unverified',
+        authFileIdentityVerified: false,
+      },
+      oldFilenameKey: {
+        status: 'success',
+        windows: [],
+        authFileKey: 'canonical-credential-key',
+        authFileIdentityVerified: true,
+      },
+    });
+
+    const persisted = await readPersistedQuotaState();
+    expect(Object.keys(persisted.claudeQuota ?? {})).toEqual(['canonical-credential-key']);
+  });
+
+  it('hydrates persisted quota success and error states', async () => {
+    const { useQuotaStore } = await import('./useQuotaStore');
+
+    useQuotaStore.getState().setCodexQuota({
+      failed: {
+        status: 'error',
+        windows: [],
+        error: 'failed',
+        errorStatus: 401,
+        authFileKey: 'failed',
+        authFileIdentityVerified: true,
+      },
+    });
+    useQuotaStore.getState().setClaudeQuota({
+      claudeSuccess: {
+        status: 'success',
+        windows: [],
+        authFileKey: 'claudeSuccess',
+        authFileIdentityVerified: true,
+      },
+    });
+    useQuotaStore.getState().setDevinQuota({
+      devinSuccess: {
+        status: 'success',
+        windows: [],
+        observedAtMs: 1_000,
+        plan: 'Team',
+        planStartMs: null,
+        planEndMs: null,
+        authFileKey: 'devinSuccess',
+        authFileIdentityVerified: true,
+      },
+      devinError: {
+        status: 'error',
+        windows: [],
+        observedAtMs: null,
+        plan: null,
+        planStartMs: null,
+        planEndMs: null,
+        error: 'devin failed',
+        errorStatus: 502,
+        authFileKey: 'devinError',
+        authFileIdentityVerified: true,
+      },
+    });
+    useQuotaStore.getState().setMetaQuota({
+      metaSuccess: {
+        status: 'success',
+        windows: [],
+        observedAtMs: 1_000,
+        plan: 'Meta Pro',
+        isSubscriptionActive: true,
+        quotaInventoryObserved: true,
+        authFileKey: 'metaSuccess',
+        authFileIdentityVerified: true,
+      },
+      metaError: {
+        status: 'error',
+        windows: [],
+        observedAtMs: 1_000,
+        plan: null,
+        isSubscriptionActive: null,
+        quotaInventoryObserved: false,
+        error: 'meta failed',
+        errorStatus: 502,
+        authFileKey: 'metaError',
+        authFileIdentityVerified: true,
+      },
+    });
+
+    vi.resetModules();
+    const { useQuotaStore: hydratedQuotaStore } = await import('./useQuotaStore');
+
+    expect(hydratedQuotaStore.getState().codexQuota.failed).toMatchObject({
+      status: 'error',
+      errorStatus: 401,
+    });
+    expect(hydratedQuotaStore.getState().claudeQuota.claudeSuccess).toMatchObject({
+      status: 'success',
+    });
+    expect(hydratedQuotaStore.getState().devinQuota.devinSuccess).toMatchObject({
+      status: 'success',
+      plan: 'Team',
+    });
+    expect(hydratedQuotaStore.getState().devinQuota.devinError).toMatchObject({
+      status: 'error',
+      error: 'devin failed',
+      errorStatus: 502,
+    });
+    expect(hydratedQuotaStore.getState().metaQuota.metaSuccess).toMatchObject({
+      status: 'success',
+      plan: 'Meta Pro',
+    });
+    expect(hydratedQuotaStore.getState().metaQuota.metaError).toMatchObject({
+      status: 'error',
+      error: 'meta failed',
+      errorStatus: 502,
+    });
+  });
+
+  it('normalizes legacy scalar Codex spend-control limits while hydrating quota cache', async () => {
+    const { STORAGE_KEY_QUOTA_CACHE } = await import('@/utils/constants');
+    const { obfuscatedStorage } = await import('@/services/storage/secureStorage');
+
+    obfuscatedStorage.setItem(STORAGE_KEY_QUOTA_CACHE, {
+      state: {
+        cacheScope: 'legacy-scope',
+        codexQuota: {
+          legacyCodex: {
+            status: 'success',
+            windows: [],
+            authFileKey: 'legacy-codex',
+            authFileIdentityVerified: true,
+            fetchedAtMs: 2_000,
+            spendControlReached: true,
+            spendControlIndividualLimit: 200,
+          },
+          canonicalCodex: {
+            status: 'success',
+            windows: [],
+            authFileKey: 'canonical-codex',
+            authFileIdentityVerified: true,
+            fetchedAtMs: 3_000,
+            spendControlReached: true,
+            spendControlIndividualLimit: {
+              source: 'workspace_spend_controls',
+              unit: 'credit',
+              limit: '100',
+              used: '100',
+              remaining: '0',
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetAfterSeconds: 3600,
+              resetAtMs: 1_793_491_200_000,
+            },
+          },
+        },
+      },
+      version: 0,
+    });
+
+    vi.resetModules();
+    const { useQuotaStore: hydratedQuotaStore } = await import('./useQuotaStore');
+
+    expect(hydratedQuotaStore.getState().codexQuota['legacy-codex']).toMatchObject({
+      status: 'success',
+      spendControlReached: true,
+      spendControlIndividualLimit: {
+        source: null,
+        unit: null,
+        limit: '200',
+        used: null,
+        remaining: null,
+        usedPercent: null,
+        remainingPercent: null,
+        resetAfterSeconds: null,
+        resetAtMs: null,
+      },
+    });
+    expect(
+      hydratedQuotaStore.getState().codexQuota['canonical-codex'].spendControlIndividualLimit
+    ).toEqual({
+      source: 'workspace_spend_controls',
+      unit: 'credit',
+      limit: '100',
+      used: '100',
+      remaining: '0',
+      usedPercent: 100,
+      remainingPercent: 0,
+      resetAfterSeconds: 3600,
+      resetAtMs: 1_793_491_200_000,
+    });
   });
 
   it('clears quota state and persisted quota cache together', async () => {
@@ -87,14 +476,37 @@ describe('useQuotaStore persistence', () => {
       manual: {
         status: 'success',
         windows: [],
+        authFileKey: 'manual',
+        authFileIdentityVerified: true,
         fetchedAtMs: 2_000,
+      },
+    });
+    useQuotaStore.getState().setMetaQuota({
+      manualMeta: {
+        status: 'success',
+        windows: [],
+        observedAtMs: 2_000,
+        plan: null,
+        isSubscriptionActive: null,
+        quotaInventoryObserved: false,
+        authFileKey: 'manualMeta',
+        authFileIdentityVerified: true,
       },
     });
 
     useQuotaStore.getState().clearQuotaCache();
 
     expect(useQuotaStore.getState().codexQuota).toEqual({});
-    expect(await readPersistedCodexQuota()).toEqual({});
+    expect(useQuotaStore.getState().metaQuota).toEqual({});
+    expect(await readPersistedQuotaState()).toMatchObject({
+      antigravityQuota: {},
+      claudeQuota: {},
+      codexQuota: {},
+      devinQuota: {},
+      kimiQuota: {},
+      metaQuota: {},
+      xaiQuota: {},
+    });
   });
 
   it('keeps quota for the same connection scope and clears it when the scope changes', async () => {
@@ -105,6 +517,8 @@ describe('useQuotaStore persistence', () => {
       manual: {
         status: 'success',
         windows: [],
+        authFileKey: 'manual',
+        authFileIdentityVerified: true,
         fetchedAtMs: 2_000,
       },
     });
@@ -121,12 +535,19 @@ describe('useQuotaStore persistence', () => {
   });
 
   it('rejects stale async commits after the connection scope changes', async () => {
-    const { captureQuotaCacheGeneration, commitIfQuotaCacheCurrent, useQuotaStore } =
-      await import('./useQuotaStore');
+    const {
+      captureQuotaCacheGeneration,
+      commitIfQuotaCacheCurrent,
+      isQuotaCacheGenerationCurrent,
+      useQuotaStore,
+    } = await import('./useQuotaStore');
 
     useQuotaStore.getState().activateQuotaCacheScope('scope-a');
     const staleGeneration = captureQuotaCacheGeneration();
+    expect(isQuotaCacheGenerationCurrent(staleGeneration)).toBe(true);
+
     useQuotaStore.getState().activateQuotaCacheScope('scope-b');
+    expect(isQuotaCacheGenerationCurrent(staleGeneration)).toBe(false);
 
     let committed = false;
     expect(

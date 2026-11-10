@@ -3,10 +3,17 @@ package modelprice
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
 	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usagepricing"
 )
+
+var ErrStructureChangeAfterRawDeletion = errors.New("model price structure cannot change after archived raw usage has been deleted")
 
 type Repository interface {
 	LoadAll(ctx context.Context) (map[string]model.ModelPrice, error)
@@ -17,6 +24,24 @@ type Repository interface {
 
 type repository struct {
 	db *sql.DB
+}
+
+type configuredFlag bool
+
+func (f *configuredFlag) Scan(value any) error {
+	switch value := value.(type) {
+	case int64:
+		*f = value != 0
+		return nil
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return fmt.Errorf("invalid configured flag numeric value %v", value)
+		}
+		*f = value != 0
+		return nil
+	default:
+		return fmt.Errorf("invalid configured flag storage type %T", value)
+	}
 }
 
 func New(db *sql.DB) Repository {
@@ -55,7 +80,7 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 		var price model.ModelPrice
 		var source, sourceModelID sql.NullString
 		var syncedAt sql.NullInt64
-		var promptConfigured, completionConfigured, cacheReadConfigured, cacheCreationConfigured int
+		var promptConfigured, completionConfigured, cacheReadConfigured, cacheCreationConfigured configuredFlag
 		if err := rows.Scan(
 			&modelID,
 			&price.Prompt,
@@ -75,10 +100,10 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 			return nil, err
 		}
 		price.Source = source.String
-		price.PromptConfigured = promptConfigured != 0
-		price.CompletionConfigured = completionConfigured != 0
-		price.CacheReadConfigured = cacheReadConfigured != 0
-		price.CacheCreationConfigured = cacheCreationConfigured != 0
+		price.PromptConfigured = bool(promptConfigured)
+		price.CompletionConfigured = bool(completionConfigured)
+		price.CacheReadConfigured = bool(cacheReadConfigured)
+		price.CacheCreationConfigured = bool(cacheCreationConfigured)
 		price.SourceModelID = sourceModelID.String
 		if syncedAt.Valid {
 			value := syncedAt.Int64
@@ -104,7 +129,7 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 	for tierRows.Next() {
 		var modelID string
 		var tier model.ModelPriceContextTier
-		var promptConfigured, completionConfigured, cacheConfigured, cacheReadConfigured, cacheCreationConfigured int
+		var promptConfigured, completionConfigured, cacheConfigured, cacheReadConfigured, cacheCreationConfigured configuredFlag
 		if err := tierRows.Scan(
 			&modelID,
 			&tier.ThresholdTokens,
@@ -121,11 +146,11 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 		); err != nil {
 			return nil, err
 		}
-		tier.PromptConfigured = promptConfigured != 0
-		tier.CompletionConfigured = completionConfigured != 0
-		tier.CacheConfigured = cacheConfigured != 0
-		tier.CacheReadConfigured = cacheReadConfigured != 0
-		tier.CacheCreationConfigured = cacheCreationConfigured != 0
+		tier.PromptConfigured = bool(promptConfigured)
+		tier.CompletionConfigured = bool(completionConfigured)
+		tier.CacheConfigured = bool(cacheConfigured)
+		tier.CacheReadConfigured = bool(cacheReadConfigured)
+		tier.CacheCreationConfigured = bool(cacheCreationConfigured)
 		price, ok := prices[modelID]
 		if !ok {
 			continue
@@ -151,7 +176,7 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 	for serviceTierRows.Next() {
 		var modelID string
 		var tier model.ModelPriceServiceTier
-		var promptConfigured, completionConfigured, cacheConfigured, cacheReadConfigured, cacheCreationConfigured int
+		var promptConfigured, completionConfigured, cacheConfigured, cacheReadConfigured, cacheCreationConfigured configuredFlag
 		if err := serviceTierRows.Scan(
 			&modelID,
 			&tier.Mode,
@@ -169,11 +194,11 @@ func (r *repository) LoadAllTx(ctx context.Context, tx *sql.Tx) (map[string]mode
 		); err != nil {
 			return nil, err
 		}
-		tier.PromptConfigured = promptConfigured != 0
-		tier.CompletionConfigured = completionConfigured != 0
-		tier.CacheConfigured = cacheConfigured != 0
-		tier.CacheReadConfigured = cacheReadConfigured != 0
-		tier.CacheCreationConfigured = cacheCreationConfigured != 0
+		tier.PromptConfigured = bool(promptConfigured)
+		tier.CompletionConfigured = bool(completionConfigured)
+		tier.CacheConfigured = bool(cacheConfigured)
+		tier.CacheReadConfigured = bool(cacheReadConfigured)
+		tier.CacheCreationConfigured = bool(cacheCreationConfigured)
 		price, ok := prices[modelID]
 		if !ok {
 			continue
@@ -200,6 +225,7 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 		_ = tx.Rollback()
 	}()
 
+	beforePrices, err := r.LoadAllTx(ctx, tx)
 	existingRawJSON, err := loadRawJSONByModel(ctx, tx)
 	if err != nil {
 		return err
@@ -219,6 +245,17 @@ func (r *repository) ReplaceAll(ctx context.Context, prices map[string]model.Mod
 			return err
 		}
 		normalizedPrices[modelID] = price
+	}
+
+	beforeRevision := model.ModelPriceStructureRevision(beforePrices)
+	afterRevision := model.ModelPriceStructureRevision(normalizedPrices)
+	if beforeRevision != afterRevision {
+		if err := usagepricing.VerifyRetainedPricingRebuildSourceTx(ctx, tx); err != nil {
+			if errors.Is(err, usagepricing.ErrRetainedPricingHistoryIncomplete) {
+				return fmt.Errorf("%w: %v", ErrStructureChangeAfterRawDeletion, err)
+			}
+			return err
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `delete from model_price_service_tiers`); err != nil {
@@ -320,6 +357,11 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		_ = tx.Rollback()
 	}()
 
+	beforePrices, err := r.LoadAllTx(ctx, tx)
+	if err != nil {
+		return model.ModelPriceSyncResult{}, err
+	}
+
 	stmt, err := tx.PrepareContext(ctx, `insert into model_prices (
 		model, prompt_per_1m, completion_per_1m, cache_per_1m, cache_read_per_1m, cache_creation_per_1m,
 		prompt_configured, completion_configured, cache_read_configured, cache_creation_configured, source, source_model_id,
@@ -339,7 +381,8 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		source_model_id = excluded.source_model_id,
 		raw_json = excluded.raw_json,
 		updated_at_ms = excluded.updated_at_ms,
-		synced_at_ms = excluded.synced_at_ms`)
+		synced_at_ms = excluded.synced_at_ms
+	where lower(trim(coalesce(model_prices.source, ''))) <> 'manual'`)
 	if err != nil {
 		return model.ModelPriceSyncResult{}, err
 	}
@@ -390,7 +433,7 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		}
 		price.UpdatedAtMS = now
 		price.SyncedAtMS = &now
-		if _, err := stmt.ExecContext(
+		execResult, err := stmt.ExecContext(
 			ctx,
 			modelID,
 			price.Prompt,
@@ -407,8 +450,17 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 			nullString(price.RawJSON),
 			now,
 			now,
-		); err != nil {
+		)
+		if err != nil {
 			return model.ModelPriceSyncResult{}, err
+		}
+		rowsAffected, err := execResult.RowsAffected()
+		if err != nil {
+			return model.ModelPriceSyncResult{}, err
+		}
+		if rowsAffected == 0 {
+			result.Preserved = append(result.Preserved, modelID)
+			continue
 		}
 		if _, err := deleteTierStmt.ExecContext(ctx, modelID); err != nil {
 			return model.ModelPriceSyncResult{}, err
@@ -424,6 +476,21 @@ func (r *repository) UpsertSynced(ctx context.Context, prices map[string]model.M
 		}
 		result.Imported++
 	}
+	afterPrices, err := r.LoadAllTx(ctx, tx)
+	if err != nil {
+		return model.ModelPriceSyncResult{}, err
+	}
+	beforeRevision := model.ModelPriceStructureRevision(beforePrices)
+	afterRevision := model.ModelPriceStructureRevision(afterPrices)
+	if beforeRevision != afterRevision {
+		if err := usagepricing.VerifyRetainedPricingRebuildSourceTx(ctx, tx); err != nil {
+			if errors.Is(err, usagepricing.ErrRetainedPricingHistoryIncomplete) {
+				return model.ModelPriceSyncResult{}, fmt.Errorf("%w: %v", ErrStructureChangeAfterRawDeletion, err)
+			}
+			return model.ModelPriceSyncResult{}, err
+		}
+	}
+	sort.Strings(result.Preserved)
 	if err := tx.Commit(); err != nil {
 		return model.ModelPriceSyncResult{}, err
 	}

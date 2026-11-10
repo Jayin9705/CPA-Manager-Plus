@@ -16,8 +16,23 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('@/components/ui/Modal', () => ({
-  Modal: ({ children, open }: { children: ReactNode; open: boolean }) =>
-    open ? <div>{children}</div> : null,
+  Modal: ({
+    children,
+    footer,
+    open,
+    width,
+  }: {
+    children: ReactNode;
+    footer: ReactNode;
+    open: boolean;
+    width?: number;
+  }) =>
+    open ? (
+      <div data-modal-width={width}>
+        <div data-testid="dialog-body">{children}</div>
+        <footer>{footer}</footer>
+      </div>
+    ) : null,
 }));
 
 const renderModal = () => {
@@ -50,6 +65,22 @@ beforeEach(() => {
 });
 
 describe('ConfirmationModal', () => {
+  it('forwards a feature-specific dialog width', () => {
+    useNotificationStore.getState().showConfirmation({
+      message: 'Structured details',
+      width: 720,
+      onConfirm: vi.fn(),
+    });
+
+    const renderer = renderModal();
+
+    expect(renderer.root.findByProps({ 'data-modal-width': 720 })).toBeTruthy();
+    expect(renderer.root.findByType('footer').findAllByType(Button)).toHaveLength(2);
+    expect(
+      renderer.root.findByProps({ 'data-testid': 'dialog-body' }).findAllByType(Button)
+    ).toHaveLength(0);
+  });
+
   it('executes ordinary confirmations after one click', async () => {
     const onConfirm = vi.fn();
     useNotificationStore.getState().showConfirmation({
@@ -119,10 +150,12 @@ describe('ConfirmationModal', () => {
   });
 
   it('starts a replacement confirmation from the first step', async () => {
+    const replacedOnCancel = vi.fn();
     useNotificationStore.getState().showConfirmation({
       message: 'First warning',
       secondConfirmation: { message: 'Final warning' },
       onConfirm: vi.fn(),
+      onCancel: replacedOnCancel,
     });
     useNotificationStore.getState().advanceConfirmation();
 
@@ -132,6 +165,7 @@ describe('ConfirmationModal', () => {
       onConfirm: vi.fn(),
     });
 
+    expect(replacedOnCancel).toHaveBeenCalledTimes(1);
     expect(useNotificationStore.getState().confirmation).toMatchObject({
       isOpen: true,
       isLoading: false,
@@ -140,5 +174,32 @@ describe('ConfirmationModal', () => {
     expect(useNotificationStore.getState().confirmation.options?.message).toBe(
       'Replacement warning'
     );
+  });
+
+  it('keeps a loading confirmation and cancels its replacement request', () => {
+    const activeOnCancel = vi.fn();
+    const replacementOnCancel = vi.fn();
+    const activeOptions = {
+      message: 'Running action',
+      onConfirm: vi.fn(),
+      onCancel: activeOnCancel,
+    };
+    useNotificationStore.getState().showConfirmation(activeOptions);
+    useNotificationStore.getState().setConfirmationLoading(true);
+
+    useNotificationStore.getState().showConfirmation({
+      message: 'Replacement warning',
+      onConfirm: vi.fn(),
+      onCancel: replacementOnCancel,
+    });
+
+    expect(activeOnCancel).not.toHaveBeenCalled();
+    expect(replacementOnCancel).toHaveBeenCalledTimes(1);
+    expect(useNotificationStore.getState().confirmation).toMatchObject({
+      isOpen: true,
+      isLoading: true,
+      step: 1,
+      options: activeOptions,
+    });
   });
 });

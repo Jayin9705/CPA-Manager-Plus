@@ -2,8 +2,10 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Drawer } from '@/components/ui/Drawer';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
+import { CoolingPolicySelect } from '../CoolingPolicySelect';
 import { IconCheck, IconX } from '@/components/ui/icons';
 import { maskApiKey } from '@/utils/format';
+import { getOpenAIKeyCount } from '@/utils/openAIKeyEntries';
 import { ProviderStatusBar } from '../ProviderStatusBar';
 import {
   getOpenAIEntryKey,
@@ -12,6 +14,7 @@ import {
   type ProviderRecentUsageMap,
 } from '../utils';
 import { getProviderKindIcon, PROVIDER_KIND_LABELS } from '../ProviderTable/kindMeta';
+import { coolingPolicyFromOverride, type CoolingPolicy } from '@/types';
 import type { ProviderRow } from '../ProviderTable/rowData';
 import styles from './ProviderDetailDrawer.module.scss';
 
@@ -28,7 +31,7 @@ interface ProviderDetailDrawerProps {
   onToggle: (row: ProviderRow, enabled: boolean) => void;
   onToggleWebsockets: (row: ProviderRow, enabled: boolean) => void;
   onToggleCloak: (row: ProviderRow, enabled: boolean) => void;
-  onToggleDisableCooling: (row: ProviderRow, enabled: boolean) => void;
+  onToggleDisableCooling: (row: ProviderRow, policy: CoolingPolicy) => void;
 }
 
 interface FieldRowProps {
@@ -62,6 +65,8 @@ export function ProviderDetailDrawer({
   onToggleDisableCooling,
 }: ProviderDetailDrawerProps) {
   const { t } = useTranslation();
+  const formatCredentialWeight = (weight: number | undefined) =>
+    weight === undefined ? `1 (${t('ai_providers.weight_default_label')})` : String(weight);
 
   const renderQuickSwitches = () => {
     if (!row) return null;
@@ -72,7 +77,7 @@ export function ProviderDetailDrawer({
       (row.kind === 'codex' || row.kind === 'xai' || row.raw.websockets !== undefined);
     const showCloak =
       supportsProviderKeySwitches && (row.kind === 'claude' || row.raw.cloak !== undefined);
-    const showDisableCooling = row.kind !== 'vertex';
+    const showDisableCooling = true;
     if (!showWebsockets && !showCloak && !showDisableCooling) return null;
 
     return (
@@ -119,17 +124,19 @@ export function ProviderDetailDrawer({
             <div className={styles.quickSwitchRow}>
               <div className={styles.quickSwitchText}>
                 <span className={styles.quickSwitchLabel}>
-                  {t('ai_providers.disable_cooling_label')}
+                  {t('ai_providers.cooling_policy_label')}
                 </span>
                 <span className={styles.quickSwitchHint}>
-                  {t('ai_providers.disable_cooling_hint')}
+                  {t('ai_providers.cooling_policy_hint')}
                 </span>
               </div>
-              <ToggleSwitch
-                checked={Boolean(row.raw.disableCooling)}
+              <CoolingPolicySelect
+                value={coolingPolicyFromOverride(row.raw.disableCooling)}
                 disabled={toggleDisabled}
                 onChange={(value) => onToggleDisableCooling(row, value)}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
+                id="provider-detail-cooling-policy"
+                compact
+                legacyProviderSupported={row.kind !== 'vertex'}
               />
             </div>
           )}
@@ -169,15 +176,17 @@ export function ProviderDetailDrawer({
     if (!row || row.kind !== 'openai') return null;
     const provider = row.raw;
     const entries = provider.apiKeyEntries ?? [];
-    if (!entries.length) return null;
 
     return (
       <section className={styles.section}>
         <h4 className={styles.sectionTitle}>
-          {t('ai_providers.openai_keys_count')}: {entries.length}
+          {t('ai_providers.openai_keys_count')}: {getOpenAIKeyCount(entries)}
         </h4>
-        <div className={styles.keyEntryList}>
-          {entries.map((entry, entryIndex) => {
+        {entries.length === 0 ? (
+          <span>{t('ai_providers.health_check_no_key_entries')}</span>
+        ) : (
+          <div className={styles.keyEntryList}>
+            {entries.map((entry, entryIndex) => {
             const entryStats = getProviderTotalStats(
               usageByProvider,
               provider.name,
@@ -187,20 +196,34 @@ export function ProviderDetailDrawer({
             return (
               <div key={getOpenAIEntryKey(entry, entryIndex)} className={styles.keyEntryCard}>
                 <span className={styles.keyEntryIndex}>{entryIndex + 1}</span>
-                <span className={styles.keyEntryKey}>{maskApiKey(entry.apiKey)}</span>
+                <span className={styles.keyEntryKey}>
+                  {entry.apiKey?.trim()
+                    ? maskApiKey(entry.apiKey)
+                    : t('ai_providers.health_check_no_key_entries')}
+                </span>
+                <span className={styles.keyEntryWeight}>
+                  {t('ai_providers.weight_label')}: {formatCredentialWeight(entry.weight)}
+                </span>
                 {entry.proxyUrl && <span className={styles.keyEntryProxy}>{entry.proxyUrl}</span>}
                 <span className={styles.keyEntryStats}>
-                  <span className={styles.statSuccess}>
-                    <IconCheck size={12} /> {entryStats.success}
-                  </span>
-                  <span className={styles.statFailure}>
-                    <IconX size={12} /> {entryStats.failure}
-                  </span>
+                  {entry.apiKey?.trim() ? (
+                    <>
+                      <span className={styles.statSuccess}>
+                        <IconCheck size={12} /> {entryStats.success}
+                      </span>
+                      <span className={styles.statFailure}>
+                        <IconX size={12} /> {entryStats.failure}
+                      </span>
+                    </>
+                  ) : (
+                    t('ai_providers.usage_stats_unavailable')
+                  )}
                 </span>
               </div>
             );
-          })}
-        </div>
+            })}
+          </div>
+        )}
       </section>
     );
   };
@@ -224,6 +247,12 @@ export function ProviderDetailDrawer({
           )}
           <FieldRow label={t('common.base_url')} value={row.baseUrl} />
           <FieldRow label={t('common.priority')} value={row.priority} />
+          {row.kind !== 'openai' && (
+            <FieldRow
+              label={t('ai_providers.weight_label')}
+              value={formatCredentialWeight(row.raw.weight)}
+            />
+          )}
           <FieldRow label={t('common.prefix')} value={row.raw.prefix} />
           {row.kind !== 'openai' && (
             <FieldRow label={t('common.proxy_url')} value={row.raw.proxyUrl} />
@@ -285,15 +314,24 @@ export function ProviderDetailDrawer({
 
         <section className={styles.section}>
           <h4 className={styles.sectionTitle}>{t('ai_providers.table_col_recent')}</h4>
-          <div className={styles.recentStats}>
-            <span className={styles.statSuccess}>
-              {t('stats.success')}: {row.stats.success}
-            </span>
-            <span className={styles.statFailure}>
-              {t('stats.failure')}: {row.stats.failure}
-            </span>
-          </div>
-          <ProviderStatusBar statusData={row.statusData} />
+          {row.usageStatsCoverage === 'unavailable' ? (
+            <div className={styles.recentStats}>{t('ai_providers.usage_stats_unavailable')}</div>
+          ) : (
+            <>
+              <div className={styles.recentStats}>
+                <span className={styles.statSuccess}>
+                  {t('stats.success')}: {row.stats.success}
+                </span>
+                <span className={styles.statFailure}>
+                  {t('stats.failure')}: {row.stats.failure}
+                </span>
+                {row.usageStatsCoverage === 'partial' && (
+                  <span>{t('ai_providers.usage_stats_partial')}</span>
+                )}
+              </div>
+              <ProviderStatusBar statusData={row.statusData} />
+            </>
+          )}
         </section>
       </>
     );

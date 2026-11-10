@@ -43,7 +43,9 @@ import {
   PayloadFilterRulesEditor,
   PayloadRulesEditor,
   PluginStoreAuthEditor,
+  StringListEditor,
 } from './VisualConfigEditorBlocks';
+import type { ApiKeyMutation } from './ApiKeysCardEditor';
 import styles from './VisualConfigEditor.module.scss';
 
 type VisualSectionId =
@@ -71,6 +73,10 @@ interface VisualConfigEditorProps {
   hasPayloadValidationErrors?: boolean;
   disabled?: boolean;
   onChange: (values: Partial<VisualConfigValues>) => void;
+  onPersistApiKeyMutation: (mutation: ApiKeyMutation) => Promise<string[]>;
+  onRefreshApiKeys: () => Promise<string[]>;
+  onApiKeyOperationStart: () => void;
+  onApiKeyOperationEnd: () => void;
 }
 
 function getValidationMessage(
@@ -178,6 +184,10 @@ export function VisualConfigEditor({
   hasPayloadValidationErrors = false,
   disabled = false,
   onChange,
+  onPersistApiKeyMutation,
+  onRefreshApiKeys,
+  onApiKeyOperationStart,
+  onApiKeyOperationEnd,
 }: VisualConfigEditorProps) {
   const { t } = useTranslation();
   const pageTransitionLayer = usePageTransitionLayer();
@@ -242,10 +252,6 @@ export function VisualConfigEditor({
     validationErrors?.['streaming.nonstreamKeepaliveInterval']
   );
 
-  const handleApiKeysTextChange = useCallback(
-    (apiKeysText: string) => onChange({ apiKeysText }),
-    [onChange]
-  );
   const handlePayloadDefaultRulesChange = useCallback(
     (payloadDefaultRules: PayloadRule[]) => onChange({ payloadDefaultRules }),
     [onChange]
@@ -772,7 +778,10 @@ export function VisualConfigEditor({
                 <ApiKeysCardEditor
                   value={values.apiKeysText}
                   disabled={disabled}
-                  onChange={handleApiKeysTextChange}
+                  onPersistApiKeyMutation={onPersistApiKeyMutation}
+                  onRefreshApiKeys={onRefreshApiKeys}
+                  onApiKeyOperationStart={onApiKeyOperationStart}
+                  onApiKeyOperationEnd={onApiKeyOperationEnd}
                 />
               </div>
             </SectionStack>
@@ -825,6 +834,13 @@ export function VisualConfigEditor({
                   checked={values.loggingToFile}
                   disabled={disabled}
                   onChange={(loggingToFile) => onChange({ loggingToFile })}
+                />
+                <ToggleRow
+                  title={t('basic_settings.request_log_enable')}
+                  description={t('basic_settings.request_log_warning')}
+                  checked={values.requestLog}
+                  disabled={disabled}
+                  onChange={(requestLog) => onChange({ requestLog })}
                 />
                 <ToggleRow
                   title={t('config_management.visual.sections.system.plugins_enabled')}
@@ -939,6 +955,34 @@ export function VisualConfigEditor({
                   error={redisUsageQueueRetentionError}
                 />
               </SectionGrid>
+
+              <SectionSubsection
+                title={t('config_management.visual.sections.system.devin_title')}
+                description={t(
+                  'config_management.visual.sections.system.devin_sensitive_words_desc'
+                )}
+              >
+                <FieldShell
+                  label={t(
+                    'config_management.visual.sections.system.devin_sensitive_words_label'
+                  )}
+                  hint={t(
+                    'config_management.visual.sections.system.devin_sensitive_words_hint'
+                  )}
+                >
+                  <StringListEditor
+                    value={values.devinSensitiveWords}
+                    disabled={disabled}
+                    placeholder={t(
+                      'config_management.visual.sections.system.devin_sensitive_words_placeholder'
+                    )}
+                    inputAriaLabel={t(
+                      'config_management.visual.sections.system.devin_sensitive_words_label'
+                    )}
+                    onChange={(devinSensitiveWords) => onChange({ devinSensitiveWords })}
+                  />
+                </FieldShell>
+              </SectionSubsection>
             </SectionStack>
           </ConfigSection>
 
@@ -1074,6 +1118,12 @@ export function VisualConfigEditor({
                       {
                         value: 'round-robin',
                         label: t('config_management.visual.sections.network.strategy_round_robin'),
+                      },
+                      {
+                        value: 'weighted-round-robin',
+                        label: t(
+                          'config_management.visual.sections.network.strategy_weighted_round_robin'
+                        ),
                       },
                       {
                         value: 'fill-first',
@@ -1254,15 +1304,17 @@ export function VisualConfigEditor({
                         onChange={(e) => onChange({ codexHeaderBetaFeatures: e.target.value })}
                         disabled={disabled}
                       />
-                      <ToggleRow
-                        title={t('config_management.visual.sections.headers.identity_confuse')}
-                        description={t(
-                          'config_management.visual.sections.headers.identity_confuse_desc'
-                        )}
-                        checked={values.codexIdentityConfuse}
-                        disabled={disabled}
-                        onChange={(codexIdentityConfuse) => onChange({ codexIdentityConfuse })}
-                      />
+                      {values.codexIdentityConfuseSupported && (
+                        <ToggleRow
+                          title={t('config_management.visual.sections.headers.identity_confuse')}
+                          description={t(
+                            'config_management.visual.sections.headers.identity_confuse_desc'
+                          )}
+                          checked={values.codexIdentityConfuse}
+                          disabled={disabled}
+                          onChange={(codexIdentityConfuse) => onChange({ codexIdentityConfuse })}
+                        />
+                      )}
                     </SectionGrid>
                   </SectionSubsection>
                 </SectionStack>

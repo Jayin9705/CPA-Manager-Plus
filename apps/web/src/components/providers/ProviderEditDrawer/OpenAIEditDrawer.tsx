@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAuthStore as useDiscoveryAuthStore } from '@/stores/useAuthStore';
+import { useRef, useLayoutEffect, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Drawer } from '@/components/ui/Drawer';
@@ -6,24 +7,55 @@ import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { HeaderInputList } from '@/components/ui/HeaderInputList';
 import { ModelInputList } from '@/components/ui/ModelInputList';
+import { InfoTooltip } from '@/components/ui/InfoTooltip';
 import { Modal } from '@/components/ui/Modal';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
-import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
 import { OpenAIKeyTestStatusIndicator } from '@/components/providers';
+import { CoolingPolicySelect } from '@/components/providers/CoolingPolicySelect';
 import { apiCallApi, getApiCallErrorDetails, modelsApi, providersApi } from '@/services/api';
 import { useConfigStore, useNotificationStore } from '@/stores';
-import type { ApiKeyEntry, OpenAIProviderConfig } from '@/types';
+import {
+  coolingPolicyFromOverride,
+  coolingPolicyToOverride,
+  toCommittedModelThinkingSnapshot,
+  type ApiKeyEntry,
+  type OpenAIProviderConfig,
+} from '@/types';
 import { buildHeaderObject, headersToEntries, normalizeHeaderEntries } from '@/utils/headers';
 import { normalizeAuthIndex } from '@/utils/authIndex';
+import {
+  getOpenAIKeyCount,
+  getOpenAIModelDiscoveryEntry,
+  updateOpenAIApiKey,
+  getOpenAITestableKeyIndexes,
+  hasOpenAIKeyEntryConfiguration,
+} from '@/utils/openAIKeyEntries';
 import { areKeyValueEntriesEqual, areModelEntriesEqual } from '@/utils/compare';
-import { entriesToModels, modelsToEntries } from '@/components/ui/modelInputListUtils';
-import { buildApiKeyEntry, buildOpenAIChatCompletionsEndpoint } from '@/components/providers/utils';
+import {
+  cloneModelEntry,
+  entriesToModels,
+  hasInvalidThinkingLevels,
+  modelsToEntries,
+} from '@/components/ui/modelInputListUtils';
+import {
+  buildApiKeyEntry,
+  buildOpenAIChatCompletionsEndpoint,
+  toCommittedOpenAIProviderSnapshot,
+} from '@/components/providers/utils';
 import {
   appendIdleKeyTestStatus,
   removeKeyTestStatusAtIndex,
 } from '@/features/aiProviders/model/keyTestStatuses';
-import type { ModelInfo } from '@/utils/models';
-import type { OpenAIFormState } from '@/components/providers';
+import { modelDisplayLabel, type ModelInfo } from '@/utils/models';
+import type { OpenAIFormApiKeyEntry, OpenAIFormState } from '@/components/providers';
+import {
+  MAX_CREDENTIAL_WEIGHT,
+  getCredentialWeightComparisonValue,
+  getCredentialWeightError,
+  normalizeCredentialWeight,
+  toCredentialWeightInputValue,
+  type CredentialWeightComparisonValue,
+} from '@/utils/credentialWeight';
 import styles from '@/features/aiProviders/AiProvidersPage.module.scss';
 
 interface OpenAIEditDrawerProps {
@@ -47,6 +79,7 @@ const buildEmptyForm = (): OpenAIFormState => ({
   apiKeyEntries: [buildApiKeyEntry()],
   modelEntries: [{ name: '', alias: '' }],
   testModel: undefined,
+  disableCooling: 'inherit',
 });
 
 const normalizeModelEntries = (entries: OpenAIFormState['modelEntries']) =>
@@ -55,7 +88,7 @@ const normalizeModelEntries = (entries: OpenAIFormState['modelEntries']) =>
     let alias = String(entry?.alias ?? '').trim();
     if (name && (alias === '' || alias === name)) alias = '';
     if (!name && !alias) return acc;
-    acc.push({ ...entry, name, alias });
+    acc.push(cloneModelEntry(entry, { name, alias }));
     return acc;
   }, []);
 
@@ -70,21 +103,23 @@ const normalizeKeyHeaders = (headers: ApiKeyEntry['headers']) => {
     });
 };
 
-const normalizeApiKeyEntries = (entries: ApiKeyEntry[]) =>
+const normalizeApiKeyEntries = (entries: OpenAIFormApiKeyEntry[]) =>
   (entries ?? []).reduce<
     Array<{
       apiKey: string;
+      weight: CredentialWeightComparisonValue;
       proxyUrl: string;
       authIndex: string;
       headers: ReturnType<typeof normalizeKeyHeaders>;
     }>
   >((acc, entry) => {
     const apiKey = String(entry?.apiKey ?? '').trim();
+    const weight = getCredentialWeightComparisonValue(entry?.weight);
     const proxyUrl = String(entry?.proxyUrl ?? '').trim();
     const authIndex = normalizeAuthIndex(entry?.authIndex) ?? '';
     const headers = normalizeKeyHeaders(entry?.headers);
-    if (!apiKey && !proxyUrl && !authIndex && headers.length === 0) return acc;
-    acc.push({ apiKey, proxyUrl, authIndex, headers });
+    if (!apiKey && weight === null && !proxyUrl && !authIndex && headers.length === 0) return acc;
+    acc.push({ apiKey, weight, proxyUrl, authIndex, headers });
     return acc;
   }, []);
 
@@ -96,10 +131,10 @@ const buildOpenAIBaseline = (form: OpenAIFormState) => ({
       : null,
   prefix: String(form.prefix ?? '').trim(),
   baseUrl: String(form.baseUrl ?? '').trim(),
-  disableCooling: Boolean(form.disableCooling),
+  disableCooling: form.disableCooling,
   headers: normalizeHeaderEntries(form.headers),
   apiKeyEntries: normalizeApiKeyEntries(form.apiKeyEntries),
-  models: normalizeModelEntries(form.modelEntries),
+  models: normalizeModelEntries(form.modelEntries).map(toCommittedModelThinkingSnapshot),
 });
 
 const areNormalizedApiKeyEntriesEqual = (
@@ -112,10 +147,14 @@ const areNormalizedApiKeyEntriesEqual = (
     const left = a[i];
     const right = b[i];
     if (!left || !right) return false;
+    // auth-index is server-generated runtime identity, not user configuration.
+    // Editing a key intentionally clears it; restoring the original visible
+    // configuration must therefore not remain dirty solely because the old
+    // runtime identity is gone.
     if (
       left.apiKey !== right.apiKey ||
-      left.proxyUrl !== right.proxyUrl ||
-      left.authIndex !== right.authIndex
+      left.weight !== right.weight ||
+      left.proxyUrl !== right.proxyUrl
     )
       return false;
     if (!areKeyValueEntriesEqual(left.headers, right.headers)) return false;
@@ -169,6 +208,7 @@ export function OpenAIEditDrawer({
   const [modelDiscoveryFetching, setModelDiscoveryFetching] = useState(false);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [discoveredModels, setDiscoveredModels] = useState<ModelInfo[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelDiscoverySearch, setModelDiscoverySearch] = useState('');
   const [modelDiscoverySelected, setModelDiscoverySelected] = useState<Set<string>>(new Set());
 
@@ -188,9 +228,7 @@ export function OpenAIEditDrawer({
     [form.modelEntries]
   );
   const hasConfiguredModels = form.modelEntries.some((entry) => entry.name.trim());
-  const hasTestableKeys = form.apiKeyEntries.some(
-    (entry) => entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex)
-  );
+  const hasTestableKeys = form.apiKeyEntries.length > 0;
 
   useEffect(() => {
     if (!open) return;
@@ -233,7 +271,7 @@ export function OpenAIEditDrawer({
         apiKeyEntries: initialData.apiKeyEntries?.length
           ? initialData.apiKeyEntries
           : [buildApiKeyEntry()],
-        disableCooling: initialData.disableCooling,
+        disableCooling: coolingPolicyFromOverride(initialData.disableCooling),
       };
       setForm(seededForm);
       setBaseline(buildOpenAIBaseline(seededForm));
@@ -264,7 +302,17 @@ export function OpenAIEditDrawer({
     }
   }, [availableModels, loaded, testModel]);
 
-  const canSave = !disabled && !loading && !saving && !invalidIndex && !isTestingKeys;
+  const hasInvalidWeight = form.apiKeyEntries.some((entry) =>
+    getCredentialWeightError(entry.weight)
+  );
+  const canSave =
+    !disabled &&
+    !loading &&
+    !saving &&
+    !invalidIndex &&
+    !isTestingKeys &&
+    !hasInvalidWeight &&
+    !hasInvalidThinkingLevels(form.modelEntries);
 
   const isDirty = useMemo(() => {
     const normalizedPriority =
@@ -276,7 +324,7 @@ export function OpenAIEditDrawer({
       baseline.priority !== normalizedPriority ||
       baseline.prefix !== form.prefix.trim() ||
       baseline.baseUrl !== form.baseUrl.trim() ||
-      baseline.disableCooling !== Boolean(form.disableCooling) ||
+      baseline.disableCooling !== form.disableCooling ||
       !areKeyValueEntriesEqual(baseline.headers, normalizeHeaderEntries(form.headers)) ||
       !areNormalizedApiKeyEntriesEqual(
         baseline.apiKeyEntries,
@@ -294,33 +342,67 @@ export function OpenAIEditDrawer({
   }, [isDirty, onClose, saving, t]);
 
   // Model discovery
+  const discoveryConnection = useDiscoveryAuthStore((state) =>
+    JSON.stringify([state.apiBase, state.managementKey])
+  );
+  const discoveryScope = JSON.stringify([
+    discoveryConnection,
+    open,
+    editIndex,
+    form.baseUrl,
+    form.apiKeyEntries,
+    buildHeaderObject(form.headers),
+  ]);
+  const activeDiscoveryScopeRef = useRef(discoveryScope);
+  activeDiscoveryScopeRef.current = discoveryScope;
+  const modelDiscoveryRequestIdRef = useRef(0);
+  useLayoutEffect(() => {
+    modelDiscoveryRequestIdRef.current += 1;
+    setDiscoveredModels([]);
+    setModelsLoaded(false);
+    setModelDiscoveryError('');
+    setModelDiscoveryFetching(false);
+    return () => {
+      modelDiscoveryRequestIdRef.current += 1;
+    };
+  }, [discoveryScope]);
+
   const fetchModelDiscovery = useCallback(async () => {
+    const requestId = ++modelDiscoveryRequestIdRef.current;
+    const requestScope = discoveryScope;
+    const isCurrentDiscovery = () =>
+      modelDiscoveryRequestIdRef.current === requestId &&
+      activeDiscoveryScopeRef.current === requestScope;
     setModelDiscoveryFetching(true);
     setModelDiscoveryError('');
     const headerObject = buildHeaderObject(form.headers);
     try {
-      const firstKey = form.apiKeyEntries[0];
+      const firstKey = getOpenAIModelDiscoveryEntry(form.apiKeyEntries);
       const keyAuthIndex = normalizeAuthIndex(firstKey?.authIndex) ?? undefined;
       const list = await modelsApi.fetchModelsViaApiCall(
         form.baseUrl.trim(),
         firstKey?.apiKey?.trim() || undefined,
         headerObject,
-        keyAuthIndex
+        keyAuthIndex,
+        firstKey?.proxyUrl,
+        !firstKey?.apiKey?.trim()
       );
+      if (!isCurrentDiscovery()) return;
       setDiscoveredModels(list);
+      setModelsLoaded(true);
     } catch (err: unknown) {
-      setDiscoveredModels([]);
+      if (!isCurrentDiscovery()) return;
+
       setModelDiscoveryError(
         `${t('ai_providers.openai_models_fetch_error')}: ${getErrorMessage(err)}`
       );
     } finally {
-      setModelDiscoveryFetching(false);
+      if (isCurrentDiscovery()) setModelDiscoveryFetching(false);
     }
-  }, [form.apiKeyEntries, form.baseUrl, form.headers, t]);
+  }, [discoveryScope, form.apiKeyEntries, form.baseUrl, form.headers, t]);
 
   useEffect(() => {
     if (!modelDiscoveryOpen) return;
-    setDiscoveredModels([]);
     setModelDiscoverySearch('');
     setModelDiscoverySelected(new Set());
     setModelDiscoveryError('');
@@ -332,19 +414,15 @@ export function OpenAIEditDrawer({
     if (!filter) return discoveredModels;
     return discoveredModels.filter((model) => {
       const name = (model.name || '').toLowerCase();
-      const alias = (model.alias || '').toLowerCase();
+      const label = modelDisplayLabel(model).toLowerCase();
       const description = (model.description || '').toLowerCase();
-      return name.includes(filter) || alias.includes(filter) || description.includes(filter);
+      return name.includes(filter) || label.includes(filter) || description.includes(filter);
     });
   }, [discoveredModels, modelDiscoverySearch]);
 
   const configuredModelNames = useMemo(
     () =>
-      new Set(
-        form.modelEntries
-          .map((entry) => entry.name.trim().toLowerCase())
-          .filter(Boolean)
-      ),
+      new Set(form.modelEntries.map((entry) => entry.name.trim().toLowerCase()).filter(Boolean)),
     [form.modelEntries]
   );
 
@@ -368,15 +446,17 @@ export function OpenAIEditDrawer({
       if (!selectedModels.length) return;
       let addedCount = 0;
       setForm((prev) => {
-        const mergedMap = new Map<string, { name: string; alias: string }>();
+        const mergedMap = new Map<string, OpenAIFormState['modelEntries'][number]>();
         prev.modelEntries.forEach((entry) => {
           const name = entry.name.trim();
           if (!name) return;
-          mergedMap.set(name.toLowerCase(), {
-            ...entry,
-            name,
-            alias: entry.alias?.trim() || '',
-          });
+          mergedMap.set(
+            name.toLowerCase(),
+            cloneModelEntry(entry, {
+              name,
+              alias: entry.alias?.trim() || '',
+            })
+          );
         });
         selectedModels.forEach((model) => {
           const name = model.name.trim();
@@ -401,7 +481,9 @@ export function OpenAIEditDrawer({
   );
 
   useEffect(() => {
-    const availableNames = new Set(discoveredModels.map((model) => String(model.name ?? '').trim()));
+    const availableNames = new Set(
+      discoveredModels.map((model) => String(model.name ?? '').trim())
+    );
     setModelDiscoverySelected((prev) => {
       let changed = false;
       const next = new Set<string>();
@@ -455,15 +537,8 @@ export function OpenAIEditDrawer({
         return false;
       }
       const keyEntry = form.apiKeyEntries[keyIndex];
-      const keyAuthIndex = normalizeAuthIndex(keyEntry?.authIndex) ?? undefined;
-      if (!keyEntry?.apiKey?.trim() && !keyAuthIndex) {
-        setKeyTestStatuses((prev) => {
-          const next = [...prev];
-          next[keyIndex] = { status: 'error', message: t('notification.openai_test_key_required') };
-          return next;
-        });
-        return false;
-      }
+      if (!keyEntry) return false;
+      const keyAuthIndex = normalizeAuthIndex(keyEntry.authIndex) ?? undefined;
       const modelName = testModel.trim() || availableModels[0] || '';
       if (!modelName) {
         showNotification(t('notification.openai_test_model_required'), 'error');
@@ -475,9 +550,11 @@ export function OpenAIEditDrawer({
         ...customHeaders,
       };
       if (!hasHeader(headers, 'authorization')) {
-        headers.Authorization = keyAuthIndex
-          ? 'Bearer $TOKEN$'
-          : `Bearer ${keyEntry.apiKey.trim()}`;
+        if (keyEntry.apiKey.trim()) {
+          headers.Authorization = keyAuthIndex
+            ? 'Bearer $TOKEN$'
+            : `Bearer ${keyEntry.apiKey.trim()}`;
+        }
       }
       setKeyTestStatuses((prev) => {
         const next = [...prev];
@@ -488,6 +565,7 @@ export function OpenAIEditDrawer({
         const result = await apiCallApi.request(
           {
             authIndex: keyAuthIndex,
+            proxyUrl: keyEntry.proxyUrl?.trim() || undefined,
             method: 'POST',
             url: endpoint,
             header: Object.keys(headers).length ? headers : undefined,
@@ -564,15 +642,7 @@ export function OpenAIEditDrawer({
       showNotification(t('ai_providers.openai_test_model_required'), 'error');
       return;
     }
-    const validKeyIndexes = form.apiKeyEntries
-      .map((entry, index) =>
-        entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex) ? index : -1
-      )
-      .filter((index) => index >= 0);
-    if (validKeyIndexes.length === 0) {
-      showNotification(t('notification.openai_test_key_required'), 'error');
-      return;
-    }
+    const validKeyIndexes = getOpenAITestableKeyIndexes(form.apiKeyEntries);
     setIsTestingKeys(true);
     setTestStatus('loading');
     setTestMessage(t('ai_providers.openai_test_running'));
@@ -614,16 +684,6 @@ export function OpenAIEditDrawer({
       showNotification(t('notification.openai_provider_required'), 'error');
       return;
     }
-    const hasValidKey = form.apiKeyEntries.some(
-      (entry) => entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex)
-    );
-    if (!hasValidKey) {
-      showNotification(
-        t('ai_providers.openai_key_required', { defaultValue: 'Please add at least one API key' }),
-        'error'
-      );
-      return;
-    }
     if (!canSave) return;
     setSaving(true);
     try {
@@ -632,8 +692,9 @@ export function OpenAIEditDrawer({
         prefix: form.prefix?.trim() || undefined,
         baseUrl,
         headers: buildHeaderObject(form.headers),
-        apiKeyEntries: form.apiKeyEntries.map((entry: ApiKeyEntry) => ({
+        apiKeyEntries: form.apiKeyEntries.filter(hasOpenAIKeyEntryConfiguration).map((entry) => ({
           apiKey: entry.apiKey.trim(),
+          weight: normalizeCredentialWeight(entry.weight),
           proxyUrl: entry.proxyUrl?.trim() || undefined,
           authIndex: normalizeAuthIndex(entry.authIndex) ?? undefined,
           headers: entry.headers,
@@ -641,16 +702,17 @@ export function OpenAIEditDrawer({
       };
       if (form.priority !== undefined && Number.isFinite(form.priority))
         payload.priority = Math.trunc(form.priority);
-      if (form.disableCooling !== undefined) payload.disableCooling = form.disableCooling;
+      payload.disableCooling = coolingPolicyToOverride(form.disableCooling);
       if (initialData?.disabled !== undefined) payload.disabled = initialData.disabled;
       const resolvedTestModel = testModel.trim();
       if (resolvedTestModel) payload.testModel = resolvedTestModel;
       const models = entriesToModels(form.modelEntries);
       if (models.length) payload.models = models;
+      const committedPayload = toCommittedOpenAIProviderSnapshot(payload);
       const nextList =
         editIndex !== null
-          ? providers.map((item, idx) => (idx === editIndex ? payload : item))
-          : [...providers, payload];
+          ? providers.map((item, idx) => (idx === editIndex ? committedPayload : item))
+          : [...providers, committedPayload];
       if (editIndex !== null) {
         await providersApi.updateOpenAIProvider(providers[editIndex].name, editIndex, payload);
       } else {
@@ -658,12 +720,18 @@ export function OpenAIEditDrawer({
       }
       let syncedProviders = nextList;
       try {
-        syncedProviders = await providersApi.getOpenAIProviders();
+        syncedProviders = (await providersApi.getOpenAIProviders()).map(
+          toCommittedOpenAIProviderSnapshot
+        );
       } catch {
         /* fallback */
       }
       setProviders(syncedProviders);
       updateConfigValue('openai-compatibility', syncedProviders);
+      setForm({
+        ...form,
+        modelEntries: form.modelEntries.map(toCommittedModelThinkingSnapshot),
+      });
       showNotification(
         editIndex !== null
           ? t('notification.openai_provider_updated')
@@ -705,14 +773,25 @@ export function OpenAIEditDrawer({
 
   const renderKeyEntries = () => {
     const list = form.apiKeyEntries.length ? form.apiKeyEntries : [buildApiKeyEntry()];
-    const updateEntry = (idx: number, field: keyof ApiKeyEntry, value: string) => {
-      const next = list.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry));
+    const updateEntry = (idx: number, field: keyof OpenAIFormApiKeyEntry, value: string) => {
+      const next = list.map((entry, i) =>
+        i === idx
+          ? field === 'apiKey'
+            ? updateOpenAIApiKey(entry, value)
+            : { ...entry, [field]: value }
+          : entry
+      );
       setForm((prev) => ({ ...prev, apiKeyEntries: next }));
       setKeyTestStatuses((prev) => {
         const nextStatuses = [...prev];
         nextStatuses[idx] = { status: 'idle', message: '' };
         return nextStatuses;
       });
+    };
+    const updateEntryWeight = (idx: number, raw: string) => {
+      const weight = toCredentialWeightInputValue(raw);
+      const next = list.map((entry, i) => (i === idx ? { ...entry, weight } : entry));
+      setForm((prev) => ({ ...prev, apiKeyEntries: next }));
     };
     const removeEntry = (idx: number) => {
       const next = list.filter((_, i) => i !== idx);
@@ -728,7 +807,7 @@ export function OpenAIEditDrawer({
       <div className={styles.keyEntriesList}>
         <div className={styles.keyEntriesToolbar}>
           <span className={styles.keyEntriesCount}>
-            {t('ai_providers.openai_keys_count')}: {list.length}
+            {t('ai_providers.openai_keys_count')}: {getOpenAIKeyCount(list)}
           </span>
           <Button
             variant="secondary"
@@ -745,14 +824,15 @@ export function OpenAIEditDrawer({
             <div className={styles.keyTableColIndex}>#</div>
             <div className={styles.keyTableColStatus}>{t('common.status')}</div>
             <div className={styles.keyTableColKey}>{t('common.api_key')}</div>
+            <div className={styles.keyTableColWeight}>{t('ai_providers.weight_label')}</div>
             <div className={styles.keyTableColProxy}>{t('common.proxy_url')}</div>
             <div className={styles.keyTableColAction}>{t('common.action')}</div>
           </div>
           {list.map((entry, index) => {
             const keyStatus = keyTestStatuses[index]?.status ?? 'idle';
+            const weightError = getCredentialWeightError(entry.weight);
             const canTestKey =
-              Boolean(entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex)) &&
-              hasConfiguredModels;
+              hasConfiguredModels && getOpenAITestableKeyIndexes(form.apiKeyEntries).includes(index);
             return (
               <div key={index} className={styles.keyTableRow}>
                 <div className={styles.keyTableColIndex}>{index + 1}</div>
@@ -771,6 +851,31 @@ export function OpenAIEditDrawer({
                     className={`input ${styles.keyTableInput}`}
                     placeholder={t('ai_providers.openai_key_placeholder')}
                   />
+                </div>
+                <div className={styles.keyTableColWeight}>
+                  <div className={styles.keyTableWeightField}>
+                    <input
+                      type="text"
+                      inputMode="text"
+                      value={entry.weight ?? ''}
+                      onChange={(e) => updateEntryWeight(index, e.target.value)}
+                      disabled={saving || disabled || isTestingKeys}
+                      className={`input ${styles.keyTableInput}`}
+                      placeholder="1"
+                      aria-invalid={Boolean(weightError)}
+                      aria-label={`${t('ai_providers.weight_label')} ${index + 1}`}
+                    />
+                    {weightError && (
+                      <span className={styles.keyTableWeightError}>
+                        {t(
+                          weightError === 'maximum'
+                            ? 'ai_providers.weight_error_maximum'
+                            : 'ai_providers.weight_error_integer',
+                          { max: MAX_CREDENTIAL_WEIGHT.toLocaleString() }
+                        )}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <div className={styles.keyTableColProxy}>
                   <input
@@ -888,16 +993,12 @@ export function OpenAIEditDrawer({
               removeButtonAriaLabel={t('common.delete')}
               disabled={saving || disabled || isTestingKeys}
             />
-            <div className="form-group">
-              <label>{t('ai_providers.disable_cooling_label')}</label>
-              <ToggleSwitch
-                checked={Boolean(form.disableCooling)}
-                onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
-                disabled={saving || disabled || isTestingKeys}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
-              />
-              <div className="hint">{t('ai_providers.disable_cooling_hint')}</div>
-            </div>
+            <CoolingPolicySelect
+              value={form.disableCooling}
+              onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
+              disabled={saving || disabled || isTestingKeys}
+              id="openai-drawer-cooling-policy"
+            />
 
             <div className={styles.keyEntriesSection}>
               <div className={styles.keyEntriesHeader}>
@@ -938,6 +1039,10 @@ export function OpenAIEditDrawer({
                   >
                     {t('ai_providers.openai_models_fetch_button')}
                   </Button>
+                  <InfoTooltip
+                    content={t('ai_providers.openai_model_discovery_proxy_version_hint')}
+                    ariaLabel={t('ai_providers.model_discovery_proxy_version_info_label')}
+                  />
                 </div>
               </div>
               <div className={styles.sectionHint}>{t('ai_providers.openai_models_hint')}</div>
@@ -948,17 +1053,31 @@ export function OpenAIEditDrawer({
                 aliasPlaceholder={t('common.model_alias_placeholder')}
                 disabled={saving || disabled || isTestingKeys}
                 hideAddButton
-                className={styles.modelInputList}
+                className={styles.openaiModelInputList}
                 rowClassName={styles.modelInputRow}
                 inputClassName={styles.modelInputField}
+                itemClassName={styles.openaiModelInputItem}
                 removeButtonClassName={styles.modelRowRemoveButton}
                 removeButtonTitle={t('common.delete')}
                 removeButtonAriaLabel={t('common.delete')}
                 showForceMapping
                 showModalities
+                showThinkingLevels
                 forceMappingLabel={t('ai_providers.force_mapping_label')}
                 inputModalitiesPlaceholder={t('ai_providers.input_modalities_placeholder')}
                 outputModalitiesPlaceholder={t('ai_providers.output_modalities_placeholder')}
+                modelFallbackLabel={t('ai_providers.thinking_model_fallback_label')}
+                thinkingLabel={t('ai_providers.thinking_levels_label')}
+                thinkingTooltip={t('ai_providers.thinking_levels_tooltip')}
+                thinkingTooltipAriaLabel={t('ai_providers.thinking_levels_tooltip_aria_label')}
+                thinkingDefaultLabel={t('ai_providers.thinking_default_label')}
+                thinkingCustomLabel={t('ai_providers.thinking_custom_label')}
+                thinkingAllowedLevelsLabel={t('ai_providers.thinking_allowed_levels_label')}
+                thinkingSelectAllLabel={t('ai_providers.thinking_select_all_label')}
+                thinkingClearLabel={t('ai_providers.thinking_clear_label')}
+                thinkingRequiredError={t('ai_providers.thinking_required_error')}
+                thinkingUnknownLevelsLabel={t('ai_providers.thinking_unknown_levels_label')}
+                thinkingUnknownLevelsHint={t('ai_providers.thinking_unknown_levels_hint')}
               />
               <div className={styles.modelTestPanel}>
                 <div className={styles.modelTestMeta}>
@@ -1100,11 +1219,11 @@ export function OpenAIEditDrawer({
                   </div>
                 )}
                 {modelDiscoveryError && <div className="error-box">{modelDiscoveryError}</div>}
-                {modelDiscoveryFetching ? (
+                {modelDiscoveryFetching && !modelsLoaded ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.openai_models_fetch_loading')}
                   </div>
-                ) : discoveredModels.length === 0 ? (
+                ) : !modelsLoaded ? null : discoveredModels.length === 0 ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.openai_models_fetch_empty')}
                   </div>
@@ -1116,6 +1235,7 @@ export function OpenAIEditDrawer({
                   <div className={styles.modelDiscoveryList}>
                     {discoveredModelsFiltered.map((model) => {
                       const checked = modelDiscoverySelected.has(model.name);
+                      const discoveryLabel = modelDisplayLabel(model);
                       const alreadyConfigured = configuredModelNames.has(
                         model.name.trim().toLowerCase()
                       );
@@ -1135,9 +1255,9 @@ export function OpenAIEditDrawer({
                               <div className={styles.modelDiscoveryName}>
                                 <div className={styles.modelDiscoveryNameText}>
                                   {model.name}
-                                  {model.alias && (
+                                  {discoveryLabel && (
                                     <span className={styles.modelDiscoveryAlias}>
-                                      {model.alias}
+                                      {discoveryLabel}
                                     </span>
                                   )}
                                 </div>

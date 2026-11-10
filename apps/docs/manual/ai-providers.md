@@ -1,6 +1,6 @@
 ---
 title: AI 提供商管理
-description: 在 CPA Manager Plus 中管理 Gemini、Codex、Claude、Vertex、xAI 和 OpenAI-compatible Provider，配置优先级、模型、代理、Header 与密钥测试。
+description: 在 CPA Manager Plus 中管理 Gemini、Codex、Claude、Vertex、xAI、Meta / Muse 和 OpenAI-compatible Provider，配置优先级、权重、模型、代理、Header 与密钥测试。
 ---
 
 # AI 提供商管理
@@ -24,10 +24,11 @@ AI 提供商页面决定 CPA 如何把客户端请求路由到上游模型服务
 - Claude API Key
 - Vertex
 - xAI API Key
+- Meta API Key (`meta-api-key`)
 - OpenAI-compatible
 - CPA 当前版本暴露的其他兼容配置
 
-不同类型的字段不完全相同，但都围绕 Base URL、凭证、模型、Header、代理、优先级和启用状态。
+不同类型的字段不完全相同，但都围绕 Base URL、凭证、模型、Header、代理、优先级、权重和启用状态。
 
 ## 新增或编辑 Provider
 
@@ -44,14 +45,31 @@ AI 提供商页面决定 CPA 如何把客户端请求路由到上游模型服务
 
 - API Key、Base URL、代理和自定义 Header。
 - 模型列表、别名、前缀和排除模型。
-- Provider 优先级和启用状态。
+- Provider 优先级、权重和启用状态。
 - 通过 Provider 测试入口验证密钥和模型访问。
 
-xAI API Key 与 xAI/Grok OAuth 认证文件不是同一种凭证。OAuth 登录、billing 证据和账号巡检请分别查看 [OAuth 登录](./oauth.md)、[配额管理](./quota.md) 和[账号巡检](./codex-inspection.md)。
+xAI API Key 与 xAI/Grok OAuth 凭证不是同一种凭证。OAuth 登录、billing 证据和账号巡检请分别查看 [OAuth 登录](./oauth.md)、[凭证管理](./accounts.md) 和[账号巡检](./codex-inspection.md)。
 
-## 优先级与并发保存
+## Meta / Muse API Key
+
+当前面板支持管理 CPA `meta-api-key` 配置，用于 Meta 模型推理：
+
+- 默认 Base URL 为 `https://api.meta.ai/v1`。
+- 模型发现与连通性检查使用 `GET /v1/models`。
+- 支持 API Key、代理、自定义 Header、模型映射/排除、优先级、权重、启停、冷却与重试等现有 Provider 能力。
+- Muse / Meta OAuth 的 DCA 凭证与推理 API Key 严格分离。
+
+不要把 `dca:` 或 `Bearer dca:` 凭证填入 API Key 或自定义 `Authorization` Header。CPAMP 会在发起网络请求前拒绝这类混用。账号登录与配额请使用 [OAuth 登录](./oauth.md) 和[凭证管理](./accounts.md)。
+
+完整 Muse / Meta Provider 管理需要 CPA `v7.3.4+`。
+
+## 优先级、权重与并发保存
 
 Provider 表格支持直接调整优先级。数值只影响 CPA 当前支持的路由排序，不代表健康状态或成本优先级。
+
+使用 `weighted-round-robin` 时，CPA 会先选择当前最高且可用的优先级层级，再按照该层级内各凭证的权重分配请求；低优先级凭证不会因为权重更高而跨层参与。未填写权重时默认为 `1`，最大值为 `1,000,000`，非正数表示在加权轮询下排除该凭证。清空输入会移除显式权重并恢复默认值。
+
+权重只有在配置中心启用加权轮询、且 CPA 版本支持 weighted routing 时才生效。旧版 CPA 可能忽略或拒绝新策略与权重字段。
 
 保存时 CPAMP 会尽量复用精确的单项更新接口并刷新配置缓存。若配置在其他浏览器或进程中同时修改，保存前重新加载页面，避免用旧快照覆盖新配置。
 
@@ -67,7 +85,7 @@ Provider 表格支持直接调整优先级。数值只影响 CPA 当前支持的
 1. 发一条低成本真实请求。
 2. 在请求监控确认 Provider、模型、账号和状态码。
 3. 如果成本为空，检查[模型价格](./model-prices.md)。
-4. 如果像认证或额度问题，检查[认证文件](./auth-files.md)、[配额管理](./quota.md)和[账号处理队列](./account-actions.md)。
+4. 如果像认证或额度问题，检查[凭证管理](./accounts.md)和[账号处理队列](./account-actions.md)。
 5. 如果页面没有请求事件，先排查采集链路，而不是反复修改 Provider。
 
 ## 配置边界

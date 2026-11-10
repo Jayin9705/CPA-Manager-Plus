@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAuthStore as useDiscoveryAuthStore } from '@/stores/useAuthStore';
+import { useRef, useLayoutEffect, useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
@@ -8,8 +9,9 @@ import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
 import { SecondaryScreenShell } from '@/components/common/SecondaryScreenShell';
 import { useEdgeSwipeBack } from '@/hooks/useEdgeSwipeBack';
 import { modelsApi } from '@/services/api';
-import type { ModelInfo } from '@/utils/models';
+import { modelDisplayLabel, type ModelInfo } from '@/utils/models';
 import { normalizeAuthIndex } from '@/utils/authIndex';
+import { getOpenAIModelDiscoveryEntry } from '@/utils/openAIKeyEntries';
 import { buildHeaderObject, hasHeader } from '@/utils/headers';
 import { buildOpenAIModelsEndpoint } from '@/components/providers/utils';
 import type { OpenAIEditOutletContext } from './AiProvidersOpenAIEditLayout';
@@ -35,6 +37,7 @@ export function AiProvidersOpenAIModelsPage() {
 
   const [endpoint, setEndpoint] = useState('');
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
@@ -45,9 +48,9 @@ export function AiProvidersOpenAIModelsPage() {
     if (!filter) return models;
     return models.filter((model) => {
       const name = (model.name || '').toLowerCase();
-      const alias = (model.alias || '').toLowerCase();
+      const label = modelDisplayLabel(model).toLowerCase();
       const desc = (model.description || '').toLowerCase();
-      return name.includes(filter) || alias.includes(filter) || desc.includes(filter);
+      return name.includes(filter) || label.includes(filter) || desc.includes(filter);
     });
   }, [models, search]);
 
@@ -73,54 +76,69 @@ export function AiProvidersOpenAIModelsPage() {
     [selected, visibleModelNames]
   );
 
-  const fetchOpenaiModelDiscovery = useCallback(
-    async ({ allowFallback = true }: { allowFallback?: boolean } = {}) => {
-      const trimmedBaseUrl = form.baseUrl.trim();
-      if (!trimmedBaseUrl) return;
-
-      setFetching(true);
-      setError('');
-      try {
-        const headerObject = buildHeaderObject(form.headers);
-        const firstEntry = form.apiKeyEntries.find(
-          (entry) => entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex)
-        );
-        const firstKey = firstEntry?.apiKey?.trim();
-        const authIndex = normalizeAuthIndex(firstEntry?.authIndex) ?? undefined;
-        const hasAuthHeader = hasHeader(headerObject, 'authorization');
-        const list = await modelsApi.fetchModelsViaApiCall(
-          trimmedBaseUrl,
-          hasAuthHeader ? undefined : firstKey,
-          headerObject,
-          authIndex
-        );
-        setModels(list);
-      } catch (err: unknown) {
-        if (allowFallback) {
-          try {
-            const list = await modelsApi.fetchModelsViaApiCall(trimmedBaseUrl);
-            setModels(list);
-            return;
-          } catch (fallbackErr: unknown) {
-            const message = getErrorMessage(fallbackErr) || getErrorMessage(err);
-            setModels([]);
-            setError(`${t('ai_providers.openai_models_fetch_error')}: ${message}`);
-          }
-        } else {
-          setModels([]);
-          setError(`${t('ai_providers.openai_models_fetch_error')}: ${getErrorMessage(err)}`);
-        }
-      } finally {
-        setFetching(false);
-      }
-    },
-    [form.apiKeyEntries, form.baseUrl, form.headers, t]
+  const discoveryConnection = useDiscoveryAuthStore((state) =>
+    JSON.stringify([state.apiBase, state.managementKey])
   );
+  const discoveryScope = JSON.stringify([
+    discoveryConnection,
+    form.baseUrl,
+    form.apiKeyEntries,
+    buildHeaderObject(form.headers),
+  ]);
+  const activeDiscoveryScopeRef = useRef(discoveryScope);
+  activeDiscoveryScopeRef.current = discoveryScope;
+  const modelDiscoveryRequestIdRef = useRef(0);
+  useLayoutEffect(() => {
+    modelDiscoveryRequestIdRef.current += 1;
+    setModels([]);
+    setModelsLoaded(false);
+    setError('');
+    setFetching(false);
+    return () => {
+      modelDiscoveryRequestIdRef.current += 1;
+    };
+  }, [discoveryScope]);
+
+  const fetchOpenaiModelDiscovery = useCallback(async () => {
+    const requestId = ++modelDiscoveryRequestIdRef.current;
+    const requestScope = discoveryScope;
+    const isCurrentDiscovery = () =>
+      modelDiscoveryRequestIdRef.current === requestId &&
+      activeDiscoveryScopeRef.current === requestScope;
+    const trimmedBaseUrl = form.baseUrl.trim();
+    if (!trimmedBaseUrl) return;
+
+    setFetching(true);
+    setError('');
+    try {
+      const headerObject = buildHeaderObject(form.headers);
+      const firstEntry = getOpenAIModelDiscoveryEntry(form.apiKeyEntries);
+      const firstKey = firstEntry?.apiKey?.trim();
+      const authIndex = normalizeAuthIndex(firstEntry?.authIndex) ?? undefined;
+      const hasAuthHeader = hasHeader(headerObject, 'authorization');
+      const list = await modelsApi.fetchModelsViaApiCall(
+        trimmedBaseUrl,
+        hasAuthHeader ? undefined : firstKey,
+        headerObject,
+        authIndex,
+        firstEntry?.proxyUrl,
+        !firstKey
+      );
+      if (!isCurrentDiscovery()) return;
+      setModels(list);
+      setModelsLoaded(true);
+    } catch (err: unknown) {
+      if (!isCurrentDiscovery()) return;
+
+      setError(`${t('ai_providers.openai_models_fetch_error')}: ${getErrorMessage(err)}`);
+    } finally {
+      if (isCurrentDiscovery()) setFetching(false);
+    }
+  }, [discoveryScope, form.apiKeyEntries, form.baseUrl, form.headers, t]);
 
   useEffect(() => {
     if (initialLoading) return;
     setEndpoint(buildOpenAIModelsEndpoint(form.baseUrl));
-    setModels([]);
     setSearch('');
     setSelected(new Set());
     setError('');
@@ -243,7 +261,7 @@ export function AiProvidersOpenAIModelsPage() {
               <Button
                 variant="secondary"
                 size="sm"
-                onClick={() => void fetchOpenaiModelDiscovery({ allowFallback: true })}
+                onClick={() => void fetchOpenaiModelDiscovery()}
                 loading={fetching}
                 disabled={disableControls || saving}
               >
@@ -290,11 +308,11 @@ export function AiProvidersOpenAIModelsPage() {
             </div>
           )}
           {error && <div className="error-box">{error}</div>}
-          {fetching ? (
+          {fetching && !modelsLoaded ? (
             <div className={styles.sectionHint}>
               {t('ai_providers.openai_models_fetch_loading')}
             </div>
-          ) : models.length === 0 ? (
+          ) : !modelsLoaded ? null : models.length === 0 ? (
             <div className={styles.sectionHint}>{t('ai_providers.openai_models_fetch_empty')}</div>
           ) : filteredModels.length === 0 ? (
             <div className={styles.sectionHint}>{t('ai_providers.openai_models_search_empty')}</div>
@@ -302,6 +320,7 @@ export function AiProvidersOpenAIModelsPage() {
             <div className={styles.modelDiscoveryList}>
               {filteredModels.map((model) => {
                 const checked = selected.has(model.name);
+                const discoveryLabel = modelDisplayLabel(model);
                 const alreadyConfigured = configuredModelNames.has(model.name.trim().toLowerCase());
                 return (
                   <SelectionCheckbox
@@ -319,8 +338,8 @@ export function AiProvidersOpenAIModelsPage() {
                         <div className={styles.modelDiscoveryName}>
                           <div className={styles.modelDiscoveryNameText}>
                             {model.name}
-                            {model.alias && (
-                              <span className={styles.modelDiscoveryAlias}>{model.alias}</span>
+                            {discoveryLabel && (
+                              <span className={styles.modelDiscoveryAlias}>{discoveryLabel}</span>
                             )}
                           </div>
                           {alreadyConfigured && (

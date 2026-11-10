@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useAuthStore as useDiscoveryAuthStore } from '@/stores/useAuthStore';
+import { useLayoutEffect, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Drawer } from '@/components/ui/Drawer';
@@ -9,9 +10,15 @@ import { ModelInputList } from '@/components/ui/ModelInputList';
 import { Modal } from '@/components/ui/Modal';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
+import { CoolingPolicySelect } from '@/components/providers/CoolingPolicySelect';
 import { apiCallApi, getApiCallErrorMessage, modelsApi, providersApi } from '@/services/api';
+import { hasMetaDcaAuthorizationHeader, isMetaDcaCredential } from '@/utils/metaProvider';
 import { useConfigStore, useNotificationStore } from '@/stores';
-import type { ProviderKeyConfig } from '@/types';
+import {
+  coolingPolicyFromOverride,
+  coolingPolicyToOverride,
+  type ProviderKeyConfig,
+} from '@/types';
 import {
   buildHeaderObject,
   hasHeader,
@@ -30,8 +37,14 @@ import {
   excludedModelsToText,
   parseExcludedModels,
 } from '@/components/providers/utils';
-import type { ProviderFormState } from '@/components/providers';
-import type { ModelInfo } from '@/utils/models';
+import { CredentialWeightInput } from '../CredentialWeightInput';
+import type { ProviderFormState } from '../types';
+import {
+  getCredentialWeightComparisonValue,
+  getCredentialWeightError,
+  normalizeCredentialWeight,
+} from '@/utils/credentialWeight';
+import { modelDisplayLabel, type ModelInfo } from '@/utils/models';
 import styles from '@/features/aiProviders/AiProvidersPage.module.scss';
 
 interface CodexEditDrawerProps {
@@ -40,7 +53,7 @@ interface CodexEditDrawerProps {
   disabled: boolean;
   onClose: () => void;
   onSaved: () => void;
-  providerKind?: 'codex' | 'xai';
+  providerKind?: 'codex' | 'xai' | 'meta';
 }
 
 type CodexFormBaseline = ReturnType<typeof buildCodexBaseline>;
@@ -48,10 +61,12 @@ type TestStatus = 'idle' | 'loading' | 'success' | 'error';
 
 const CODEX_TEST_TIMEOUT_MS = 20_000;
 const XAI_API_BASE_URL = 'https://api.x.ai/v1';
+const META_API_BASE_URL = 'https://api.meta.ai/v1';
 
 const buildEmptyForm = (baseUrl = ''): ProviderFormState => ({
   apiKey: '',
   priority: undefined,
+  weight: undefined,
   prefix: '',
   baseUrl,
   websockets: false,
@@ -61,6 +76,7 @@ const buildEmptyForm = (baseUrl = ''): ProviderFormState => ({
   excludedModels: [],
   modelEntries: [{ name: '', alias: '' }],
   excludedText: '',
+  disableCooling: 'inherit',
 });
 
 const normalizeModelEntries = (entries: ProviderFormState['modelEntries']) =>
@@ -80,10 +96,11 @@ const buildCodexBaseline = (form: ProviderFormState) => ({
     form.priority !== undefined && Number.isFinite(form.priority)
       ? Math.trunc(form.priority)
       : null,
+  weight: normalizeCredentialWeight(form.weight) ?? null,
   prefix: String(form.prefix ?? '').trim(),
   baseUrl: String(form.baseUrl ?? '').trim(),
   websockets: Boolean(form.websockets),
-  disableCooling: Boolean(form.disableCooling),
+  disableCooling: form.disableCooling,
   proxyUrl: String(form.proxyUrl ?? '').trim(),
   headers: normalizeHeaderEntries(form.headers),
   models: normalizeModelEntries(form.modelEntries),
@@ -94,6 +111,13 @@ const getErrorMessage = (err: unknown) => {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   return '';
+};
+
+const getMetaApiKeyValidationError = (value: string): 'required' | 'dca' | null => {
+  const apiKey = value.trim();
+  if (!apiKey) return 'required';
+  if (isMetaDcaCredential(apiKey)) return 'dca';
+  return null;
 };
 
 export function CodexEditDrawer({
@@ -110,8 +134,9 @@ export function CodexEditDrawer({
   const updateConfigValue = useConfigStore((state) => state.updateConfigValue);
   const clearCache = useConfigStore((state) => state.clearCache);
   const isXAI = providerKind === 'xai';
-  const providerSection = isXAI ? 'xai-api-key' : 'codex-api-key';
-  const defaultBaseUrl = isXAI ? XAI_API_BASE_URL : '';
+  const isMeta = providerKind === 'meta';
+  const providerSection = isMeta ? 'meta-api-key' : isXAI ? 'xai-api-key' : 'codex-api-key';
+  const defaultBaseUrl = isMeta ? META_API_BASE_URL : isXAI ? XAI_API_BASE_URL : '';
 
   const [configs, setConfigs] = useState<ProviderKeyConfig[]>([]);
   const [loading, setLoading] = useState(false);
@@ -127,6 +152,7 @@ export function CodexEditDrawer({
   const [modelDiscoveryFetching, setModelDiscoveryFetching] = useState(false);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [discoveredModels, setDiscoveredModels] = useState<ModelInfo[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelDiscoverySearch, setModelDiscoverySearch] = useState('');
   const [modelDiscoverySelected, setModelDiscoverySelected] = useState<Set<string>>(new Set());
   const [testModel, setTestModel] = useState('');
@@ -142,8 +168,20 @@ export function CodexEditDrawer({
 
   const title =
     editIndex !== null
-      ? t(isXAI ? 'ai_providers.xai_edit_modal_title' : 'ai_providers.codex_edit_modal_title')
-      : t(isXAI ? 'ai_providers.xai_add_modal_title' : 'ai_providers.codex_add_modal_title');
+      ? t(
+          isMeta
+            ? 'ai_providers.meta_edit_modal_title'
+            : isXAI
+              ? 'ai_providers.xai_edit_modal_title'
+              : 'ai_providers.codex_edit_modal_title'
+        )
+      : t(
+          isMeta
+            ? 'ai_providers.meta_add_modal_title'
+            : isXAI
+              ? 'ai_providers.xai_add_modal_title'
+              : 'ai_providers.codex_add_modal_title'
+        );
 
   useEffect(() => {
     if (!open) return;
@@ -183,6 +221,7 @@ export function CodexEditDrawer({
     if (initialData) {
       const nextForm: ProviderFormState = {
         ...initialData,
+        disableCooling: coolingPolicyFromOverride(initialData.disableCooling),
         websockets: Boolean(initialData.websockets),
         headers: headersToEntries(initialData.headers),
         modelEntries: modelsToEntries(initialData.models),
@@ -203,21 +242,30 @@ export function CodexEditDrawer({
   }, [defaultBaseUrl, open, loaded, initialData]);
 
   const canSave =
-    loaded && !error && !disabled && !saving && !loading && !invalidIndex && !isTesting;
+    loaded &&
+    !error &&
+    !disabled &&
+    !saving &&
+    !loading &&
+    !invalidIndex &&
+    !isTesting &&
+    !getCredentialWeightError(form.weight);
 
   const isDirty = useMemo(() => {
     const normalizedPriority =
       form.priority !== undefined && Number.isFinite(form.priority)
         ? Math.trunc(form.priority)
         : null;
+    const comparableWeight = getCredentialWeightComparisonValue(form.weight);
     return (
       baseline.apiKey !== form.apiKey.trim() ||
       baseline.authIndex !== (normalizeAuthIndex(form.authIndex) ?? '') ||
       baseline.priority !== normalizedPriority ||
+      baseline.weight !== comparableWeight ||
       baseline.prefix !== String(form.prefix ?? '').trim() ||
       baseline.baseUrl !== String(form.baseUrl ?? '').trim() ||
       baseline.websockets !== Boolean(form.websockets) ||
-      baseline.disableCooling !== Boolean(form.disableCooling) ||
+      baseline.disableCooling !== form.disableCooling ||
       baseline.proxyUrl !== String(form.proxyUrl ?? '').trim() ||
       !areKeyValueEntriesEqual(baseline.headers, normalizeHeaderEntries(form.headers)) ||
       !areModelEntriesEqual(baseline.models, normalizeModelEntries(form.modelEntries)) ||
@@ -230,9 +278,9 @@ export function CodexEditDrawer({
     if (!filter) return discoveredModels;
     return discoveredModels.filter((model) => {
       const name = (model.name || '').toLowerCase();
-      const alias = (model.alias || '').toLowerCase();
+      const label = modelDisplayLabel(model).toLowerCase();
       const description = (model.description || '').toLowerCase();
-      return name.includes(filter) || alias.includes(filter) || description.includes(filter);
+      return name.includes(filter) || label.includes(filter) || description.includes(filter);
     });
   }, [discoveredModels, modelDiscoverySearch]);
 
@@ -339,9 +387,62 @@ export function CodexEditDrawer({
     [showNotification, t]
   );
 
-  const fetchModelDiscovery = useCallback(async () => {
-    setModelDiscoveryFetching(true);
+  const discoveryConnection = useDiscoveryAuthStore((state) =>
+    JSON.stringify([state.apiBase, state.managementKey])
+  );
+  const discoveryScope = JSON.stringify([
+    discoveryConnection,
+    open,
+    editIndex,
+    form.baseUrl,
+    form.apiKey,
+    form.authIndex,
+    form.proxyUrl,
+    buildHeaderObject(form.headers),
+  ]);
+  const activeDiscoveryScopeRef = useRef(discoveryScope);
+  activeDiscoveryScopeRef.current = discoveryScope;
+  const modelDiscoveryRequestIdRef = useRef(0);
+  useLayoutEffect(() => {
+    modelDiscoveryRequestIdRef.current += 1;
+    setDiscoveredModels([]);
+    setModelsLoaded(false);
     setModelDiscoveryError('');
+    setModelDiscoveryFetching(false);
+    return () => {
+      modelDiscoveryRequestIdRef.current += 1;
+    };
+  }, [discoveryScope]);
+
+  const fetchModelDiscovery = useCallback(async () => {
+    const requestId = ++modelDiscoveryRequestIdRef.current;
+    const requestScope = discoveryScope;
+    const isCurrentDiscovery = () =>
+      modelDiscoveryRequestIdRef.current === requestId &&
+      activeDiscoveryScopeRef.current === requestScope;
+    setModelDiscoveryError('');
+
+    if (isMeta) {
+      const keyError = getMetaApiKeyValidationError(form.apiKey);
+      if (keyError === 'required') {
+        setDiscoveredModels([]);
+        setModelDiscoveryError(t('ai_providers.meta_key_required'));
+        return;
+      }
+      if (keyError === 'dca') {
+        setDiscoveredModels([]);
+        setModelDiscoveryError(t('ai_providers.meta_dca_not_accepted'));
+        return;
+      }
+      const headerObject = buildHeaderObject(form.headers);
+      if (hasMetaDcaAuthorizationHeader(headerObject)) {
+        setDiscoveredModels([]);
+        setModelDiscoveryError(t('ai_providers.meta_dca_not_accepted'));
+        return;
+      }
+    }
+
+    setModelDiscoveryFetching(true);
     try {
       const headerObject = buildHeaderObject(form.headers);
       const hasCustomAuthorization = Object.keys(headerObject).some(
@@ -352,18 +453,22 @@ export function CodexEditDrawer({
         form.baseUrl ?? '',
         hasCustomAuthorization ? undefined : apiKey,
         headerObject,
-        normalizeAuthIndex(form.authIndex) ?? undefined
+        normalizeAuthIndex(form.authIndex) ?? undefined,
+        form.proxyUrl
       );
+      if (!isCurrentDiscovery()) return;
       setDiscoveredModels(list);
+      setModelsLoaded(true);
     } catch (err: unknown) {
-      setDiscoveredModels([]);
+      if (!isCurrentDiscovery()) return;
+
       setModelDiscoveryError(
         `${t('ai_providers.codex_models_fetch_error')}: ${getErrorMessage(err)}`
       );
     } finally {
-      setModelDiscoveryFetching(false);
+      if (isCurrentDiscovery()) setModelDiscoveryFetching(false);
     }
-  }, [form.apiKey, form.authIndex, form.baseUrl, form.headers, t]);
+  }, [discoveryScope, form.apiKey, form.authIndex, form.baseUrl, form.headers, form.proxyUrl, isMeta, t]);
 
   const runCodexConnectivityTest = useCallback(async () => {
     if (isTesting) return;
@@ -463,20 +568,114 @@ export function CodexEditDrawer({
     testModel,
   ]);
 
-  const handleSave = useCallback(async () => {
-    if (!canSave) return;
-    const apiKey = form.apiKey.trim();
-    if (!apiKey && !normalizeAuthIndex(form.authIndex)) {
-      showNotification(
-        t(isXAI ? 'ai_providers.xai_key_required' : 'ai_providers.codex_key_required'),
-        'error'
-      );
+  const runMetaConnectivityTest = useCallback(async () => {
+    if (isTesting) return;
+
+    const keyError = getMetaApiKeyValidationError(form.apiKey);
+    if (keyError === 'required') {
+      const message = t('ai_providers.meta_key_required');
+      setTestStatus('error');
+      setTestMessage(message);
+      showNotification(message, 'error');
       return;
     }
-    const trimmedBaseUrl = (form.baseUrl ?? '').trim();
+    if (keyError === 'dca') {
+      const message = t('ai_providers.meta_dca_not_accepted');
+      setTestStatus('error');
+      setTestMessage(message);
+      showNotification(message, 'error');
+      return;
+    }
+
+    const customHeaders = buildHeaderObject(form.headers);
+    if (hasMetaDcaAuthorizationHeader(customHeaders)) {
+      const message = t('ai_providers.meta_dca_not_accepted');
+      setTestStatus('error');
+      setTestMessage(message);
+      showNotification(message, 'error');
+      return;
+    }
+    const hasAuthorization = hasHeader(customHeaders, 'authorization');
+    const keyAuthIndex = normalizeAuthIndex(form.authIndex) ?? undefined;
+    const baseUrl = (form.baseUrl ?? '').trim() || META_API_BASE_URL;
+    const apiKey = form.apiKey.trim();
+
+    setIsTesting(true);
+    setTestStatus('loading');
+    setTestMessage(t('ai_providers.meta_test_running'));
+
+    try {
+      const models = await modelsApi.fetchV1ModelsViaApiCall(
+        baseUrl,
+        hasAuthorization ? undefined : apiKey,
+        customHeaders,
+        keyAuthIndex,
+        form.proxyUrl
+      );
+      if (!models || models.length === 0) {
+        throw new Error(t('ai_providers.meta_test_no_models'));
+      }
+      const message = t('ai_providers.meta_test_success');
+      setTestStatus('success');
+      setTestMessage(message);
+      showNotification(message, 'success');
+    } catch (err: unknown) {
+      const failureText = t('ai_providers.meta_test_failed');
+      const message = getErrorMessage(err) || failureText;
+      setTestStatus('error');
+      setTestMessage(message);
+      showNotification(`${failureText}: ${message}`, 'error');
+    } finally {
+      setIsTesting(false);
+    }
+  }, [
+    form.apiKey,
+    form.authIndex,
+    form.baseUrl,
+    form.headers,
+    form.proxyUrl,
+    isTesting,
+    showNotification,
+    t,
+  ]);
+
+  const handleSave = useCallback(async () => {
+    if (!canSave) return;
+    if (isMeta) {
+      const keyError = getMetaApiKeyValidationError(form.apiKey);
+      if (keyError === 'required') {
+        showNotification(t('ai_providers.meta_key_required'), 'error');
+        return;
+      }
+      if (keyError === 'dca') {
+        showNotification(t('ai_providers.meta_dca_not_accepted'), 'error');
+        return;
+      }
+      const customHeaders = buildHeaderObject(form.headers);
+      if (hasMetaDcaAuthorizationHeader(customHeaders)) {
+        showNotification(t('ai_providers.meta_dca_not_accepted'), 'error');
+        return;
+      }
+    } else {
+      const apiKey = form.apiKey.trim();
+      if (!apiKey && !normalizeAuthIndex(form.authIndex)) {
+        showNotification(
+          t(isXAI ? 'ai_providers.xai_key_required' : 'ai_providers.codex_key_required'),
+          'error'
+        );
+        return;
+      }
+    }
+    const trimmedBaseUrl = (form.baseUrl ?? '').trim() || (isMeta ? META_API_BASE_URL : '');
     if (!trimmedBaseUrl) {
       showNotification(
-        t(isXAI ? 'notification.xai_base_url_required' : 'notification.codex_base_url_required'),
+        t(
+          isMeta
+            ? 'notification.meta_base_url_required'
+            : isXAI
+              ? 'notification.xai_base_url_required'
+              : 'notification.codex_base_url_required'
+        ),
         'error'
       );
       return;
@@ -487,32 +686,42 @@ export function CodexEditDrawer({
       const payload: ProviderKeyConfig = {
         apiKey: form.apiKey.trim(),
         priority: form.priority !== undefined ? Math.trunc(form.priority) : undefined,
+        weight: normalizeCredentialWeight(form.weight),
         prefix: form.prefix?.trim() || undefined,
         baseUrl: trimmedBaseUrl,
-        websockets: Boolean(form.websockets),
         proxyUrl: form.proxyUrl?.trim() || undefined,
         headers: buildHeaderObject(form.headers),
         models: entriesToModels(form.modelEntries),
         excludedModels: parseExcludedModels(form.excludedText),
         authIndex: normalizeAuthIndex(form.authIndex) ?? undefined,
-        disableCooling: form.disableCooling,
-        experimentalCchSigning: form.experimentalCchSigning,
+        disableCooling: coolingPolicyToOverride(form.disableCooling),
       };
+      if (!isMeta) {
+        payload.websockets = Boolean(form.websockets);
+      }
       if (editIndex !== null) {
-        if (isXAI) {
+        if (isMeta) {
+          await providersApi.updateMetaConfig(configs[editIndex], payload);
+        } else if (isXAI) {
           await providersApi.updateXAIConfig(configs[editIndex], payload);
         } else {
           await providersApi.updateCodexConfig(configs[editIndex], payload);
         }
       } else {
-        if (isXAI) {
+        if (isMeta) {
+          await providersApi.createMetaConfig(payload);
+        } else if (isXAI) {
           await providersApi.createXAIConfig(payload);
         } else {
           await providersApi.createCodexConfig(payload);
         }
       }
       const syncedList = await (
-        isXAI ? providersApi.getXAIConfigs() : providersApi.getCodexConfigs()
+        isMeta
+          ? providersApi.getMetaConfigs()
+          : isXAI
+            ? providersApi.getXAIConfigs()
+            : providersApi.getCodexConfigs()
       ).catch(() =>
         editIndex !== null
           ? configs.map((item, index) => (index === editIndex ? payload : item))
@@ -522,8 +731,20 @@ export function CodexEditDrawer({
       clearCache(providerSection);
       showNotification(
         editIndex !== null
-          ? t(isXAI ? 'notification.xai_config_updated' : 'notification.codex_config_updated')
-          : t(isXAI ? 'notification.xai_config_added' : 'notification.codex_config_added'),
+          ? t(
+              isMeta
+                ? 'notification.meta_config_updated'
+                : isXAI
+                  ? 'notification.xai_config_updated'
+                  : 'notification.codex_config_updated'
+            )
+          : t(
+              isMeta
+                ? 'notification.meta_config_added'
+                : isXAI
+                  ? 'notification.xai_config_added'
+                  : 'notification.codex_config_added'
+            ),
         'success'
       );
       onSaved();
@@ -539,7 +760,19 @@ export function CodexEditDrawer({
     clearCache,
     configs,
     editIndex,
-    form,
+    form.apiKey,
+    form.authIndex,
+    form.baseUrl,
+    form.disableCooling,
+    form.excludedText,
+    form.headers,
+    form.modelEntries,
+    form.prefix,
+    form.priority,
+    form.proxyUrl,
+    form.websockets,
+    form.weight,
+    isMeta,
     isXAI,
     onClose,
     onSaved,
@@ -558,7 +791,6 @@ export function CodexEditDrawer({
 
   useEffect(() => {
     if (!modelDiscoveryOpen) return;
-    setDiscoveredModels([]);
     setModelDiscoverySearch('');
     setModelDiscoverySelected(new Set());
     setModelDiscoveryError('');
@@ -608,8 +840,17 @@ export function CodexEditDrawer({
     setModelDiscoverySelected(new Set());
   }, []);
 
+  const isMetaKeyValid = !isMeta || getMetaApiKeyValidationError(form.apiKey) === null;
+  const isMetaAuthorizationValid =
+    !isMeta || !hasMetaDcaAuthorizationHeader(buildHeaderObject(form.headers));
   const canOpenModelDiscovery =
-    !disabled && !saving && !loading && !invalidIndex && Boolean((form.baseUrl ?? '').trim());
+    !disabled &&
+    !saving &&
+    !loading &&
+    !invalidIndex &&
+    Boolean((form.baseUrl ?? '').trim()) &&
+    isMetaKeyValid &&
+    isMetaAuthorizationValid;
   const canApplyModelDiscovery =
     !disabled && !saving && !modelDiscoveryFetching && modelDiscoverySelected.size > 0;
 
@@ -662,6 +903,11 @@ export function CodexEditDrawer({
               }}
               disabled={disabled || saving}
             />
+            <CredentialWeightInput
+              value={form.weight}
+              onChange={(weight) => setForm((prev) => ({ ...prev, weight }))}
+              disabled={disabled || saving}
+            />
             <Input
               label={t('ai_providers.prefix_label')}
               placeholder={t('ai_providers.prefix_placeholder')}
@@ -674,6 +920,7 @@ export function CodexEditDrawer({
               label={t('ai_providers.codex_add_modal_proxy_label')}
               value={form.proxyUrl ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, proxyUrl: e.target.value }))}
+              hint={t('ai_providers.model_discovery_proxy_version_hint')}
               disabled={disabled || saving}
             />
             <HeaderInputList
@@ -739,44 +986,54 @@ export function CodexEditDrawer({
                     {t('ai_providers.codex_test_title')}
                   </label>
                   <span className={styles.modelTestHint}>
-                    {t(isXAI ? 'ai_providers.xai_test_hint' : 'ai_providers.codex_test_hint')}
+                    {t(
+                      isMeta
+                        ? 'ai_providers.meta_test_hint'
+                        : isXAI
+                          ? 'ai_providers.xai_test_hint'
+                          : 'ai_providers.codex_test_hint'
+                    )}
                   </span>
                 </div>
                 <div className={styles.modelTestControls}>
-                  <Select
-                    value={testModel}
-                    options={modelSelectOptions}
-                    onChange={(value) => {
-                      setTestModel(value);
-                      setTestStatus('idle');
-                      setTestMessage('');
-                    }}
-                    placeholder={
-                      availableModels.length
-                        ? t('ai_providers.codex_test_select_placeholder')
-                        : t('ai_providers.codex_test_select_empty')
-                    }
-                    className={styles.openaiTestSelect}
-                    ariaLabel={t('ai_providers.codex_test_title')}
-                    disabled={
-                      disabled ||
-                      saving ||
-                      isTesting ||
-                      testStatus === 'loading' ||
-                      availableModels.length === 0
-                    }
-                  />
+                  {!isMeta && (
+                    <Select
+                      value={testModel}
+                      options={modelSelectOptions}
+                      onChange={(value) => {
+                        setTestModel(value);
+                        setTestStatus('idle');
+                        setTestMessage('');
+                      }}
+                      placeholder={
+                        availableModels.length
+                          ? t('ai_providers.codex_test_select_placeholder')
+                          : t('ai_providers.codex_test_select_empty')
+                      }
+                      className={styles.openaiTestSelect}
+                      ariaLabel={t('ai_providers.codex_test_title')}
+                      disabled={
+                        disabled ||
+                        saving ||
+                        isTesting ||
+                        testStatus === 'loading' ||
+                        availableModels.length === 0
+                      }
+                    />
+                  )}
                   <Button
                     variant={testStatus === 'error' ? 'danger' : 'secondary'}
                     size="sm"
-                    onClick={() => void runCodexConnectivityTest()}
+                    onClick={() =>
+                      void (isMeta ? runMetaConnectivityTest() : runCodexConnectivityTest())
+                    }
                     disabled={
                       disabled ||
                       saving ||
                       loading ||
                       isTesting ||
                       testStatus === 'loading' ||
-                      availableModels.length === 0
+                      (!isMeta && availableModels.length === 0)
                     }
                     loading={isTesting}
                     className={styles.modelTestAllButton}
@@ -800,27 +1057,25 @@ export function CodexEditDrawer({
               )}
             </div>
 
-            <div className="form-group">
-              <label>{t('ai_providers.codex_websockets_label')}</label>
-              <ToggleSwitch
-                checked={Boolean(form.websockets)}
-                onChange={(value) => setForm((prev) => ({ ...prev, websockets: value }))}
-                disabled={disabled || saving}
-                ariaLabel={t('ai_providers.codex_websockets_label')}
-              />
-              <div className="hint">{t('ai_providers.codex_websockets_hint')}</div>
-            </div>
+            {!isMeta && (
+              <div className="form-group">
+                <label>{t('ai_providers.codex_websockets_label')}</label>
+                <ToggleSwitch
+                  checked={Boolean(form.websockets)}
+                  onChange={(value) => setForm((prev) => ({ ...prev, websockets: value }))}
+                  disabled={disabled || saving}
+                  ariaLabel={t('ai_providers.codex_websockets_label')}
+                />
+                <div className="hint">{t('ai_providers.codex_websockets_hint')}</div>
+              </div>
+            )}
 
-            <div className="form-group">
-              <label>{t('ai_providers.disable_cooling_label')}</label>
-              <ToggleSwitch
-                checked={Boolean(form.disableCooling)}
-                onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
-                disabled={disabled || saving}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
-              />
-              <div className="hint">{t('ai_providers.disable_cooling_hint')}</div>
-            </div>
+            <CoolingPolicySelect
+              value={form.disableCooling}
+              onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
+              disabled={disabled || saving}
+              id={`${providerSection}-cooling-policy`}
+            />
 
             <div className="form-group">
               <label>{t('ai_providers.excluded_models_label')}</label>
@@ -916,11 +1171,11 @@ export function CodexEditDrawer({
                   </div>
                 )}
                 {modelDiscoveryError && <div className="error-box">{modelDiscoveryError}</div>}
-                {modelDiscoveryFetching ? (
+                {modelDiscoveryFetching && !modelsLoaded ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.codex_models_fetch_loading')}
                   </div>
-                ) : discoveredModels.length === 0 ? (
+                ) : !modelsLoaded ? null : discoveredModels.length === 0 ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.codex_models_fetch_empty')}
                   </div>
@@ -928,6 +1183,7 @@ export function CodexEditDrawer({
                   <div className={styles.modelDiscoveryList}>
                     {discoveredModelsFiltered.map((model) => {
                       const checked = modelDiscoverySelected.has(model.name);
+                      const discoveryLabel = modelDisplayLabel(model);
                       const alreadyConfigured = configuredModelNames.has(
                         model.name.trim().toLowerCase()
                       );
@@ -947,9 +1203,9 @@ export function CodexEditDrawer({
                               <div className={styles.modelDiscoveryName}>
                                 <div className={styles.modelDiscoveryNameText}>
                                   {model.name}
-                                  {model.alias && (
+                                  {discoveryLabel && (
                                     <span className={styles.modelDiscoveryAlias}>
-                                      {model.alias}
+                                      {discoveryLabel}
                                     </span>
                                   )}
                                 </div>

@@ -1,8 +1,6 @@
 import { apiCallApi, getApiCallErrorMessage } from './apiCall';
-import {
-  ANTIGRAVITY_CODE_ASSIST_URLS,
-  ANTIGRAVITY_REQUEST_HEADERS,
-} from '@/utils/quota/constants';
+import { createScopedApiRequestConfig, type ApiClientRequestScope } from './client';
+import { ANTIGRAVITY_CODE_ASSIST_URLS, ANTIGRAVITY_REQUEST_HEADERS } from '@/utils/quota/constants';
 import { createStatusError, getStatusFromError } from '@/utils/quota/formatters';
 import { normalizeStringValue, parseAntigravityPayload } from '@/utils/quota/parsers';
 
@@ -110,28 +108,40 @@ export const parseAntigravitySubscriptionSummary = (
 };
 
 export const antigravitySubscriptionApi = {
-  async get(authIndex: string): Promise<AntigravitySubscriptionSummary | null> {
+  async get(
+    authIndex: string,
+    requestScope?: ApiClientRequestScope
+  ): Promise<AntigravitySubscriptionSummary | null> {
     let lastError = '';
     let lastStatus: number | undefined;
 
     for (const url of ANTIGRAVITY_CODE_ASSIST_URLS) {
       try {
-        const result = await apiCallApi.request({
-          authIndex,
-          method: 'POST',
-          url,
-          header: { ...ANTIGRAVITY_REQUEST_HEADERS },
-          data: CODE_ASSIST_REQUEST_BODY,
-        });
+        const result = await apiCallApi.request(
+          {
+            authIndex,
+            method: 'POST',
+            url,
+            header: { ...ANTIGRAVITY_REQUEST_HEADERS },
+            data: CODE_ASSIST_REQUEST_BODY,
+          },
+          requestScope ? createScopedApiRequestConfig(requestScope) : undefined
+        );
 
         if (result.statusCode < 200 || result.statusCode >= 300) {
           lastError = getApiCallErrorMessage(result);
           lastStatus = result.statusCode;
+          if (result.statusCode === 429) {
+            throw createStatusError(lastError, 429);
+          }
           continue;
         }
 
         return parseAntigravitySubscriptionSummary(result.body ?? result.bodyText);
       } catch (err: unknown) {
+        if (getStatusFromError(err) === 429) {
+          throw err;
+        }
         lastError = err instanceof Error ? err.message : 'Unknown error';
         lastStatus = getStatusFromError(err) ?? lastStatus;
       }

@@ -1,10 +1,33 @@
 import type { AuthFileItem } from '@/types';
 import {
   readAuthFileStatusAccountId,
-  readAuthFileStatusAccountSnapshot,
+  readAuthFileStatusCodexMember,
   readAuthFileStatusProvider,
   readAuthFileStatusRuntimeId,
 } from '@/utils/authFileStatusMutation';
+
+export type CodexReauthReconciliationCode =
+  | 'identity_changed'
+  | 'identity_ambiguous'
+  | 'identity_unconfirmed';
+
+export class CodexReauthReconciliationError extends Error {
+  readonly code: CodexReauthReconciliationCode;
+
+  constructor(code: CodexReauthReconciliationCode, message: string) {
+    super(message);
+    this.code = code;
+    Object.defineProperty(this, 'name', {
+      value: 'CodexReauthReconciliationError',
+      enumerable: false,
+      configurable: true,
+    });
+  }
+}
+
+export const isCodexReauthReconciliationError = (
+  error: unknown
+): error is CodexReauthReconciliationError => error instanceof CodexReauthReconciliationError;
 
 export type CodexReauthTarget = {
   account: string;
@@ -46,6 +69,6 @@ export const createCodexReauthTargetFromAuthFile = (file: AuthFileItem): CodexRe
     provider: readAuthFileStatusProvider(file) || null,
     authIndex: (record.authIndex ?? record.auth_index ?? null) as string | number | null,
     accountId,
-    accountSnapshot: readAuthFileStatusAccountSnapshot(file) || null,
+    accountSnapshot: readAuthFileStatusCodexMember(file) || null,
   };
 };

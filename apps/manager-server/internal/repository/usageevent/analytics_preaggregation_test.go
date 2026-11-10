@@ -82,16 +82,16 @@ func TestCredentialIDFilterMatchesAllIdentityFallbacks(t *testing.T) {
 		sourceHash string
 		source     string
 	}{
-		{name: "auth file", id: "credential.json", authFile: "credential.json", authIndex: "auth-file", sourceHash: "hash-file", source: "source-file"},
-		{name: "auth index", id: "auth-index", authIndex: "auth-index", sourceHash: "hash-index", source: "source-index"},
-		{name: "source hash", id: "hash-only", sourceHash: "hash-only", source: "source-hash"},
+		{name: "auth file", id: "credential.json", authFile: "credential.json", authIndex: "auth-file", sourceHash: canonicalTestHash("hash-file"), source: "source-file"},
+		{name: "auth index", id: "auth-index", authIndex: "auth-index", sourceHash: canonicalTestHash("hash-index"), source: "source-index"},
+		{name: "source hash", id: canonicalTestHash("hash-only"), sourceHash: canonicalTestHash("hash-only"), source: "source-hash"},
 		{name: "source", id: "source-only", source: "source-only"},
 	}
 	events := make([]usage.Event, 0, len(identities))
 	for index, identity := range identities {
 		timestamp := base.Add(time.Duration(index) * time.Hour)
 		events = append(events, usage.Event{
-			EventHash:        "credential-filter-" + identity.name,
+			EventHash:        canonicalTestHash("credential-filter-" + identity.name),
 			TimestampMS:      timestamp.UnixMilli(),
 			Timestamp:        timestamp.Format(time.RFC3339Nano),
 			Model:            "gpt-test",
@@ -135,6 +135,48 @@ func TestCredentialIDFilterMatchesAllIdentityFallbacks(t *testing.T) {
 	}
 }
 
+func TestCredentialAnalyticsHidesHistoricalCodexProjectMarker(t *testing.T) {
+	repo := newAnalyticsPreaggregationRepo(t)
+	ctx := context.Background()
+	timestamp := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := repo.InsertBatch(ctx, []usage.Event{{
+		EventHash:             canonicalTestHash("credential-legacy-codex-marker"),
+		TimestampMS:           timestamp.UnixMilli(),
+		Timestamp:             timestamp.Format(time.RFC3339Nano),
+		Provider:              "codex",
+		Model:                 "gpt-5",
+		AuthFileSnapshot:      "codex.json",
+		AuthIndex:             "codex-auth",
+		AuthProviderSnapshot:  "codex",
+		AuthProjectIDSnapshot: "codex-account-id:v1:historical-account",
+		InputTokens:           10,
+		OutputTokens:          5,
+		TotalTokens:           15,
+		CreatedAtMS:           timestamp.UnixMilli(),
+	}}); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+	filter := AnalyticsFilter{
+		FromMS:        timestamp.Add(-time.Hour).UnixMilli(),
+		ToMS:          timestamp.Add(time.Hour).UnixMilli(),
+		IncludeFailed: true,
+	}
+	stats, err := repo.CredentialModelStatsWithFilter(ctx, filter)
+	if err != nil {
+		t.Fatalf("credential stats: %v", err)
+	}
+	if len(stats) != 1 || stats[0].AuthProjectIDSnapshot != "" {
+		t.Fatalf("credential stats project snapshot = %#v, want empty", stats)
+	}
+	points, err := repo.CredentialTimelineWithFilter(ctx, filter, "hour", time.UTC)
+	if err != nil {
+		t.Fatalf("credential timeline: %v", err)
+	}
+	if len(points) != 1 || points[0].AuthProjectIDSnapshot != "" {
+		t.Fatalf("credential timeline project snapshot = %#v, want empty", points)
+	}
+}
+
 func newAnalyticsPreaggregationRepo(t *testing.T) *repository {
 	t.Helper()
 	db, err := sqliterepo.Open(filepath.Join(t.TempDir(), "usage.sqlite"))
@@ -152,7 +194,7 @@ func insertAnalyticsPreaggregationEvents(t *testing.T, ctx context.Context, repo
 	for index, latency := range latencies {
 		timestamp := base.Add(time.Duration(index)*time.Hour + 20*time.Minute)
 		event := usage.Event{
-			EventHash:             "analytics-preaggregate-" + timestamp.Format("20060102T150405Z"),
+			EventHash:             canonicalTestHash("analytics-preaggregate-" + timestamp.Format("20060102T150405Z")),
 			TimestampMS:           timestamp.UnixMilli(),
 			Timestamp:             timestamp.Format(time.RFC3339Nano),
 			Provider:              "fallback-provider",

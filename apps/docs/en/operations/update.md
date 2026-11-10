@@ -10,6 +10,7 @@ This guide explains how to upgrade CPAMP without losing SQLite data, `data.key`,
 4. Back up:
    - `usage.sqlite`, `usage.sqlite-wal`, and `usage.sqlite-shm`.
    - `data.key`.
+   - `usage-archives/` when historical archiving has been used.
    - Installer-managed `secrets/`, `.env`, `compose.yaml`, or `config.json`.
    - Custom reverse-proxy, systemd, launchd, or Windows service configuration.
 
@@ -21,7 +22,34 @@ See [Backup And Restore](./backup.md) for safe procedures. A CPA Management Key 
 - Large historical corrections may continue in the background after the HTTP server starts listening.
 - Account-history or dashboard-hourly rollups may pause during migration. Related pages temporarily fall back to raw events and can be slower until catch-up completes.
 - Do not start a second Manager Server against the same SQLite database or CPA queue to accelerate migration or rollup rebuilds.
-- Use authenticated `GET /status` to inspect migration, collector, and event state.
+- Use authenticated `GET /status` to inspect migration, collector, event, and `databaseMaintenance` state. The global warning, System Info, and Request Monitoring explain when offline maintenance is required.
+- The Usage Maintenance page in a Manager Server-hosted panel shows migration, aggregate, active archive, and reclaimable SQLite state. A regular CPA-hosted panel does not show this entry.
+
+### If Database Maintenance Is Degraded
+
+Manager Server binds HTTP before running work whose cost grows with historical data. Missing indexes on populated tables and some legacy-derived cleanup are therefore not executed without a bound during startup. This does not mean data is missing, but historical request queries can become noticeably slower or time out until the query indexes are prepared.
+
+Docker Compose:
+
+```bash
+docker compose stop cpa-manager-plus
+
+docker compose run --rm --no-deps \
+  cpa-manager-plus \
+  cleanup-derived --db-path /data/usage.sqlite
+
+docker compose start cpa-manager-plus
+```
+
+Native installation:
+
+```bash
+cpa-manager-plus cleanup-derived
+# Non-default path
+cpa-manager-plus cleanup-derived --db-path /path/to/usage.sqlite
+```
+
+Stop Manager Server first because the offline command requires the exclusive SQLite process lock. The web UI does not run cleanup automatically, spawn a cleanup subprocess, or create large-table indexes online. The global warning reads bounded metadata through `/status?scope=database-maintenance`, so maintenance polling does not scan or count `usage_events`. After the command completes and Manager Server restarts, `/status.databaseMaintenance` recovers from the real metadata automatically. `cleanup-derived` never deletes, rebuilds, or rewrites authoritative `usage_events`.
 
 ## Docker Deployment Created By The Installer
 
@@ -217,6 +245,8 @@ For a manually deployed single-file panel:
 
 Replacing only `management.html` does not update Manager Server APIs. Mixing a frontend and Manager Server across several releases can cause field or feature incompatibilities; use the panel and Manager Server from the same CPAMP release.
 
+`PANEL_PATH` changes which `management.html` Manager Server serves; the root `/favicon.ico` and `/apple-touch-icon.png` endpoints remain CPAMP service assets. This preserves Safari/iOS compatibility when `PANEL_PATH` points to an official CPAMP Release panel. A third-party panel that needs different branding should use its own explicit icon URLs or embedded icons.
+
 ## Verify The Upgrade
 
 Run:
@@ -235,13 +265,17 @@ Confirm:
 - `collector.lastError` is empty or understood.
 - `lastConsumedAt`, `lastInsertedAt`, and `eventCount` update normally.
 - Dashboard, Request Monitoring, and Usage Analytics load data.
+- Usage Maintenance loads recent archive runs and maintenance state. A mismatched old panel or Manager Server should report the feature as unsupported instead of presenting empty data.
 - Background migration completes and rollup checkpoints continue advancing in `/status`.
+- `/status.databaseMaintenance.required` is `false`. If it is `true`, inspect the deferred-index and offline-job counts and follow the offline steps above.
 - Reverse-proxied `/management.html`, `/usage-service/*`, and management API paths still route to the correct service.
+
+For releases involving historical archives or large databases, rehearse on staging: complete backup → reserve temporary free space at least equal to the database-file size → stop every Manager Server → `compact-usage` → start service → check health/status/analytics → decompress an archive sample as documented in [Backup And Restore](./backup.md) and confirm that the source database skips it idempotently → confirm that the same sample is added to an empty isolated recovery instance → restore the complete backup into a separate directory and verify again. Physical compaction is not an automatic upgrade step; run it only after logical deletion when disk space must be reclaimed. Pending derived-data migration checkpoints are preserved by compaction and continue after restart.
 
 ## Rollback Principles
 
 - Docker: restore the previous image tag and recreate the container while mounting the pre-upgrade data backup.
 - Native: stop the new version and restore the old binary, configuration, and pre-upgrade data backup.
 - Single-file panel: restore the previous `management.html`.
-- Do not assume an older binary can read a database migrated by a newer version. For schema or data-semantics changes, restore the pre-upgrade SQLite, WAL/SHM, and `data.key` together.
+- Do not assume an older binary can read a database migrated by a newer version. For schema or data-semantics changes, restore the pre-upgrade SQLite, WAL/SHM, `data.key`, and matching `usage-archives/` together.
 - If the cause is unclear, preserve both versions' logs and database copies. Do not repeatedly start different versions against the same live database.

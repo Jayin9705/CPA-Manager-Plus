@@ -8,38 +8,31 @@ import { Select } from '@/components/ui/Select';
 import { HeaderInputList } from '@/components/ui/HeaderInputList';
 import { ModelInputList } from '@/components/ui/ModelInputList';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
+import { CoolingPolicySelect } from '@/components/providers/CoolingPolicySelect';
 import { useEdgeSwipeBack } from '@/hooks/useEdgeSwipeBack';
 import { SecondaryScreenShell } from '@/components/common/SecondaryScreenShell';
 import { apiCallApi, getApiCallErrorMessage } from '@/services/api';
 import { useNotificationStore } from '@/stores';
 import { normalizeAuthIndex } from '@/utils/authIndex';
 import { buildHeaderObject } from '@/utils/headers';
-import { buildClaudeMessagesEndpoint, parseTextList } from '@/components/providers/utils';
+import { buildClaudeRequestHeaders } from '@/utils/claudeAuth';
+import {
+  buildClaudeMessagesEndpoint,
+  parseTextList,
+  resolveClaudeFingerprintSelection,
+} from '@/components/providers/utils';
+import { CredentialWeightInput } from '@/components/providers';
+import { getCredentialWeightError } from '@/utils/credentialWeight';
 import type { ClaudeEditOutletContext } from './AiProvidersClaudeEditLayout';
 import styles from './AiProvidersPage.module.scss';
 import layoutStyles from './AiProvidersEditLayout.module.scss';
 
 const CLAUDE_TEST_TIMEOUT_MS = 30_000;
-const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
 
 const getErrorMessage = (err: unknown) => {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   return '';
-};
-
-const hasHeader = (headers: Record<string, string>, name: string) => {
-  const target = name.toLowerCase();
-  return Object.keys(headers).some((key) => key.toLowerCase() === target);
-};
-
-const resolveBearerTokenFromAuthorization = (headers: Record<string, string>): string => {
-  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === 'authorization');
-  if (!entry) return '';
-  const value = String(entry[1] ?? '').trim();
-  if (!value) return '';
-  const match = value.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || '';
 };
 
 export function AiProvidersClaudeEditPage() {
@@ -90,7 +83,13 @@ export function AiProvidersClaudeEditPage() {
   }, [form.cloak]);
 
   const canSave =
-    !disableControls && !loading && !saving && !invalidIndexParam && !invalidIndex && !isTesting;
+    !disableControls &&
+    !loading &&
+    !saving &&
+    !invalidIndexParam &&
+    !invalidIndex &&
+    !isTesting &&
+    !getCredentialWeightError(form.weight);
 
   const modelSelectOptions = useMemo(() => {
     const seen = new Set<string>();
@@ -116,6 +115,17 @@ export function AiProvidersClaudeEditPage() {
     [t]
   );
 
+  const fingerprintOptions = useMemo(
+    () => [
+      { value: '', label: t('ai_providers.claude_request_fingerprint_default') },
+      {
+        value: 'claude-code-cli',
+        label: t('ai_providers.claude_request_fingerprint_claude_code_cli'),
+      },
+    ],
+    [t]
+  );
+
   const resolvedCloakMode = useMemo(() => {
     const mode = (form.cloak?.mode ?? '').trim().toLowerCase();
     if (!mode) return 'auto';
@@ -135,11 +145,20 @@ export function AiProvidersClaudeEditPage() {
       form.apiKey.trim(),
       normalizeAuthIndex(form.authIndex) ?? '',
       form.baseUrl?.trim() ?? '',
+      form.proxyUrl?.trim() ?? '',
       testModel.trim(),
       headersSignature,
       modelsSignature,
     ].join('||');
-  }, [form.apiKey, form.authIndex, form.baseUrl, form.headers, form.modelEntries, testModel]);
+  }, [
+    form.apiKey,
+    form.authIndex,
+    form.baseUrl,
+    form.headers,
+    form.modelEntries,
+    form.proxyUrl,
+    testModel,
+  ]);
 
   const previousConnectivityConfigRef = useRef(connectivityConfigSignature);
 
@@ -171,17 +190,6 @@ export function AiProvidersClaudeEditPage() {
     const customHeaders = buildHeaderObject(form.headers);
     const apiKey = form.apiKey.trim();
     const keyAuthIndex = normalizeAuthIndex(form.authIndex) ?? undefined;
-    const hasApiKeyHeader = hasHeader(customHeaders, 'x-api-key');
-    const apiKeyFromAuthorization = resolveBearerTokenFromAuthorization(customHeaders);
-    const resolvedApiKey = apiKey || apiKeyFromAuthorization;
-
-    if (!resolvedApiKey && !hasApiKeyHeader && !keyAuthIndex) {
-      const message = t('ai_providers.claude_test_key_required');
-      setTestStatus('error');
-      setTestMessage(message);
-      showNotification(message, 'error');
-      return;
-    }
 
     const endpoint = buildClaudeMessagesEndpoint(form.baseUrl ?? '');
     if (!endpoint) {
@@ -192,26 +200,21 @@ export function AiProvidersClaudeEditPage() {
       return;
     }
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...customHeaders,
-    };
-
-    if (!hasHeader(headers, 'anthropic-version')) {
-      headers['anthropic-version'] = DEFAULT_ANTHROPIC_VERSION;
+    const authResolution = buildClaudeRequestHeaders({
+      url: endpoint,
+      apiKey: apiKey || undefined,
+      authIndex: keyAuthIndex,
+      customHeaders,
+      contentType: 'application/json',
+    });
+    if (!authResolution.effectiveXApiKey && !authResolution.effectiveAuthorization) {
+      const message = t('ai_providers.claude_test_key_required');
+      setTestStatus('error');
+      setTestMessage(message);
+      showNotification(message, 'error');
+      return;
     }
-    if (!Object.prototype.hasOwnProperty.call(headers, 'Anthropic-Version')) {
-      headers['Anthropic-Version'] = headers['anthropic-version'] ?? DEFAULT_ANTHROPIC_VERSION;
-    }
-
-    const tokenValue = resolvedApiKey || (keyAuthIndex ? '$TOKEN$' : '');
-
-    if (!hasApiKeyHeader && tokenValue) {
-      headers['x-api-key'] = tokenValue;
-    }
-    if (!Object.prototype.hasOwnProperty.call(headers, 'X-Api-Key') && tokenValue) {
-      headers['X-Api-Key'] = tokenValue;
-    }
+    const headers = authResolution.headers;
 
     setIsTesting(true);
     setTestStatus('loading');
@@ -222,6 +225,7 @@ export function AiProvidersClaudeEditPage() {
         {
           method: 'POST',
           authIndex: keyAuthIndex,
+          proxyUrl: form.proxyUrl,
           url: endpoint,
           header: headers,
           data: JSON.stringify({
@@ -263,6 +267,7 @@ export function AiProvidersClaudeEditPage() {
     form.authIndex,
     form.baseUrl,
     form.headers,
+    form.proxyUrl,
     isTesting,
     setTestMessage,
     setTestStatus,
@@ -332,6 +337,11 @@ export function AiProvidersClaudeEditPage() {
               }}
               disabled={saving || disableControls || isTesting}
             />
+            <CredentialWeightInput
+              value={form.weight}
+              onChange={(weight) => setForm((prev) => ({ ...prev, weight }))}
+              disabled={saving || disableControls || isTesting}
+            />
             <Input
               label={t('ai_providers.prefix_label')}
               placeholder={t('ai_providers.prefix_placeholder')}
@@ -350,6 +360,7 @@ export function AiProvidersClaudeEditPage() {
               label={t('ai_providers.claude_add_modal_proxy_label')}
               value={form.proxyUrl ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, proxyUrl: e.target.value }))}
+              hint={t('ai_providers.model_discovery_proxy_version_hint')}
               disabled={saving || disableControls || isTesting}
             />
             <HeaderInputList
@@ -491,16 +502,12 @@ export function AiProvidersClaudeEditPage() {
               <div className="hint">{t('ai_providers.excluded_models_hint')}</div>
             </div>
 
-            <div className="form-group">
-              <label>{t('ai_providers.disable_cooling_label')}</label>
-              <ToggleSwitch
-                checked={Boolean(form.disableCooling)}
-                onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
-                disabled={saving || disableControls || isTesting}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
-              />
-              <div className="hint">{t('ai_providers.disable_cooling_hint')}</div>
-            </div>
+            <CoolingPolicySelect
+              value={form.disableCooling}
+              onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
+              disabled={saving || disableControls || isTesting}
+              id="claude-page-cooling-policy"
+            />
             <div className="form-group">
               <label>{t('ai_providers.rebuild_mid_system_message_label')}</label>
               <ToggleSwitch
@@ -514,6 +521,26 @@ export function AiProvidersClaudeEditPage() {
               <div className="hint">
                 {t('ai_providers.rebuild_mid_system_message_hint')}
               </div>
+            </div>
+
+            <div className="form-group">
+              <label>{t('ai_providers.claude_request_fingerprint_label')}</label>
+              <Select
+                value={form.fingerprintProfile ?? ''}
+                options={fingerprintOptions}
+                onChange={(value) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    fingerprintProfile: resolveClaudeFingerprintSelection(
+                      prev.fingerprintProfile,
+                      value
+                    ),
+                  }))
+                }
+                ariaLabel={t('ai_providers.claude_request_fingerprint_label')}
+                disabled={saving || disableControls || isTesting}
+              />
+              <div className="hint">{t('ai_providers.claude_request_fingerprint_hint')}</div>
             </div>
 
             <div className={styles.modelConfigSection}>

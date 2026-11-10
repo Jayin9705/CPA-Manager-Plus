@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
-import type { MonitoringAnalyticsResponse } from '@/services/api/usageService';
+import { describe, expect, it, vi } from 'vitest';
+import type {
+  MonitoringAnalyticsApiKeyStatRow,
+  MonitoringAnalyticsResponse,
+} from '@/services/api/usageService';
 import { buildSourceInfoMap } from '@/utils/sourceResolver';
-import type { UsageRankRow } from './usageAnalyticsModel';
+import type { UsageRankRow, UsageTimelinePoint } from './usageAnalyticsModel';
 import {
+  adaptUsageAnalyticsData,
   analyzeUsageBucket,
   buildApiKeyTrendSeries,
   buildApiKeyRows,
@@ -28,11 +32,14 @@ import {
   buildUsageCredentialTimeline,
   buildUsageApiKeyTimeline,
   buildUsageTimeline,
+  fillUsageTimelineBuckets,
   computeCacheHitRate,
   computeRowAverageCostPerCall,
   computeRowCacheHitRate,
   getUsageCacheTokens,
+  getUsagePresentationRangeScopeKey,
   getUsageRangeBounds,
+  getSelectableApiKeyHash,
   maskApiKeyHash,
   resolveUsageGranularity,
   USAGE_ANALYTICS_DEFAULT_FILTERS,
@@ -42,7 +49,70 @@ const NOW_MS = Date.UTC(2026, 5, 4, 12, 0, 0);
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+const localDateMs = (day: number, hour = 0) => new Date(2026, 7, day, hour, 0, 0, 0).getTime();
+
+const expectZeroTimelinePoint = (point: UsageTimelinePoint) => {
+  expect(point).toMatchObject({
+    requestCount: 0,
+    totalTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    reasoningTokens: 0,
+    estimatedCost: 0,
+    successCount: 0,
+    failureCount: 0,
+    successRate: 0,
+    failureRate: 0,
+    cacheHitRate: 0,
+    averageTokensPerRequest: 0,
+  });
+  expect(point.averageLatencyMs).toBeNull();
+  expect(point.p95LatencyMs).toBeNull();
+  expect(point.p95TtftMs).toBeNull();
+};
+
 describe('usage analytics request model', () => {
+  it('keeps synthetic fallback groups out of API key filters', () => {
+    expect(getSelectableApiKeyHash('unknown-client-api-key:source:auth:provider')).toBe('');
+    expect(getSelectableApiKeyHash(' UNKNOWN-CLIENT-API-KEY:legacy ')).toBe('');
+    expect(getSelectableApiKeyHash('all')).toBe('');
+    expect(getSelectableApiKeyHash(' ABCDEF1234567890 ')).toBe('abcdef1234567890');
+    expect(
+      buildUsageAnalyticsFilters({ apiKeyHash: 'unknown-client-api-key:analytics-filter' })
+    ).not.toHaveProperty('api_key_hashes');
+    expect(
+      buildMonitoringDetailUrl(
+        { bucketMs: 1000, bucketEndMs: 2000 },
+        { apiKeyHash: 'unknown-client-api-key:monitoring-link' }
+      )
+    ).not.toContain('api_key_hash');
+  });
+
+  it('keeps rolling-range presentation stable on refresh but separates new calendar days', () => {
+    const rollingFilters = { timeRange: '24h' as const, customRange: null };
+    const firstRolling = getUsageRangeBounds(rollingFilters, NOW_MS);
+    const nextRolling = getUsageRangeBounds(rollingFilters, NOW_MS + 60_000);
+    expect(nextRolling).not.toEqual(firstRolling);
+    expect(getUsagePresentationRangeScopeKey(rollingFilters, nextRolling)).toBe(
+      getUsagePresentationRangeScopeKey(rollingFilters, firstRolling)
+    );
+
+    const todayFilters = { timeRange: 'today' as const, customRange: null };
+    const today = getUsageRangeBounds(todayFilters, localDateMs(20, 12));
+    const tomorrow = getUsageRangeBounds(todayFilters, localDateMs(21, 1));
+    expect(getUsagePresentationRangeScopeKey(todayFilters, tomorrow)).not.toBe(
+      getUsagePresentationRangeScopeKey(todayFilters, today)
+    );
+
+    const customFilters = { timeRange: 'custom' as const, customRange: null };
+    expect(
+      getUsagePresentationRangeScopeKey(customFilters, { fromMs: 1000, toMs: 2000 })
+    ).not.toBe(getUsagePresentationRangeScopeKey(customFilters, { fromMs: 2000, toMs: 3000 }));
+  });
+
   it('resolves time ranges and default granularity rules', () => {
     expect(USAGE_ANALYTICS_DEFAULT_FILTERS.timeRange).toBe('24h');
     expect(getUsageRangeBounds({ timeRange: '24h', customRange: null }, NOW_MS)).toEqual({
@@ -166,6 +236,218 @@ describe('usage analytics request model', () => {
 });
 
 describe('usage analytics adapters', () => {
+  it('preserves archive coverage metadata for presentation layers', () => {
+    const coverage: NonNullable<MonitoringAnalyticsResponse['coverage']> = {
+      scope: 'time_range',
+      mode: 'mixed',
+      raw_complete: false,
+      core_aggregate_used: true,
+      raw_event_count: 4,
+      raw_deleted_event_count: 2,
+      min_deleted_timestamp_ms: 1,
+      max_deleted_timestamp_ms: 2,
+      comparison_raw_event_count: 0,
+      comparison_raw_deleted_event_count: 3,
+      comparison_min_deleted_timestamp_ms: 3,
+      comparison_max_deleted_timestamp_ms: 4,
+      fidelity_limitations: ['event_details_require_raw_events'],
+    };
+
+    expect(
+      adaptUsageAnalyticsData(
+        {
+          generated_at_ms: NOW_MS,
+          granularity: 'hour',
+          coverage,
+        },
+        'hour'
+      ).coverage
+    ).toEqual(coverage);
+  });
+
+  it('fills a missing middle hourly bucket with zero metrics', () => {
+    const fromMs = localDateMs(10, 10);
+    const toMs = localDateMs(10, 13);
+    const timeline = fillUsageTimelineBuckets(
+      buildUsageTimeline(
+        [
+          { bucket_ms: fromMs, label: '', calls: 2, tokens: 20, success: 2, failure: 0 },
+          {
+            bucket_ms: fromMs + 2 * HOUR_MS,
+            label: '',
+            calls: 3,
+            tokens: 30,
+            success: 3,
+            failure: 0,
+          },
+        ],
+        'hour'
+      ),
+      { fromMs, toMs },
+      'hour'
+    );
+
+    expect(timeline.map((point) => point.bucketMs)).toEqual([
+      fromMs,
+      fromMs + HOUR_MS,
+      fromMs + 2 * HOUR_MS,
+    ]);
+    expectZeroTimelinePoint(timeline[1]);
+    expect(timeline[1].bucketEndMs).toBe(fromMs + 2 * HOUR_MS);
+  });
+
+  it('does not synthesize a duplicate local hour across DST fall-back', () => {
+    vi.stubEnv('TZ', 'America/New_York');
+
+    try {
+      const firstMidnight = Date.parse('2026-11-01T04:00:00.000Z');
+      const firstOneAm = Date.parse('2026-11-01T05:00:00.000Z');
+      const repeatedOneAm = Date.parse('2026-11-01T06:00:00.000Z');
+      const twoAm = Date.parse('2026-11-01T07:00:00.000Z');
+      const threeAm = Date.parse('2026-11-01T08:00:00.000Z');
+      const mappedTimeline = buildUsageTimeline(
+        [
+          {
+            bucket_ms: firstMidnight,
+            label: '',
+            calls: 1,
+            tokens: 10,
+            success: 1,
+            failure: 0,
+            cost: 1,
+          },
+          {
+            bucket_ms: firstOneAm,
+            label: '',
+            calls: 2,
+            tokens: 20,
+            success: 2,
+            failure: 0,
+            cost: 2,
+          },
+          {
+            bucket_ms: twoAm,
+            label: '',
+            calls: 3,
+            tokens: 30,
+            success: 3,
+            failure: 0,
+            cost: 3,
+          },
+        ],
+        'hour'
+      );
+      const timeline = fillUsageTimelineBuckets(
+        mappedTimeline,
+        { fromMs: firstMidnight, toMs: threeAm },
+        'hour'
+      );
+
+      expect(timeline.map((point) => point.bucketMs)).toEqual([firstMidnight, firstOneAm, twoAm]);
+      expect(timeline.some((point) => point.bucketMs === repeatedOneAm)).toBe(false);
+      expect(timeline).toEqual(mappedTimeline);
+      expect(timeline.map((point) => point.requestCount)).toEqual([1, 2, 3]);
+      expect(timeline.map((point) => point.totalTokens)).toEqual([10, 20, 30]);
+      expect(timeline.map((point) => point.estimatedCost)).toEqual([1, 2, 3]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('fills missing daily buckets and respects the exclusive range end', () => {
+    const fromMs = localDateMs(10);
+    const toMs = localDateMs(13);
+    const timeline = fillUsageTimelineBuckets(
+      buildUsageTimeline(
+        [
+          { bucket_ms: fromMs, label: '', calls: 1, tokens: 10, success: 1, failure: 0 },
+          {
+            bucket_ms: localDateMs(12),
+            label: '',
+            calls: 2,
+            tokens: 20,
+            success: 2,
+            failure: 0,
+          },
+        ],
+        'day'
+      ),
+      { fromMs, toMs },
+      'day'
+    );
+
+    expect(timeline.map((point) => point.bucketMs)).toEqual([
+      localDateMs(10),
+      localDateMs(11),
+      localDateMs(12),
+    ]);
+    expectZeroTimelinePoint(timeline[1]);
+    expect(timeline.some((point) => point.bucketMs === toMs)).toBe(false);
+  });
+
+  it('fills both leading and trailing buckets without changing real points', () => {
+    const fromMs = localDateMs(10);
+    const toMs = localDateMs(14);
+    const realPoint = buildUsageTimeline(
+      [{ bucket_ms: localDateMs(12), label: '', calls: 4, tokens: 40, success: 3, failure: 1 }],
+      'day'
+    )[0];
+    const timeline = fillUsageTimelineBuckets([realPoint], { fromMs, toMs }, 'day');
+
+    expect(timeline.map((point) => point.bucketMs)).toEqual([
+      localDateMs(10),
+      localDateMs(11),
+      localDateMs(12),
+      localDateMs(13),
+    ]);
+    expectZeroTimelinePoint(timeline[0]);
+    expectZeroTimelinePoint(timeline[1]);
+    expectZeroTimelinePoint(timeline[3]);
+    expect(timeline[2]).toBe(realPoint);
+    expect(timeline[2]).toMatchObject({ requestCount: 4, totalTokens: 40, failureCount: 1 });
+  });
+
+  it('returns a complete timeline unchanged apart from ordering', () => {
+    const fromMs = localDateMs(10, 10);
+    const toMs = localDateMs(10, 13);
+    const mappedTimeline = buildUsageTimeline(
+      [
+        {
+          bucket_ms: fromMs + 2 * HOUR_MS,
+          label: '',
+          calls: 3,
+          tokens: 30,
+          success: 3,
+          failure: 0,
+        },
+        { bucket_ms: fromMs, label: '', calls: 1, tokens: 10, success: 1, failure: 0 },
+        { bucket_ms: fromMs + HOUR_MS, label: '', calls: 2, tokens: 20, success: 1, failure: 1 },
+      ],
+      'hour'
+    );
+    const timeline = fillUsageTimelineBuckets(mappedTimeline, { fromMs, toMs }, 'hour');
+
+    expect(timeline).toEqual(
+      mappedTimeline.slice().sort((left, right) => left.bucketMs - right.bucketMs)
+    );
+    expect(timeline).toHaveLength(3);
+  });
+
+  it('keeps a successful empty analytics response empty', () => {
+    const fromMs = localDateMs(10, 10);
+    const toMs = localDateMs(10, 13);
+    const adapted = adaptUsageAnalyticsData(
+      { generated_at_ms: 1, granularity: 'hour', timeline: [] },
+      'hour',
+      '',
+      undefined,
+      undefined,
+      { fromMs, toMs }
+    );
+
+    expect(adapted.timeline).toEqual([]);
+  });
+
   it('builds heatmap chart data from non-empty valid request buckets only', () => {
     expect(
       buildUsageHeatmapChartData([
@@ -785,6 +1067,48 @@ describe('usage analytics adapters', () => {
     expect(maskApiKeyHash('sk-live-raw-secret-value')).toBe('sk-****alue');
   });
 
+  it('ranks API keys by cost before request count', () => {
+    const createRow = (
+      id: string,
+      calls: number,
+      cost: number
+    ): MonitoringAnalyticsApiKeyStatRow => ({
+      id,
+      api_key_hash: id,
+      calls,
+      success_calls: calls,
+      failure_calls: 0,
+      success_rate: 1,
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      total_tokens: 0,
+      cost,
+      average_latency_ms: null,
+      last_seen_ms: NOW_MS,
+    });
+
+    const rows = buildApiKeyRows([
+      createRow('key-a', 1000, 1),
+      createRow('key-b', 100, 20),
+      createRow('key-c', 50, 20),
+    ]);
+
+    expect(
+      rows.map(({ apiKeyHash, requestCount, estimatedCost }) => ({
+        apiKeyHash,
+        requestCount,
+        estimatedCost,
+      }))
+    ).toEqual([
+      { apiKeyHash: 'key-b', requestCount: 100, estimatedCost: 20 },
+      { apiKeyHash: 'key-c', requestCount: 50, estimatedCost: 20 },
+      { apiKeyHash: 'key-a', requestCount: 1000, estimatedCost: 1 },
+    ]);
+  });
+
   it('resolves API key aliases by hash across analytics views', () => {
     const displayMap = new Map([
       [
@@ -1189,13 +1513,16 @@ describe('usage analytics adapters', () => {
     expect(rows[0].cacheRate).toBeCloseTo(140 / 300, 6);
   });
 
-  it('estimates drilldown preview cost from model cost per token', () => {
+  it('uses canonical analytics models to estimate drilldown preview cost', () => {
     const rows = buildDrilldownPreview(
       [
         {
           event_hash: 'event-a',
           timestamp_ms: NOW_MS,
-          model: 'gpt-4o',
+          model: 'deepseek-v4-flash(max)',
+          analytics_model: 'deepseek-v4-flash',
+          requested_model: 'deepseek-v4-flash(max)',
+          resolved_model: 'deepseek-v4-flash-202608',
           endpoint: '/v1/chat/completions',
           method: 'POST',
           path: '/v1/chat/completions',
@@ -1222,12 +1549,37 @@ describe('usage analytics adapters', () => {
           header_quota_used_percent: 87,
           header_quota_recover_at_ms: 1780000060000,
         },
+        {
+          event_hash: 'event-b',
+          timestamp_ms: NOW_MS,
+          model: 'deepseek-v4-flash(high)',
+          requested_model: 'deepseek-v4-flash(high)',
+          endpoint: '/v1/chat/completions',
+          method: 'POST',
+          path: '/v1/chat/completions',
+          auth_index: '0',
+          source: 'codex',
+          source_hash: 'source-a',
+          api_key_hash: 'abcdef1234567890',
+          account_snapshot: 'team-alpha',
+          auth_label_snapshot: 'prod',
+          auth_provider_snapshot: 'openai',
+          input_tokens: 60,
+          output_tokens: 40,
+          cached_tokens: 0,
+          cache_read_tokens: 0,
+          cache_creation_tokens: 0,
+          reasoning_tokens: 0,
+          total_tokens: 100,
+          latency_ms: 250,
+          failed: false,
+        },
       ],
       [
         {
-          id: 'gpt-4o',
-          label: 'gpt-4o',
-          model: 'gpt-4o',
+          id: 'deepseek-v4-flash',
+          label: 'deepseek-v4-flash',
+          model: 'deepseek-v4-flash',
           requestCount: 10,
           successCount: 10,
           failureCount: 0,
@@ -1247,7 +1599,7 @@ describe('usage analytics adapters', () => {
 
     expect(rows[0]).toMatchObject({
       eventHash: 'event-a',
-      model: 'gpt-4o',
+      model: 'deepseek-v4-flash',
       estimatedCost: 0.2,
       headerErrorKind: 'rate_limit',
       headerErrorCode: 'retry_after',
@@ -1255,6 +1607,11 @@ describe('usage analytics adapters', () => {
       headerQuotaPlanType: 'plus',
       headerQuotaUsedPercent: 87,
       headerQuotaRecoverAtMs: 1780000060000,
+    });
+    expect(rows[1]).toMatchObject({
+      eventHash: 'event-b',
+      model: 'deepseek-v4-flash',
+      estimatedCost: 0.2,
     });
   });
 });
@@ -1458,6 +1815,69 @@ describe('usage anomaly drilldown', () => {
       'usage_analytics.cause_token_per_request_spike',
       'usage_analytics.cause_cache_hit_drop',
     ]);
+  });
+
+  it('does not treat zero-request buckets as health anomaly samples', () => {
+    const timeline = buildUsageTimeline(
+      [
+        {
+          bucket_ms: NOW_MS,
+          label: '',
+          calls: 10,
+          tokens: 100,
+          success: 9,
+          failure: 1,
+          input_tokens: 100,
+          cache_read_tokens: 80,
+          cost: 1,
+          average_latency_ms: 500,
+        },
+        {
+          bucket_ms: NOW_MS + HOUR_MS,
+          label: '',
+          calls: 0,
+          tokens: 0,
+          success: 0,
+          failure: 0,
+          input_tokens: 0,
+          cache_read_tokens: 0,
+          cost: 0,
+        },
+        {
+          bucket_ms: NOW_MS + 2 * HOUR_MS,
+          label: '',
+          calls: 10,
+          tokens: 100,
+          success: 5,
+          failure: 5,
+          input_tokens: 100,
+          cache_read_tokens: 80,
+          cost: 1,
+          average_latency_ms: 400,
+        },
+      ],
+      'hour'
+    );
+
+    const emptyAnalysis = analyzeUsageBucket(timeline, NOW_MS + HOUR_MS);
+    expect(emptyAnalysis?.changes).toMatchObject({
+      requestCount: -1,
+      cacheHitRate: 0,
+      averageTokensPerRequest: 0,
+      failureRate: 0,
+      averageLatencyMs: 0,
+    });
+    expect(emptyAnalysis?.anomalies).toEqual([]);
+
+    const recoveryAnalysis = analyzeUsageBucket(timeline, NOW_MS + 2 * HOUR_MS);
+    expect(recoveryAnalysis?.changes).toMatchObject({
+      requestCount: 1,
+      cacheHitRate: 0,
+      averageTokensPerRequest: 0,
+      failureRate: 0,
+      averageLatencyMs: 0,
+    });
+    expect(recoveryAnalysis?.anomalies).toEqual([]);
   });
 
   it('uses direction-aware anomaly cause copy', () => {

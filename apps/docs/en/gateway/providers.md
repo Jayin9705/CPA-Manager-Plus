@@ -6,13 +6,16 @@ To add, edit, or test a model service, go directly to [AI Providers](../manual/a
 
 | Provider type     | Common use                                  | Related pages                               |
 | ----------------- | ------------------------------------------- | ------------------------------------------- |
-| Codex             | Codex CLI, accounts, and quota              | AI Providers, Auth Files, Inspection        |
-| Claude            | Claude Code and compatible calls            | AI Providers, Auth Files, Monitoring        |
+| Codex             | Codex CLI, accounts, and quota              | AI Providers, Accounts, Inspection          |
+| Claude            | Claude Code and compatible calls            | AI Providers, Accounts, Monitoring          |
 | OpenAI-compatible | Relays, self-hosted, or compatible services | AI Providers, Model Prices, Usage Analytics |
-| Gemini / Vertex   | Google models and project credentials       | AI Providers, OAuth, Auth Files             |
-| xAI / Grok        | API key or OAuth accounts                   | AI Providers, Quota, Inspection             |
+| Gemini / Vertex   | Google models and project credentials       | AI Providers, OAuth, Accounts               |
+| xAI / Grok        | API key or OAuth accounts                   | AI Providers, Accounts, Inspection          |
+| Muse / Meta       | Device Flow account or `meta-api-key` inference provider | AI Providers, OAuth, Accounts     |
 
 When adding a provider, confirm four things first: base URL, authentication method, model names used by clients, and the account or auth file binding.
+
+Muse / Meta requires an extra credential distinction: OAuth Device Flow produces a DCA for account authentication and quota reads, while model inference uses a separate `meta-api-key`. Full support requires CPA `v7.3.4+`.
 
 ## When Requests Fail
 

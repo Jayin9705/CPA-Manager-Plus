@@ -3,11 +3,14 @@ package app
 import (
 	"context"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/collector"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/config"
+	sqliterepo "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/sqlite"
 	accountactionsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/accountaction"
 	adminauthsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/adminauth"
 	apikeyaliassvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/apikeyalias"
@@ -22,7 +25,9 @@ import (
 	monitoringsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/monitoring"
 	panelsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/panel"
 	proxysvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/proxy"
+	quotasnapshotsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/quotasnapshot"
 	setupsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/setup"
+	updatechecksvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/updatecheck"
 	usagesvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
 )
@@ -31,10 +36,19 @@ type AutomationRuntimeService interface {
 	Reload(ctx context.Context) error
 }
 
+type QuotaCooldownRecoveryService interface {
+	RecoverOwnedCooldown(ctx context.Context, authFileName string, authIndex string, provider string) (bool, error)
+}
+
+type DatabaseMaintenanceStatusProvider interface {
+	Snapshot() sqliterepo.WALMaintenanceSnapshot
+}
+
 type Context struct {
-	Config    config.Config
-	Store     *store.Store
-	Collector *collector.Manager
+	UpdateCheckService *updatechecksvc.Service
+	Config             config.Config
+	Store              *store.Store
+	Collector          *collector.Manager
 
 	StartedAt int64
 	ServiceID string
@@ -48,14 +62,17 @@ type Context struct {
 	DashboardService               *dashboardsvc.Service
 	CodexInspectionService         *codexinspectionsvc.Service
 	MonitoringService              *monitoringsvc.Service
+	QuotaSnapshotService           *quotasnapshotsvc.Service
 	ModelPriceService              *modelpricesvc.Service
 	APIKeyAliasService             *apikeyaliassvc.Service
 	AccountActionService           *accountactionsvc.Service
 	AccountProcessingPolicyService *automationsvc.Service
 	AuthFileMutationCoordinator    *cpaauthfiles.MutationCoordinator
+	QuotaCooldownRecoveryService   QuotaCooldownRecoveryService
 	ProxyService                   *proxysvc.Service
 	PanelService                   *panelsvc.Service
 	AutomationRuntimeService       AutomationRuntimeService
+	DatabaseMaintenance            DatabaseMaintenanceStatusProvider
 }
 
 func FromExisting(
@@ -132,14 +149,24 @@ func fromExisting(
 	if usageImportBaseDir == "" {
 		usageImportBaseDir = filepath.Dir(cfg.DBPath)
 	}
+	usageArchiveDir := strings.TrimSpace(cfg.UsageArchiveDir)
+	if usageArchiveDir == "" {
+		usageArchiveDir = filepath.Join(usageImportBaseDir, "usage-archives")
+	}
 	usageService := usagesvc.New(st, usagesvc.WithImportSessions(usagesvc.ImportSessionConfig{
 		Directory:      filepath.Join(usageImportBaseDir, "usage-imports"),
 		ChunkSizeBytes: cfg.UsageImportChunkBytes,
 		DiskQuotaBytes: cfg.UsageImportDiskQuotaBytes,
 		MaxSessions:    cfg.UsageImportMaxSessions,
 		TTL:            cfg.UsageImportSessionTTL,
+	}), usagesvc.WithArchive(usagesvc.ArchiveConfig{
+		Directory:             usageArchiveDir,
+		AggregateReadsEnabled: cfg.DashboardHourlyRollupEnabled,
 	}))
+	// separated 架构下监控分析走 PostgreSQL 聚合 + Manager 侧缓存；
+	// 该 Redis 缓存仅在单体模式下使用，此处保留配置读取以兼容现有 api.env。
 	var monitoringCache *monitoringsvc.RedisCache
+	_ = monitoringCache
 	if cfg.MonitoringCacheEnabled {
 		monitoringCache = monitoringsvc.NewRedisCache(
 			cfg.UsageRedisAddr,
@@ -150,6 +177,7 @@ func fromExisting(
 	}
 	authFileMutationCoordinator := cpaauthfiles.NewMutationCoordinator()
 	return &Context{
+		UpdateCheckService:   updatechecksvc.New(st, buildinfo.Version, buildinfo.SourceCommit(), os.Getenv("CPAMP_UPDATE_CHECK_ENABLED") != "false"),
 		Config:               cfg,
 		Store:                st,
 		Collector:            collectorManager,
@@ -166,9 +194,10 @@ func fromExisting(
 			managerConfigService,
 			codexinspectionsvc.ServiceOptions{AuthFileMutationCoordinator: authFileMutationCoordinator},
 		),
-		MonitoringService:  monitoringsvc.NewWithCache(st, monitoringCache, cfg.DashboardHourlyRollupEnabled),
-		ModelPriceService:  modelpricesvc.NewMultiSourceWithModelsDev(st, modelsDevModelPriceSyncURL, modelPriceSyncURL, openRouterModelPriceSyncURL, managerConfigService),
-		APIKeyAliasService: apikeyaliassvc.New(st),
+		MonitoringService:    monitoringsvc.New(st, cfg.DashboardHourlyRollupEnabled),
+		QuotaSnapshotService: quotasnapshotsvc.New(st),
+		ModelPriceService:    modelpricesvc.NewMultiSourceWithModelsDev(st, modelsDevModelPriceSyncURL, modelPriceSyncURL, openRouterModelPriceSyncURL, managerConfigService),
+		APIKeyAliasService:   apikeyaliassvc.New(st),
 		AccountActionService: accountactionsvc.NewWithMutationCoordinator(
 			st,
 			managerConfigService,

@@ -3,22 +3,32 @@ package usageevent
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
+
+var ErrInvalidEventHash = usage.ErrInvalidEventHash
 
 type Repository interface {
 	InsertBatch(ctx context.Context, events []model.UsageEvent) (model.InsertResult, error)
+	ExistingEventHashes(ctx context.Context, hashes []string) (map[string]struct{}, error)
+	ResolveCodexLegacyAccountKey(ctx context.Context, fields usageidentity.Fields) (string, bool, error)
 	ListRecent(ctx context.Context, limit int) ([]model.UsageEvent, error)
 	ModelUsageSummary(ctx context.Context, limit int) (model.ModelUsageSummary, error)
 	BackfillResponseMetadata(ctx context.Context, batchLimit int) (int, error)
+	ResponseMetadataBackfillPending(ctx context.Context) (bool, error)
 	Count(ctx context.Context) (int64, error)
 	ExportJSONL(ctx context.Context) ([]byte, error)
 	WriteCompatibleUsage(ctx context.Context, writer io.Writer, limit int) error
 	WriteExportJSONL(ctx context.Context, writer io.Writer, limit int) error
+	WriteFullExportJSONL(ctx context.Context, writer io.Writer) error
 	AggregateBetween(ctx context.Context, fromMs, toMs int64) (Aggregate, error)
 	TopModelsBetween(ctx context.Context, fromMs, toMs int64, limit int) ([]ModelStat, error)
 	ModelStatsBetween(ctx context.Context, fromMs, toMs int64) ([]ModelStat, error)
@@ -37,6 +47,8 @@ type Repository interface {
 	ChannelModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]ChannelModelStat, error)
 	FailureSourcesWithFilter(ctx context.Context, filter AnalyticsFilter) ([]FailureSourceStat, error)
 	AccountModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]AccountModelStat, error)
+	AccountWindowModelStats(ctx context.Context, windows []AccountWindowUsageQuery) ([]AccountWindowModelStat, error)
+	RecentAccountRequests(ctx context.Context, targets []LatestAccountRequestQuery, limit int) ([]LatestAccountRequest, error)
 	CredentialModelStatsWithFilter(ctx context.Context, filter AnalyticsFilter) ([]CredentialModelStat, error)
 	CredentialTimelineWithFilter(ctx context.Context, filter AnalyticsFilter, granularity string, location *time.Location) ([]CredentialTimelinePoint, error)
 	APIKeyTimelineWithFilter(ctx context.Context, filter AnalyticsFilter, granularity string, location *time.Location) ([]APIKeyTimelinePoint, error)
@@ -58,10 +70,304 @@ func New(db *sql.DB) Repository {
 	return &repository{db: db}
 }
 
+type preparedUsageEvent struct {
+	event model.UsageEvent
+
+	ledgerNowMS int64
+	bucketMS    int64
+	failed      int
+
+	metadataJSON     string
+	quotaRecoverAtMS int64
+	quotaUsedPercent *float64
+	quotaPlanType    string
+	errorKind        string
+	errorCode        string
+	traceID          string
+
+	failSummary string
+	rawJSON     string
+}
+
+func (r *repository) queryExistingLedgerHashes(ctx context.Context, hashes []string) (map[string]struct{}, error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+	uniqueHashes := make([]string, 0, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		if _, ok := seen[h]; !ok {
+			seen[h] = struct{}{}
+			uniqueHashes = append(uniqueHashes, h)
+		}
+	}
+
+	existing := make(map[string]struct{}, len(uniqueHashes))
+	const chunkSize = 200
+	for i := 0; i < len(uniqueHashes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(uniqueHashes) {
+			end = len(uniqueHashes)
+		}
+		chunk := uniqueHashes[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for idx, h := range chunk {
+			placeholders[idx] = "?"
+			args[idx] = h
+		}
+		query := `select event_hash from usage_event_identity_ledger where event_hash in (` + strings.Join(placeholders, ",") + `)`
+		rows, err := r.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var h string
+			if err := rows.Scan(&h); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			existing[h] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return existing, nil
+}
+
+func (r *repository) ExistingEventHashes(ctx context.Context, hashes []string) (map[string]struct{}, error) {
+	if len(hashes) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	unique := make([]string, 0, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
+	for _, hash := range hashes {
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		unique = append(unique, hash)
+	}
+
+	existing := make(map[string]struct{}, len(unique))
+	const chunkSize = 200
+	for start := 0; start < len(unique); start += chunkSize {
+		end := start + chunkSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		chunk := unique[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)*2)
+		for i, hash := range chunk {
+			placeholders[i] = "?"
+			args = append(args, hash)
+		}
+		args = append(args, append([]any(nil), args...)...)
+		inClause := strings.Join(placeholders, ",")
+		rows, err := r.db.QueryContext(ctx, `
+			select event_hash from usage_event_identity_ledger where event_hash in (`+inClause+`)
+			union
+			select event_hash from usage_events where event_hash in (`+inClause+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var hash string
+			if err := rows.Scan(&hash); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			existing[hash] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return existing, nil
+}
+
+func (r *repository) hashExistsInLedger(ctx context.Context, hash string) (bool, error) {
+	var dummy int
+	err := r.db.QueryRowContext(ctx, `select 1 from usage_event_identity_ledger where event_hash = ? limit 1`, hash).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	return false, nil
+}
+
+func (r *repository) hashExistsInRaw(ctx context.Context, hash string) (bool, error) {
+	var dummy int
+	err := r.db.QueryRowContext(ctx, `select 1 from usage_events where event_hash = ? limit 1`, hash).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	return false, nil
+}
+
+func (r *repository) prepareUsageEvent(rawEvent model.UsageEvent) (preparedUsageEvent, error) {
+	event := usage.PrepareSensitiveFieldsForPersistence(rawEvent)
+	usage.NormalizeRequestMetadata(&event)
+	if event.PreserveArchiveDerivedFields {
+		if err := usage.ValidateArchiveDerivedFields(event); err != nil {
+			return preparedUsageEvent{}, fmt.Errorf("restore archive event %q: %w", event.EventHash, err)
+		}
+	} else {
+		accounting := usage.NormalizeCacheAccounting(usage.CacheInputContext{
+			ExplicitMode:     event.CacheInputMode,
+			ExecutorType:     event.ExecutorType,
+			Provider:         event.Provider,
+			ProviderSnapshot: event.AuthProviderSnapshot,
+			ResolvedModel:    event.ResolvedModel,
+			RequestedModel:   event.RequestedModel,
+			DisplayModel:     event.Model,
+		}, event.InputTokens, event.CachedTokens, event.CacheTokens, event.CacheReadTokens, event.CacheCreationTokens)
+		event.CacheInputMode = accounting.Mode
+		event.NormalizedUncachedInputTokens = accounting.UncachedInputTokens
+		event.NormalizedTotalInputTokens = accounting.TotalInputTokens
+		event.NormalizedCacheReadTokens = accounting.CacheReadTokens
+		event.NormalizedCacheCreationTokens = accounting.CacheCreationTokens
+		if event.TotalTokens <= 0 {
+			event.TotalTokens = accounting.TotalInputTokens + max(event.OutputTokens, int64(0)) + max(event.ReasoningTokens, int64(0))
+		}
+		if event.RequestServiceTier == "" {
+			event.RequestServiceTier = event.ServiceTier
+		}
+		event.ServiceTier = usage.EffectiveServiceTier(usage.CacheInputContext{
+			ExecutorType:     event.ExecutorType,
+			Provider:         event.Provider,
+			ProviderSnapshot: event.AuthProviderSnapshot,
+			AuthType:         event.AuthType,
+		}, event.RequestServiceTier, event.ServiceTier, event.ResponseServiceTier)
+	}
+	failed := 0
+	if event.Failed {
+		failed = 1
+	}
+	metadataJSON, quotaRecoverAtMS, quotaUsedPercent, quotaPlanType, errorKind, errorCode, traceID := responseHeaderDerivedForInsert(event)
+	failSummary := event.FailSummary
+	rawJSON := event.RawJSON
+
+	ledgerNowMS := event.CreatedAtMS
+	if ledgerNowMS <= 0 {
+		ledgerNowMS = time.Now().UnixMilli()
+	}
+	bucketMS := event.TimestampMS - event.TimestampMS%(60*60*1000)
+
+	return preparedUsageEvent{
+		event:            event,
+		ledgerNowMS:      ledgerNowMS,
+		bucketMS:         bucketMS,
+		failed:           failed,
+		metadataJSON:     metadataJSON,
+		quotaRecoverAtMS: quotaRecoverAtMS,
+		quotaUsedPercent: quotaUsedPercent,
+		quotaPlanType:    quotaPlanType,
+		errorKind:        errorKind,
+		errorCode:        errorCode,
+		traceID:          traceID,
+		failSummary:      failSummary,
+		rawJSON:          rawJSON,
+	}, nil
+}
+
 func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent) (model.InsertResult, error) {
 	if len(events) == 0 {
 		return model.InsertResult{}, nil
 	}
+
+	result := model.InsertResult{}
+
+	// Phase 1: Identity validation & historical noncanonical check
+	type eventCandidate struct {
+		event       model.UsageEvent
+		isDuplicate bool
+	}
+	candidates := make([]eventCandidate, len(events))
+	canonicalHashesToCheck := make([]string, 0, len(events))
+
+	for i, ev := range events {
+		if usage.IsCanonicalSHA256Hex(ev.EventHash) {
+			candidates[i] = eventCandidate{event: ev}
+			canonicalHashesToCheck = append(canonicalHashesToCheck, ev.EventHash)
+		} else {
+			// Noncanonical hash: check if exists in DB as historical duplicate
+			existsInLedger, err := r.hashExistsInLedger(ctx, ev.EventHash)
+			if err != nil {
+				return model.InsertResult{}, err
+			}
+			if existsInLedger {
+				candidates[i] = eventCandidate{event: ev, isDuplicate: true}
+				result.Skipped++
+				continue
+			}
+			existsInRaw, err := r.hashExistsInRaw(ctx, ev.EventHash)
+			if err != nil {
+				return model.InsertResult{}, err
+			}
+			if existsInRaw {
+				candidates[i] = eventCandidate{event: ev, isDuplicate: false}
+			} else {
+				return model.InsertResult{}, ErrInvalidEventHash
+			}
+		}
+	}
+
+	// Phase 2: Duplicate preflight for canonical hashes outside write transaction
+	if len(canonicalHashesToCheck) > 0 {
+		existingLedgerHashes, err := r.queryExistingLedgerHashes(ctx, canonicalHashesToCheck)
+		if err != nil {
+			return model.InsertResult{}, err
+		}
+		for i := range candidates {
+			if candidates[i].isDuplicate {
+				continue
+			}
+			if _, found := existingLedgerHashes[candidates[i].event.EventHash]; found {
+				candidates[i].isDuplicate = true
+				result.Skipped++
+			}
+		}
+	}
+
+	// Phase 3: Short-circuit if all events are duplicates (skip tx entirely)
+	allDuplicates := true
+	for _, c := range candidates {
+		if !c.isDuplicate {
+			allDuplicates = false
+			break
+		}
+	}
+	if allDuplicates {
+		return result, nil
+	}
+
+	// Phase 4: Prepare non-duplicate events OUTSIDE write transaction
+	preparedList := make([]preparedUsageEvent, 0, len(candidates))
+	for _, c := range candidates {
+		if c.isDuplicate {
+			continue
+		}
+		prepared, err := r.prepareUsageEvent(c.event)
+		if err != nil {
+			return model.InsertResult{}, err
+		}
+		preparedList = append(preparedList, prepared)
+	}
+
+	// Phase 5: SQLite write transaction - strictly short atomic DB writes only
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return model.InsertResult{}, err
@@ -109,34 +415,32 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 
 	stmt, err := tx.PrepareContext(ctx, `insert or ignore into usage_events (
 		request_id, event_hash, timestamp_ms, timestamp, provider, executor_type, model, endpoint, method, path,
+		client_ip, x_forwarded_for, user_agent,
 		auth_type, auth_index, source, source_hash, api_key_hash,
-		account_snapshot, auth_label_snapshot, auth_file_snapshot, auth_provider_snapshot, auth_project_id_snapshot, auth_snapshot_at_ms,
+		account_snapshot, auth_label_snapshot, auth_file_snapshot, auth_provider_snapshot, auth_account_id_snapshot, auth_project_id_snapshot, auth_snapshot_at_ms,
 		requested_model, resolved_model, reasoning_effort, service_tier, request_service_tier, response_service_tier, cache_input_mode,
 		input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_tokens, cache_read_tokens, cache_creation_tokens,
 		normalized_uncached_input_tokens, normalized_total_input_tokens, normalized_cache_read_tokens, normalized_cache_creation_tokens, total_tokens,
 		latency_ms, ttft_ms, failed, fail_status_code, fail_summary,
 		response_metadata_json, header_quota_recover_at_ms, header_quota_used_percent, header_quota_plan_type, header_error_kind, header_error_code, header_trace_id,
-		fail_body, raw_json, created_at_ms
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		fail_body, raw_json,
+		response_model, session_id, parent_session_id, access_token_sha256, generate, stream,
+		created_at_ms
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return model.InsertResult{}, err
 	}
 	defer stmt.Close()
 
-	result := model.InsertResult{}
-	for _, event := range events {
-		ledgerNowMS := event.CreatedAtMS
-		if ledgerNowMS <= 0 {
-			ledgerNowMS = time.Now().UnixMilli()
-		}
-		bucketMS := event.TimestampMS - event.TimestampMS%(60*60*1000)
+	for _, prep := range preparedList {
+		ev := prep.event
 		ledgerResult, err := ledgerStmt.ExecContext(
 			ctx,
-			event.EventHash,
-			event.TimestampMS,
-			bucketMS,
-			ledgerNowMS,
-			ledgerNowMS,
+			ev.EventHash,
+			ev.TimestampMS,
+			prep.bucketMS,
+			prep.ledgerNowMS,
+			prep.ledgerNowMS,
 		)
 		if err != nil {
 			return model.InsertResult{}, err
@@ -147,100 +451,73 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 			continue
 		}
 
-		accounting := usage.NormalizeCacheAccounting(usage.CacheInputContext{
-			ExplicitMode:     event.CacheInputMode,
-			ExecutorType:     event.ExecutorType,
-			Provider:         event.Provider,
-			ProviderSnapshot: event.AuthProviderSnapshot,
-			ResolvedModel:    event.ResolvedModel,
-			RequestedModel:   event.RequestedModel,
-			DisplayModel:     event.Model,
-		}, event.InputTokens, event.CachedTokens, event.CacheTokens, event.CacheReadTokens, event.CacheCreationTokens)
-		event.CacheInputMode = accounting.Mode
-		event.NormalizedUncachedInputTokens = accounting.UncachedInputTokens
-		event.NormalizedTotalInputTokens = accounting.TotalInputTokens
-		event.NormalizedCacheReadTokens = accounting.CacheReadTokens
-		event.NormalizedCacheCreationTokens = accounting.CacheCreationTokens
-		if event.TotalTokens <= 0 {
-			event.TotalTokens = accounting.TotalInputTokens + max(event.OutputTokens, int64(0)) + max(event.ReasoningTokens, int64(0))
-		}
-		if event.RequestServiceTier == "" {
-			event.RequestServiceTier = event.ServiceTier
-		}
-		event.ServiceTier = usage.EffectiveServiceTier(usage.CacheInputContext{
-			ExecutorType:     event.ExecutorType,
-			Provider:         event.Provider,
-			ProviderSnapshot: event.AuthProviderSnapshot,
-			AuthType:         event.AuthType,
-		}, event.RequestServiceTier, event.ServiceTier, event.ResponseServiceTier)
-		failed := 0
-		if event.Failed {
-			failed = 1
-		}
-		metadataJSON, quotaRecoverAtMS, quotaUsedPercent, quotaPlanType, errorKind, errorCode, traceID := responseHeaderDerivedForInsert(event)
-		failSummarySource := event.FailSummary
-		if failSummarySource == "" {
-			failSummarySource = event.FailBody
-		}
-		failSummary := usage.FailSummaryFromBody(failSummarySource)
-		rawJSON := usage.SafeRawJSON(event.RawJSON)
 		res, err := stmt.ExecContext(
 			ctx,
-			nullString(event.RequestID),
-			event.EventHash,
-			event.TimestampMS,
-			event.Timestamp,
-			nullString(event.Provider),
-			nullString(event.ExecutorType),
-			event.Model,
-			nullString(event.Endpoint),
-			nullString(event.Method),
-			nullString(event.Path),
-			nullString(event.AuthType),
-			nullString(event.AuthIndex),
-			nullString(event.Source),
-			nullString(event.SourceHash),
-			nullString(event.APIKeyHash),
-			nullString(event.AccountSnapshot),
-			nullString(event.AuthLabelSnapshot),
-			nullString(event.AuthFileSnapshot),
-			nullString(event.AuthProviderSnapshot),
-			nullString(event.AuthProjectIDSnapshot),
-			nullPositiveInt64(event.AuthSnapshotAtMS),
-			nullString(event.RequestedModel),
-			nullString(event.ResolvedModel),
-			nullString(event.ReasoningEffort),
-			nullString(event.ServiceTier),
-			nullString(event.RequestServiceTier),
-			nullString(event.ResponseServiceTier),
-			nullString(event.CacheInputMode),
-			event.InputTokens,
-			event.OutputTokens,
-			event.ReasoningTokens,
-			event.CachedTokens,
-			event.CacheTokens,
-			event.CacheReadTokens,
-			event.CacheCreationTokens,
-			event.NormalizedUncachedInputTokens,
-			event.NormalizedTotalInputTokens,
-			event.NormalizedCacheReadTokens,
-			event.NormalizedCacheCreationTokens,
-			event.TotalTokens,
-			nullInt(event.LatencyMS),
-			nullInt(event.TTFTMS),
-			failed,
-			nullPositiveInt64(int64(event.FailStatusCode)),
-			nullString(failSummary),
-			nullString(metadataJSON),
-			nullPositiveInt64(quotaRecoverAtMS),
-			nullFloat(quotaUsedPercent),
-			nullString(quotaPlanType),
-			nullString(errorKind),
-			nullString(errorCode),
-			nullString(traceID),
-			nullString(event.FailBody),
-			nullString(rawJSON),
-			event.CreatedAtMS,
+			nullString(ev.RequestID),
+			ev.EventHash,
+			ev.TimestampMS,
+			ev.Timestamp,
+			nullString(ev.Provider),
+			nullString(ev.ExecutorType),
+			ev.Model,
+			nullString(ev.Endpoint),
+			nullString(ev.Method),
+			nullString(ev.Path),
+			nullString(ev.ClientIP),
+			nullString(ev.XForwardedFor),
+			nullString(ev.UserAgent),
+			nullString(ev.AuthType),
+			nullString(ev.AuthIndex),
+			nullString(ev.Source),
+			nullString(ev.SourceHash),
+			nullString(ev.APIKeyHash),
+			nullString(ev.AccountSnapshot),
+			nullString(ev.AuthLabelSnapshot),
+			nullString(ev.AuthFileSnapshot),
+			nullString(ev.AuthProviderSnapshot),
+			nullString(ev.AuthAccountIDSnapshot),
+			nullString(ev.AuthProjectIDSnapshot),
+			nullPositiveInt64(ev.AuthSnapshotAtMS),
+			nullString(ev.RequestedModel),
+			nullString(ev.ResolvedModel),
+			nullString(ev.ReasoningEffort),
+			nullString(ev.ServiceTier),
+			nullString(ev.RequestServiceTier),
+			nullString(ev.ResponseServiceTier),
+			nullString(ev.CacheInputMode),
+			ev.InputTokens,
+			ev.OutputTokens,
+			ev.ReasoningTokens,
+			ev.CachedTokens,
+			ev.CacheTokens,
+			ev.CacheReadTokens,
+			ev.CacheCreationTokens,
+			ev.NormalizedUncachedInputTokens,
+			ev.NormalizedTotalInputTokens,
+			ev.NormalizedCacheReadTokens,
+			ev.NormalizedCacheCreationTokens,
+			ev.TotalTokens,
+			nullInt(ev.LatencyMS),
+			nullInt(ev.TTFTMS),
+			prep.failed,
+			nullPositiveInt64(int64(ev.FailStatusCode)),
+			nullString(prep.failSummary),
+			nullString(prep.metadataJSON),
+			nullPositiveInt64(prep.quotaRecoverAtMS),
+			nullFloat(prep.quotaUsedPercent),
+			nullString(prep.quotaPlanType),
+			nullString(prep.errorKind),
+			nullString(prep.errorCode),
+			nullString(prep.traceID),
+			nullString(ev.FailBody),
+			nullString(prep.rawJSON),
+			nullString(ev.ResponseModel),
+			nullString(ev.SessionID),
+			nullString(ev.ParentSessionID),
+			nullString(ev.AccessTokenSHA256),
+			nullBool(ev.Generate),
+			nullBool(ev.Stream),
+			ev.CreatedAtMS,
 		)
 		if err != nil {
 			return model.InsertResult{}, err
@@ -254,30 +531,31 @@ func (r *repository) InsertBatch(ctx context.Context, events []model.UsageEvent)
 			if _, err := attachLedgerStmt.ExecContext(
 				ctx,
 				rawEventID,
-				event.TimestampMS,
-				bucketMS,
-				ledgerNowMS,
-				event.EventHash,
+				ev.TimestampMS,
+				prep.bucketMS,
+				prep.ledgerNowMS,
+				ev.EventHash,
 			); err != nil {
 				return model.InsertResult{}, err
 			}
 			result.Inserted++
-			result.InsertedEventHashes = append(result.InsertedEventHashes, event.EventHash)
+			result.InsertedEventHashes = append(result.InsertedEventHashes, ev.EventHash)
 		} else {
 			if _, err := attachExistingLedgerStmt.ExecContext(
 				ctx,
-				event.EventHash,
-				event.EventHash,
-				event.EventHash,
-				event.EventHash,
-				ledgerNowMS,
-				event.EventHash,
+				ev.EventHash,
+				ev.EventHash,
+				ev.EventHash,
+				ev.EventHash,
+				prep.ledgerNowMS,
+				ev.EventHash,
 			); err != nil {
 				return model.InsertResult{}, err
 			}
 			result.Skipped++
 		}
 	}
+
 	if err := tx.Commit(); err != nil {
 		return model.InsertResult{}, err
 	}
@@ -290,13 +568,16 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 	}
 	rows, err := r.db.QueryContext(ctx, `select
 		request_id, event_hash, timestamp_ms, timestamp, provider, executor_type, model, endpoint, method, path,
+		client_ip, x_forwarded_for, user_agent,
 		auth_type, auth_index, source, source_hash, api_key_hash,
-		account_snapshot, auth_label_snapshot, auth_file_snapshot, auth_provider_snapshot, auth_project_id_snapshot, auth_snapshot_at_ms,
+		account_snapshot, auth_label_snapshot, auth_file_snapshot, auth_provider_snapshot, auth_account_id_snapshot, auth_project_id_snapshot, auth_snapshot_at_ms,
 		requested_model, resolved_model, reasoning_effort, service_tier, request_service_tier, response_service_tier, cache_input_mode,
 		input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_tokens, cache_read_tokens, cache_creation_tokens,
 		normalized_uncached_input_tokens, normalized_total_input_tokens, normalized_cache_read_tokens, normalized_cache_creation_tokens, total_tokens,
 		latency_ms, ttft_ms, failed, fail_status_code, fail_summary,
 		coalesce(response_metadata_json, ''), header_quota_recover_at_ms, header_quota_used_percent, coalesce(header_quota_plan_type, ''), coalesce(header_error_kind, ''), coalesce(header_error_code, ''), coalesce(header_trace_id, ''),
+		coalesce(response_model, ''), coalesce(session_id, ''), coalesce(parent_session_id, ''), coalesce(access_token_sha256, ''),
+		generate, stream,
 		coalesce(raw_json, ''), created_at_ms
 		from usage_events
 		order by timestamp_ms desc, id desc
@@ -309,8 +590,10 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 	events := make([]model.UsageEvent, 0)
 	for rows.Next() {
 		var event model.UsageEvent
-		var requestID, provider, executorType, endpoint, method, path, authType, authIndex, source, sourceHash, apiKeyHash, accountSnapshot, authLabelSnapshot, authFileSnapshot, authProviderSnapshot, authProjectIDSnapshot, requestedModel, resolvedModel, reasoningEffort, serviceTier, requestServiceTier, responseServiceTier, cacheInputMode, failSummary sql.NullString
+		var requestID, provider, executorType, endpoint, method, path, clientIP, xForwardedFor, userAgent, authType, authIndex, source, sourceHash, apiKeyHash, accountSnapshot, authLabelSnapshot, authFileSnapshot, authProviderSnapshot, authAccountIDSnapshot, authProjectIDSnapshot, requestedModel, resolvedModel, reasoningEffort, serviceTier, requestServiceTier, responseServiceTier, cacheInputMode, failSummary sql.NullString
 		var responseMetadataJSON, quotaPlanType, errorKind, errorCode, traceID, rawJSON string
+		var responseModel, sessionID, parentSessionID, accessTokenSHA256 sql.NullString
+		var generateVal, streamVal sql.NullInt64
 		var authSnapshotAt sql.NullInt64
 		var latency, ttft sql.NullInt64
 		var failStatusCode sql.NullInt64
@@ -329,6 +612,9 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 			&endpoint,
 			&method,
 			&path,
+			&clientIP,
+			&xForwardedFor,
+			&userAgent,
 			&authType,
 			&authIndex,
 			&source,
@@ -338,6 +624,7 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 			&authLabelSnapshot,
 			&authFileSnapshot,
 			&authProviderSnapshot,
+			&authAccountIDSnapshot,
 			&authProjectIDSnapshot,
 			&authSnapshotAt,
 			&requestedModel,
@@ -371,17 +658,27 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 			&errorKind,
 			&errorCode,
 			&traceID,
+			&responseModel,
+			&sessionID,
+			&parentSessionID,
+			&accessTokenSHA256,
+			&generateVal,
+			&streamVal,
 			&rawJSON,
 			&event.CreatedAtMS,
 		); err != nil {
 			return nil, err
 		}
 		event.RequestID = requestID.String
+		event.AnalyticsModel = usageidentity.AnalyticsModelForRequest(event.Model, requestedModel.String)
 		event.Provider = provider.String
 		event.ExecutorType = executorType.String
 		event.Endpoint = endpoint.String
 		event.Method = method.String
 		event.Path = path.String
+		event.ClientIP = clientIP.String
+		event.XForwardedFor = xForwardedFor.String
+		event.UserAgent = userAgent.String
 		event.AuthType = authType.String
 		event.AuthIndex = authIndex.String
 		event.Source = source.String
@@ -391,39 +688,77 @@ func (r *repository) ListRecent(ctx context.Context, limit int) ([]model.UsageEv
 		event.AuthLabelSnapshot = authLabelSnapshot.String
 		event.AuthFileSnapshot = authFileSnapshot.String
 		event.AuthProviderSnapshot = authProviderSnapshot.String
+		event.AuthAccountIDSnapshot = authAccountIDSnapshot.String
 		event.AuthProjectIDSnapshot = authProjectIDSnapshot.String
 		event.RequestedModel = requestedModel.String
 		event.ResolvedModel = resolvedModel.String
+		event.ResponseModel = responseModel.String
+		event.SessionID = sessionID.String
+		event.ParentSessionID = parentSessionID.String
+		event.AccessTokenSHA256 = accessTokenSHA256.String
+		if generateVal.Valid {
+			v := generateVal.Int64 != 0
+			event.Generate = &v
+		}
+		if streamVal.Valid {
+			v := streamVal.Int64 != 0
+			event.Stream = &v
+		}
 		event.ReasoningEffort = reasoningEffort.String
 		event.ServiceTier = serviceTier.String
 		event.RequestServiceTier = requestServiceTier.String
 		event.ResponseServiceTier = responseServiceTier.String
-		hints := usage.RawCacheAccountingHintsFromJSON(rawJSON)
-		accounting := usage.NormalizeCacheAccounting(usage.CacheInputContext{
-			ExplicitMode:     hints.ExplicitMode,
-			ExecutorType:     event.ExecutorType,
-			Provider:         event.Provider,
-			ProviderSnapshot: event.AuthProviderSnapshot,
-			ResolvedModel:    event.ResolvedModel,
-			RequestedModel:   event.RequestedModel,
-			DisplayModel:     event.Model,
-		}, event.InputTokens, event.CachedTokens, event.CacheTokens, event.CacheReadTokens, event.CacheCreationTokens)
-		event.CacheInputMode = accounting.Mode
-		event.NormalizedUncachedInputTokens = accounting.UncachedInputTokens
-		event.NormalizedTotalInputTokens = accounting.TotalInputTokens
-		event.NormalizedCacheReadTokens = accounting.CacheReadTokens
-		event.NormalizedCacheCreationTokens = accounting.CacheCreationTokens
-		if normalizedUncachedInput.Valid {
+		storedMode := strings.TrimSpace(cacheInputMode.String)
+		storedDerivedComplete := cacheInputMode.Valid &&
+			normalizedUncachedInput.Valid &&
+			normalizedTotalInput.Valid &&
+			normalizedCacheRead.Valid &&
+			normalizedCacheCreation.Valid &&
+			normalizedUncachedInput.Int64 >= 0 &&
+			normalizedTotalInput.Int64 >= 0 &&
+			normalizedCacheRead.Int64 >= 0 &&
+			normalizedCacheCreation.Int64 >= 0 &&
+			(storedMode == usage.CacheInputModeIncluded ||
+				storedMode == usage.CacheInputModeSeparate ||
+				storedMode == usage.CacheInputModeReadIncludedCreationSeparate)
+		if storedDerivedComplete {
+			// These columns are one persisted derived-accounting result. Restore
+			// them atomically so a sanitized import cannot pair a newly inferred
+			// fallback mode with normalized values calculated under another mode.
+			// This does not make the stored mode raw/upstream provenance; migration
+			// and ingestion still classify exclusively from explicit/raw evidence.
+			event.CacheInputMode = storedMode
 			event.NormalizedUncachedInputTokens = normalizedUncachedInput.Int64
-		}
-		if normalizedTotalInput.Valid {
 			event.NormalizedTotalInputTokens = normalizedTotalInput.Int64
-		}
-		if normalizedCacheRead.Valid {
 			event.NormalizedCacheReadTokens = normalizedCacheRead.Int64
-		}
-		if normalizedCacheCreation.Valid {
 			event.NormalizedCacheCreationTokens = normalizedCacheCreation.Int64
+		} else {
+			hints := usage.RawCacheAccountingHintsFromJSON(rawJSON)
+			accounting := usage.NormalizeCacheAccountingWithRawJSON(
+				usage.CacheInputContext{
+					ExplicitMode:     hints.ExplicitMode,
+					ExecutorType:     event.ExecutorType,
+					Provider:         event.Provider,
+					ProviderSnapshot: event.AuthProviderSnapshot,
+					ResolvedModel:    event.ResolvedModel,
+					RequestedModel:   event.RequestedModel,
+					DisplayModel:     event.Model,
+				},
+				rawJSON,
+				event.InputTokens,
+				event.OutputTokens,
+				event.ReasoningTokens,
+				event.TotalTokens,
+				event.CachedTokens,
+				event.CacheTokens,
+				event.CacheReadTokens,
+				event.CacheCreationTokens,
+			)
+			event.CacheInputMode = accounting.Mode
+			event.NormalizedUncachedInputTokens = accounting.UncachedInputTokens
+			event.NormalizedTotalInputTokens = accounting.TotalInputTokens
+			event.NormalizedCacheReadTokens = accounting.CacheReadTokens
+			event.NormalizedCacheCreationTokens = accounting.CacheCreationTokens
 		}
 		if authSnapshotAt.Valid {
 			event.AuthSnapshotAtMS = authSnapshotAt.Int64
@@ -495,6 +830,16 @@ func nullPositiveInt64(value int64) any {
 	return value
 }
 
+func nullBool(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	if *value {
+		return 1
+	}
+	return 0
+}
+
 func responseHeaderDerivedForInsert(event model.UsageEvent) (string, int64, *float64, string, string, string, string) {
 	metadataJSON := event.ResponseMetadataJSON
 	quotaRecoverAtMS := event.HeaderQuotaRecoverAtMS
@@ -503,6 +848,9 @@ func responseHeaderDerivedForInsert(event model.UsageEvent) (string, int64, *flo
 	errorKind := event.HeaderErrorKind
 	errorCode := event.HeaderErrorCode
 	traceID := event.HeaderTraceID
+	if event.PreserveArchiveDerivedFields {
+		return metadataJSON, quotaRecoverAtMS, quotaUsedPercent, quotaPlanType, errorKind, errorCode, traceID
+	}
 
 	derived := usage.DeriveResponseHeaderMetadata(event.ResponseMetadata)
 	if metadataJSON == "" {

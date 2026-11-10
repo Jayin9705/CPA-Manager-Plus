@@ -10,8 +10,8 @@ const t = ((key: string, options?: Record<string, unknown>) => {
   const messages: Record<string, string> = {
     'common.loading': 'Loading',
     'common.copy': 'Copy',
-    'common.yes': 'Yes',
-    'common.no': 'No',
+    'common.yes': 'Yes (i18n)',
+    'common.no': 'No (i18n)',
     'monitoring.account_overview_account_display_masked': 'Masked',
     'monitoring.account_overview_account_display_full': 'Full',
     'monitoring.account_overview_show_full_accounts_hint': 'Show full accounts',
@@ -33,6 +33,10 @@ const t = ((key: string, options?: Record<string, unknown>) => {
     'monitoring.filter_account': 'Account',
     'monitoring.filter_status_failed': 'Failed only',
     'monitoring.filter_provider': 'Provider',
+    'monitoring.client_ip': 'Client IP',
+    'monitoring.x_forwarded_for_unverified': 'Forwarded chain (unverified)',
+    'monitoring.user_agent': 'User-Agent',
+    'monitoring.request_metadata': 'Request metadata',
     'monitoring.cached_tokens': 'Cached Tokens',
     'monitoring.cache_read_tokens': 'Cache Read Tokens',
     'monitoring.cache_creation_tokens': 'Cache Creation Tokens',
@@ -77,6 +81,14 @@ const t = ((key: string, options?: Record<string, unknown>) => {
     'monitoring.this_call_cost': 'Cost',
     'monitoring.this_call_usage': 'Usage',
     'monitoring.ttft_short': 'TTFT',
+    'monitoring.model_mismatch': 'Model mismatch',
+    'monitoring.requested_model': 'Requested model',
+    'monitoring.resolved_model': 'Routed model',
+    'monitoring.response_model': 'Response model',
+    'monitoring.session_id': 'Session ID (i18n)',
+    'monitoring.parent_session_id': 'Parent session ID (i18n)',
+    'monitoring.generate': 'Generate (i18n)',
+    'monitoring.stream': 'Stream (i18n)',
   };
   let message = messages[key] ?? key;
   if (options) {
@@ -103,6 +115,7 @@ type PanelOverrides = {
   eventsRetentionLimited?: boolean;
   eventsTotalCount?: number;
   eventsLoadedCount?: number;
+  hasPrices?: boolean;
 };
 
 const baseRow = (overrides: Partial<PanelRow> = {}): PanelRow => ({
@@ -176,7 +189,7 @@ const renderPanel = (row: PanelRow, overrides: PanelOverrides = {}) =>
       eventsTotalCount={overrides.eventsTotalCount ?? 1}
       eventsLoadedCount={overrides.eventsLoadedCount ?? 1}
       overallLoading={false}
-      hasPrices={false}
+      hasPrices={overrides.hasPrices ?? false}
       accountDisplayMode={overrides.accountDisplayMode ?? 'masked'}
       locale="en-US"
       emptyState={<span>empty</span>}
@@ -368,6 +381,12 @@ describe('RealtimeEventsPanel', () => {
     expect(markup).not.toContain('HTTP');
   });
 
+  it('keeps realtime request estimated cost at three decimal places', () => {
+    const markup = renderPanel(baseRow({ totalCost: 0.1264 }), { hasPrices: true });
+
+    expect(markup).toContain('$0.126');
+  });
+
   it('renders API key alias inside the source cell without adding another column', () => {
     const markup = renderPanel(
       baseRow({
@@ -393,10 +412,200 @@ describe('RealtimeEventsPanel', () => {
       'claude-opus-4-6-thinking-with-a-very-long-provider-routing-suffix-for-realtime-monitoring';
     const markup = renderPanel(baseRow({ model: longModel, resolvedModel: longModel }));
 
-    expect(markup).toContain(`title="${longModel}"`);
+    expect(markup).toContain(`title="Requested model: ${longModel}"`);
     expect(markup).toContain(longModel);
     expect(markup).toMatch(/class="[^"]*realtimeModelCell[^"]*"/);
     expect(markup).toMatch(/class="[^"]*realtimeModelText[^"]*"/);
+  });
+
+  it('renders the requested model first and the upstream resolved model second', () => {
+    const markup = renderPanel(
+      baseRow({
+        model: 'deepseek-v4-flash',
+        requestedModel: 'deepseek-v4-flash(max)',
+        resolvedModel: 'resolved-deepseek-v4-flash',
+      })
+    );
+
+    expect(markup).toContain(
+      'title="Requested model: deepseek-v4-flash(max)\nRouted model: resolved-deepseek-v4-flash"'
+    );
+    expect(markup.indexOf('>deepseek-v4-flash(max)</span>')).toBeLessThan(
+      markup.indexOf('>→ resolved-deepseek-v4-flash</small>')
+    );
+    expect(markup).not.toContain('>deepseek-v4-flash</span>');
+  });
+
+  it('does not duplicate an unchanged requested and resolved model', () => {
+    const model = 'deepseek-chat(region-us)';
+    const markup = renderPanel(
+      baseRow({
+        model,
+        requestedModel: model,
+        resolvedModel: model,
+      })
+    );
+
+    expect(markup).toContain(`title="Requested model: ${model}"`);
+    expect(markup).toContain(`>${model}</span>`);
+    expect(markup).not.toContain('realtimeModelRoutedText');
+  });
+
+  describe('model column presentation states (Section 31 & Case A-D)', () => {
+    it('State 1 / Case A: requested == resolved == response', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-4o',
+          requestedModel: 'gpt-4o',
+          resolvedModel: 'gpt-4o',
+          responseModel: 'gpt-4o',
+        })
+      );
+      expect(markup).toContain('title="Requested model: gpt-4o"');
+      expect(markup).toContain('>gpt-4o</span>');
+      expect(markup).not.toContain('realtimeModelRoutedText');
+      expect(markup).not.toContain('realtimeModelResponseLine');
+      expect(markup).not.toContain('realtimeModelMismatchBadge');
+      expect(markup).not.toContain('Model mismatch');
+    });
+
+    it('State 2: requested and resolved model differ, responseModel empty', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-4o',
+          requestedModel: 'gpt-4o',
+          resolvedModel: 'gpt-4o-2024-08-06',
+        })
+      );
+      expect(markup).toContain('title="Requested model: gpt-4o\nRouted model: gpt-4o-2024-08-06"');
+      expect(markup).toContain('>gpt-4o</span>');
+      expect(markup).toContain('>→ gpt-4o-2024-08-06</small>');
+      expect(markup).not.toContain('realtimeModelResponseLine');
+      expect(markup).not.toContain('realtimeModelMismatchBadge');
+    });
+
+    it('State 3 / Case C: all three models differ (requested != resolved != response)', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-4o',
+          requestedModel: 'gpt-4o',
+          resolvedModel: 'gpt-4o-2024-08-06',
+          responseModel: 'gpt-4o-mini',
+        })
+      );
+      expect(markup).toContain(
+        'title="Requested model: gpt-4o\nRouted model: gpt-4o-2024-08-06\nResponse model: gpt-4o-mini\nModel mismatch"'
+      );
+      expect(markup).toContain('>gpt-4o</span>');
+      expect(markup).toContain('>→ gpt-4o-2024-08-06</small>');
+      expect(markup).toContain('>↳ gpt-4o-mini</small>');
+      expect(markup).toContain('realtimeModelMismatchBadge');
+      expect(markup).toContain('Model mismatch');
+    });
+
+    it('State 4: requested == resolved, but responseModel differs (mismatch without routed line)', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'claude-3-5-sonnet',
+          requestedModel: 'claude-3-5-sonnet',
+          resolvedModel: 'claude-3-5-sonnet',
+          responseModel: 'claude-3-haiku',
+        })
+      );
+      expect(markup).toContain(
+        'title="Requested model: claude-3-5-sonnet\nResponse model: claude-3-haiku\nModel mismatch"'
+      );
+      expect(markup).toContain('>claude-3-5-sonnet</span>');
+      expect(markup).not.toContain('realtimeModelRoutedText');
+      expect(markup).toContain('>↳ claude-3-haiku</small>');
+      expect(markup).toContain('realtimeModelMismatchBadge');
+    });
+
+    it('State 5 / Case B: requested != resolved, but responseModel matches resolved (no mismatch)', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-4o',
+          requestedModel: 'gpt-4o',
+          resolvedModel: 'gpt-4o-2024-08-06',
+          responseModel: 'gpt-4o-2024-08-06',
+        })
+      );
+      expect(markup).toContain('title="Requested model: gpt-4o\nRouted model: gpt-4o-2024-08-06"');
+      expect(markup).toContain('>gpt-4o</span>');
+      expect(markup).toContain('>→ gpt-4o-2024-08-06</small>');
+      expect(markup).not.toContain('realtimeModelResponseLine');
+      expect(markup).not.toContain('realtimeModelMismatchBadge');
+      expect(markup).not.toContain('Model mismatch');
+    });
+
+    it('State 6: requested == responseModel != resolved (resolved diverted, response reverted)', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-4o',
+          requestedModel: 'gpt-4o',
+          resolvedModel: 'gpt-4o-azure',
+          responseModel: 'gpt-4o',
+        })
+      );
+      expect(markup).toContain(
+        'title="Requested model: gpt-4o\nRouted model: gpt-4o-azure\nResponse model: gpt-4o\nModel mismatch"'
+      );
+      expect(markup).toContain('>gpt-4o</span>');
+      expect(markup).toContain('>→ gpt-4o-azure</small>');
+      expect(markup).toContain('>↳ gpt-4o</small>');
+      expect(markup).toContain('realtimeModelMismatchBadge');
+    });
+
+    it('State 7: failed request orthogonal styling with model mismatch badge', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'deepseek-chat',
+          requestedModel: 'deepseek-chat',
+          resolvedModel: 'deepseek-v3',
+          responseModel: 'deepseek-v2.5',
+          failed: true,
+        })
+      );
+      expect(markup).toContain('logRowFailed');
+      expect(markup).toContain('realtimeModelMismatchBadge');
+      expect(markup).toContain('>↳ deepseek-v2.5</small>');
+      expect(markup).toContain(
+        'title="Requested model: deepseek-chat\nRouted model: deepseek-v3\nResponse model: deepseek-v2.5\nModel mismatch"'
+      );
+    });
+
+    it('State 8: legacy payload with missing responseModel degrades cleanly', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-3.5-turbo',
+          requestedModel: 'gpt-3.5-turbo',
+          resolvedModel: 'gpt-3.5-turbo-0125',
+          responseModel: undefined,
+        })
+      );
+      expect(markup).toContain('title="Requested model: gpt-3.5-turbo\nRouted model: gpt-3.5-turbo-0125"');
+      expect(markup).toContain('>gpt-3.5-turbo</span>');
+      expect(markup).toContain('>→ gpt-3.5-turbo-0125</small>');
+      expect(markup).not.toContain('realtimeModelResponseLine');
+      expect(markup).not.toContain('realtimeModelMismatchBadge');
+    });
+
+    it('Case D: resolved is empty and response is present (diagnostic response in tooltip, no mismatch)', () => {
+      const markup = renderPanel(
+        baseRow({
+          model: 'gpt-5.6-sol',
+          requestedModel: 'gpt-5.6-sol',
+          resolvedModel: '',
+          responseModel: 'gpt-5.6-sol',
+        })
+      );
+      expect(markup).toContain('title="Requested model: gpt-5.6-sol\nResponse model: gpt-5.6-sol"');
+      expect(markup).toContain('>gpt-5.6-sol</span>');
+      expect(markup).not.toContain('realtimeModelRoutedText');
+      expect(markup).not.toContain('realtimeModelResponseLine');
+      expect(markup).not.toContain('realtimeModelMismatchBadge');
+      expect(markup).not.toContain('Model mismatch');
+    });
   });
 
   it('switches realtime source labels between masked and full display', () => {
@@ -439,6 +648,49 @@ describe('RealtimeEventsPanel', () => {
     expect(maskedMarkup).not.toContain('<small>Account: vis***@example.com</small>');
     expect(fullMarkup).toContain('>visible-user@example.com</span>');
     expect(fullMarkup).not.toContain('<small>Account: visible-user@example.com</small>');
+  });
+
+  it('exposes request metadata through a keyboard-expandable disclosure only in full mode', () => {
+    const row = baseRow({
+      clientIp: '192.0.2.10',
+      xForwardedFor: '203.0.113.5, 198.51.100.8',
+      userAgent: 'test-client/1.0',
+    });
+    const maskedMarkup = renderPanel(row);
+    const fullMarkup = renderPanel(row, { accountDisplayMode: 'full' });
+
+    for (const value of ['192.0.2.10', '203.0.113.5', 'test-client/1.0']) {
+      expect(maskedMarkup).not.toContain(value);
+      expect(fullMarkup).toContain(value);
+    }
+    expect(maskedMarkup).not.toContain('Request metadata');
+    expect(fullMarkup).toContain(`<details class="${styles.realtimeRequestMetadata}">`);
+    expect(fullMarkup).toContain('<summary>Request metadata</summary>');
+    expect(fullMarkup).toContain('Client IP: 192.0.2.10');
+    expect(fullMarkup).toContain(
+      'Forwarded chain (unverified): 203.0.113.5, 198.51.100.8'
+    );
+    expect(fullMarkup).toContain('User-Agent: test-client/1.0');
+  });
+
+  it('formats request metadata fields using i18n translation functions in full mode', () => {
+    const row = baseRow({
+      clientIp: '192.0.2.10',
+      sessionId: 'sess-98765',
+      parentSessionId: 'parent-sess-43210',
+      generate: true,
+      stream: false,
+    });
+    const maskedMarkup = renderPanel(row);
+    const fullMarkup = renderPanel(row, { accountDisplayMode: 'full' });
+
+    expect(maskedMarkup).not.toContain('sess-98765');
+    expect(maskedMarkup).not.toContain('parent-sess-43210');
+
+    expect(fullMarkup).toContain('Session ID (i18n): sess-98765');
+    expect(fullMarkup).toContain('Parent session ID (i18n): parent-sess-43210');
+    expect(fullMarkup).toContain('Generate (i18n): Yes (i18n)');
+    expect(fullMarkup).toContain('Stream (i18n): No (i18n)');
   });
 
   it('renders a ttft placeholder when ttft is missing', () => {
@@ -549,5 +801,26 @@ describe('RealtimeEventsPanel', () => {
 
     expect(markup).toContain('Loaded 500 of 500 events');
     expect(markup).toContain('Load more');
+  });
+
+  it('does not display opaque source identity as primary title when readable metadata is available (#781)', () => {
+    const validHash = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const markup = renderPanel(
+      baseRow({
+        provider: 'codex',
+        channel: 'codex',
+        channelHost: 'api.codex.example.com',
+        source: `h:${validHash}`,
+        sourceMasked: `h:${validHash}`,
+        apiKeyHash: 'aabbccddeeff0011',
+        apiKeyLabel: 'Production Key',
+        apiKeyMasked: 'sk-...0011',
+      })
+    );
+
+    expect(markup).toContain('<span>api.codex.example.com</span>');
+    expect(markup).toContain('API Key: Production Key');
+    expect(markup).not.toContain(`<span>h:${validHash}</span>`);
+    expect(markup).not.toContain('<span>k:');
   });
 });

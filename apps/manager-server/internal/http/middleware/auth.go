@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -64,6 +65,7 @@ func authorizeSession(w http.ResponseWriter, r *http.Request, verifier SessionVe
 
 	ok, err := verifier.VerifySession(verifyCtx, SessionToken(r))
 	if err != nil {
+		writeAuthorizationFailure(w, "admin", err)
 		response.Error(w, http.StatusServiceUnavailable, errors.New("authentication service unavailable"))
 		return false
 	}
@@ -91,9 +93,6 @@ func authorizeSession(w http.ResponseWriter, r *http.Request, verifier SessionVe
 	return false
 }
 
-// SessionToken accepts the browser cookie first and a Bearer session token as
-// a fallback for non-browser clients. Legacy Admin Keys are verified through
-// the separate header verifier before the value reaches the session backend.
 func SessionToken(r *http.Request) string {
 	if r == nil {
 		return ""
@@ -106,8 +105,6 @@ func SessionToken(r *http.Request) string {
 	return security.ExtractBearerToken(r.Header.Get("Authorization"))
 }
 
-// StripSessionCookie prevents the Manager Server's browser credential from
-// being forwarded to the CPA upstream while preserving unrelated cookies.
 func StripSessionCookie(r *http.Request) {
 	if r == nil {
 		return
@@ -119,4 +116,12 @@ func StripSessionCookie(r *http.Request) {
 			r.AddCookie(cookie)
 		}
 	}
+}
+
+func writeAuthorizationFailure(w http.ResponseWriter, scope string, err error) {
+	log.Printf("%s authorization failed: %v", scope, err)
+	response.JSON(w, http.StatusInternalServerError, map[string]any{
+		"error": "authorization failed",
+		"code":  "request_failed",
+	})
 }

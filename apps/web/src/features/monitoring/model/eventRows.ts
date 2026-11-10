@@ -9,7 +9,7 @@ import {
 import { formatApiKeyHashLabel } from './base';
 import { buildSearchText, maskAuthIndex, maskEmailLike, readString } from './base';
 import { sanitizeApiKeyDisplayText, type ApiKeyDisplayInfo } from './apiKeys';
-import { isKeyDisambiguatedLabel } from './sourceDisplay';
+import { isKeyDisambiguatedLabel, isProviderLikeMonitoringLabel } from './sourceDisplay';
 import { buildHourLabel, buildLocalDayKey } from './range';
 import type { MonitoringAuthMeta, MonitoringChannelMeta, MonitoringEventRow } from './types';
 
@@ -26,6 +26,8 @@ const calculateOutputTokensPerSecond = (
 
   return outputTokens / (latencyMs / 1000);
 };
+
+const CODEX_ACCOUNT_ID_SNAPSHOT_PREFIX = 'codex-account-id:v1:';
 
 export const buildEventRows = (
   details: UsageDetailWithEndpoint[],
@@ -46,13 +48,22 @@ export const buildEventRows = (
         return null;
       }
 
-      const authIndex = normalizeAuthIndex(detail.auth_index) ?? '-';
+      const authIndexIdentity = normalizeAuthIndex(detail.auth_index) ?? '';
+      const authIndex = authIndexIdentity || '-';
+      const sourceIdentity = readString(detail.source);
+      const sourceHashIdentity = readString(detail.source_hash ?? detail.sourceHash);
       const authMeta = authMetaMap.get(authIndex);
+      const snapshotProvider = readString(
+        detail.auth_provider_snapshot ?? detail.authProviderSnapshot
+      );
+      const eventProvider = readString(detail.provider);
+      const effectiveProvider = snapshotProvider || eventProvider;
       const sourceMeta = resolveSourceDisplay(
         detail.source,
         detail.auth_index,
         sourceInfoMap,
-        authFileMap
+        authFileMap,
+        effectiveProvider
       );
       const snapshotAccount = readString(detail.account_snapshot ?? detail.accountSnapshot);
       const snapshotLabel = readString(
@@ -60,9 +71,6 @@ export const buildEventRows = (
           detail.authLabelSnapshot ??
           detail.auth_file_snapshot ??
           detail.authFileSnapshot
-      );
-      const snapshotProvider = readString(
-        detail.auth_provider_snapshot ?? detail.authProviderSnapshot
       );
       const snapshotDisplay = snapshotAccount || snapshotLabel;
       const channelMeta =
@@ -72,6 +80,12 @@ export const buildEventRows = (
         channelMeta?.name || authMeta?.provider || snapshotProvider || sourceMeta.type || '-';
       const resolvedSourceName = readString(sourceMeta.displayName);
       const labelCandidates = authMeta?.label || snapshotLabel || snapshotDisplay;
+      const configuredSourceName = Boolean(
+        resolvedSourceName &&
+          sourceMeta.identityKey &&
+          !sourceMeta.identityKey.startsWith('source:') &&
+          !sourceMeta.identityKey.startsWith('auth:')
+      );
       // Prefer multi-key OpenAI-compatible disambiguation (e.g. "kuaileshifu #1") over the
       // bare provider/auth label so realtime cells match account overview identity.
       const sourceLabel =
@@ -80,7 +94,9 @@ export const buildEventRows = (
           isKeyDisambiguatedLabel(resolvedSourceName, channelMeta?.host) ||
           isKeyDisambiguatedLabel(resolvedSourceName, labelCandidates) ||
           isKeyDisambiguatedLabel(resolvedSourceName, authMeta?.account) ||
-          isKeyDisambiguatedLabel(resolvedSourceName, snapshotAccount))
+          isKeyDisambiguatedLabel(resolvedSourceName, snapshotAccount) ||
+          (configuredSourceName &&
+            isProviderLikeMonitoringLabel(authMeta?.label || snapshotDisplay, effectiveProvider)))
           ? resolvedSourceName
           : '') ||
         authMeta?.label ||
@@ -103,8 +119,34 @@ export const buildEventRows = (
       const endpoint = readString(detail.__endpoint) || '-';
       const endpointMethod = readString(detail.__endpointMethod) || '-';
       const endpointPath = readString(detail.__endpointPath) || endpoint;
+      const requestedModel = readString(detail.__requestedModel);
+      const clientIp = readString(detail.client_ip ?? detail.clientIp);
+      const xForwardedFor = readString(detail.x_forwarded_for ?? detail.xForwardedFor);
+      const userAgent = readString(detail.user_agent ?? detail.userAgent);
       const resolvedModel = readString(detail.__resolvedModel);
-      const projectId = readString(detail.auth_project_id_snapshot ?? detail.authProjectIdSnapshot);
+      const responseModel = readString(
+        detail.__responseModel ?? detail.response_model ?? detail.responseModel
+      );
+      const sessionId = readString(detail.session_id ?? detail.sessionId);
+      const parentSessionId = readString(
+        detail.parent_session_id ?? detail.parentSessionId
+      );
+      const accessTokenSha256 = readString(
+        detail.access_token_sha256 ?? detail.accessTokenSha256
+      );
+      const generate = typeof detail.generate === 'boolean' ? detail.generate : undefined;
+      const stream = typeof detail.stream === 'boolean' ? detail.stream : undefined;
+      const accountId = readString(
+        detail.auth_account_id_snapshot ?? detail.authAccountIdSnapshot
+      );
+      const rawProjectId = readString(
+        detail.auth_project_id_snapshot ?? detail.authProjectIdSnapshot
+      );
+      const projectId =
+        effectiveProvider.toLowerCase().replace(/_/g, '-') === 'codex' &&
+        rawProjectId.startsWith(CODEX_ACCOUNT_ID_SNAPSHOT_PREFIX)
+          ? ''
+          : rawProjectId;
       const inputTokens = Math.max(Number(detail.tokens?.input_tokens) || 0, 0);
       const outputTokens = Math.max(Number(detail.tokens?.output_tokens) || 0, 0);
       const reasoningTokens = Math.max(Number(detail.tokens?.reasoning_tokens) || 0, 0);
@@ -190,23 +232,34 @@ export const buildEventRows = (
         dayKey,
         hourLabel,
         model: readString(detail.__modelName) || '-',
+        requestedModel: requestedModel || undefined,
         resolvedModel: resolvedModel || undefined,
         endpoint,
         endpointMethod,
         endpointPath,
+        clientIp,
+        xForwardedFor,
+        userAgent,
         sourceKey,
         source: sourceLabel,
+        sourceIdentity,
+        sourceHashIdentity,
         sourceMasked,
         account,
+        accountIdentity: snapshotAccount,
         accountMasked,
         authIndex,
+        authIndexIdentity,
         authIndexMasked: maskAuthIndex(authIndex),
         authLabel: authMeta?.label || snapshotLabel || sourceMasked,
+        authLabelIdentity: snapshotLabel,
+        accountId: accountId || undefined,
         projectId,
         apiKeyHash,
         apiKeyLabel,
         apiKeyMasked,
-        provider: authMeta?.provider || snapshotProvider || sourceMeta.type || '-',
+        provider: authMeta?.provider || snapshotProvider || eventProvider || sourceMeta.type || '-',
+        providerIdentity: effectiveProvider,
         planType: authMeta?.planType || '-',
         channel: channelLabel,
         channelHost: channelMeta?.host || '-',
@@ -224,6 +277,12 @@ export const buildEventRows = (
         cacheCreationTokens,
         totalTokens,
         totalCost,
+        responseModel,
+        sessionId,
+        parentSessionId,
+        accessTokenSha256,
+        generate,
+        stream,
         reasoningEffort,
         serviceTier,
         requestServiceTier,
@@ -252,8 +311,12 @@ export const buildEventRows = (
           channelMeta?.host,
           endpointPath,
           endpointMethod,
+          clientIp,
+          xForwardedFor,
+          userAgent,
           authMeta?.provider || snapshotProvider,
           authMeta?.planType,
+          requestedModel,
           resolvedModel,
           projectId,
           reasoningEffort,

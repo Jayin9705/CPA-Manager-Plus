@@ -25,6 +25,7 @@ import type { AccountDisplayMode } from '@/features/monitoring/accountOverviewSt
 import { useNotificationStore } from '@/stores';
 import { copyToClipboard } from '@/utils/clipboard';
 import { maskSensitiveText, truncateText } from '@/utils/format';
+import { getPlanLabel, getPlanPresentation, type PlanDisplayMode } from '@/utils/plans';
 import { formatCompactNumber, formatUsd } from '@/utils/usage';
 import styles from '../MonitoringCenterPage.module.scss';
 
@@ -334,7 +335,8 @@ const formatHeaderRecoverAt = (value: number | null | undefined, locale: string)
 const buildHeaderDiagnosticParts = (
   row: MonitoringEventRow,
   t: TFunction,
-  locale: string
+  locale: string,
+  planDisplayMode: PlanDisplayMode = 'compact'
 ): string[] => {
   const parts: string[] = [];
   const formatCount = (value: number): string =>
@@ -412,7 +414,13 @@ const buildHeaderDiagnosticParts = (
     row.responseMetadata?.quota?.plan_type ||
     row.responseMetadata?.quota?.active_limit ||
     '';
-  if (planType) quotaParts.push(planType);
+  const planPresentation = getPlanPresentation({
+    provider: row.provider,
+    planType,
+    t,
+  });
+  const planLabel = getPlanLabel(planPresentation, planDisplayMode);
+  if (planLabel) quotaParts.push(planLabel);
   const usedPercent =
     row.headerQuotaUsedPercent ?? row.responseMetadata?.quota?.used_percent ?? null;
   if (typeof usedPercent === 'number' && Number.isFinite(usedPercent)) {
@@ -515,7 +523,7 @@ const buildRequestDiagnosticDetails = (row: MonitoringEventRow, t: TFunction, lo
   if (!row.failed) return null;
 
   const summary = maskSensitiveText(row.failSummary || '');
-  const diagnostics = buildHeaderDiagnosticParts(row, t, locale);
+  const diagnostics = buildHeaderDiagnosticParts(row, t, locale, 'full');
   if (!row.failStatusCode && !summary && diagnostics.length === 0) return null;
   const statusText = row.failStatusCode
     ? `${shortLabel(t, 'monitoring.fail_status_code_short', 'monitoring.fail_status_code')} ${row.failStatusCode}`
@@ -728,14 +736,26 @@ type RealtimeTokenUsageDetails = {
 
 const buildRealtimeTokenUsageDetails = (row: MonitoringEventRow, t: TFunction) => {
   const fields = [
-    { label: t('monitoring.realtime_usage_total_label'), value: formatCompactNumber(row.totalTokens) },
-    { label: t('monitoring.realtime_usage_input_label'), value: formatCompactNumber(row.inputTokens) },
-    { label: t('monitoring.realtime_usage_output_label'), value: formatCompactNumber(row.outputTokens) },
+    {
+      label: t('monitoring.realtime_usage_total_label'),
+      value: formatCompactNumber(row.totalTokens),
+    },
+    {
+      label: t('monitoring.realtime_usage_input_label'),
+      value: formatCompactNumber(row.inputTokens),
+    },
+    {
+      label: t('monitoring.realtime_usage_output_label'),
+      value: formatCompactNumber(row.outputTokens),
+    },
     {
       label: t('monitoring.realtime_usage_reasoning_label'),
-      value: formatCompactNumber(row.reasoningTokens),
+      value: String(row.reasoningTokens),
     },
-    { label: t('monitoring.realtime_usage_cached_label'), value: formatCompactNumber(row.cachedTokens) },
+    {
+      label: t('monitoring.realtime_usage_cached_label'),
+      value: formatCompactNumber(row.cachedTokens),
+    },
     {
       label: t('monitoring.realtime_usage_cache_read_label'),
       value: formatCompactNumber(row.cacheReadTokens),
@@ -1099,10 +1119,29 @@ export function RealtimeEventsPanel({
             {pagination.pageItems.map((row) => {
               const sourceDisplay = buildRealtimeSourceDisplay(row, t, accountDisplayMode);
               const apiKeyDisplay = buildRealtimeApiKeyDisplay(row, t);
-              const showResolvedModel =
-                row.resolvedModel &&
-                row.resolvedModel.trim() &&
-                row.resolvedModel.trim() !== row.model;
+              const requestedModel = row.requestedModel?.trim() || row.model || '—';
+              const resolvedModel = row.resolvedModel?.trim() || '';
+              const responseModel = row.responseModel?.trim() || '';
+              const showResolvedModel = Boolean(resolvedModel && resolvedModel !== requestedModel);
+              const hasResponseModelMismatch = Boolean(
+                responseModel && resolvedModel && responseModel !== resolvedModel
+              );
+              const showResponseModelInTooltip = Boolean(
+                responseModel && (!resolvedModel || responseModel !== resolvedModel)
+              );
+              const modelTooltipLines: string[] = [];
+              if (requestedModel) {
+                modelTooltipLines.push(`${t('monitoring.requested_model')}: ${requestedModel}`);
+              }
+              if (showResolvedModel) {
+                modelTooltipLines.push(`${t('monitoring.resolved_model')}: ${resolvedModel}`);
+              }
+              if (showResponseModelInTooltip) {
+                modelTooltipLines.push(`${t('monitoring.response_model')}: ${responseModel}`);
+              }
+              if (hasResponseModelMismatch) {
+                modelTooltipLines.push(t('monitoring.model_mismatch'));
+              }
               const reasoningEffort = formatOptionalText(row.reasoningEffort);
               const serviceTier = formatOptionalText(row.serviceTier);
               const requestServiceTier = formatOptionalText(row.requestServiceTier);
@@ -1129,6 +1168,16 @@ export function RealtimeEventsPanel({
                       <div className={styles.primaryCell} title={sourceDisplay.title}>
                         <span>{sourceDisplay.primary}</span>
                         {sourceDisplay.meta ? <small>{sourceDisplay.meta}</small> : null}
+                        {sourceDisplay.requestMetadataTitle ? (
+                          <details className={styles.realtimeRequestMetadata}>
+                            <summary>{t('monitoring.request_metadata')}</summary>
+                            <small>
+                              {sourceDisplay.requestMetadataTitle.split('\n').map((line) => (
+                                <span key={line}>{line}</span>
+                              ))}
+                            </small>
+                          </details>
+                        ) : null}
                         {apiKeyDisplay ? (
                           <small className={styles.realtimeApiKeyLine} title={apiKeyDisplay.title}>
                             {`${t('monitoring.realtime_api_key_label')}: ${apiKeyDisplay.display}`}
@@ -1140,17 +1189,25 @@ export function RealtimeEventsPanel({
                   <td>
                     <div
                       className={`${styles.primaryCell} ${styles.realtimeModelCell}`}
-                      title={[row.model, showResolvedModel ? row.resolvedModel : '']
-                        .filter(Boolean)
-                        .join('\n')}
+                      title={modelTooltipLines.join('\n')}
                     >
                       <span className={`${styles.monoCell} ${styles.realtimeModelText}`}>
-                        {row.model}
+                        {requestedModel}
                       </span>
                       {showResolvedModel ? (
-                        <small className={`${styles.monoCell} ${styles.realtimeModelText}`}>
-                          {row.resolvedModel}
+                        <small className={`${styles.monoCell} ${styles.realtimeModelRoutedText}`}>
+                          {`→ ${resolvedModel}`}
                         </small>
+                      ) : null}
+                      {hasResponseModelMismatch ? (
+                        <div className={styles.realtimeModelResponseLine}>
+                          <small className={`${styles.monoCell} ${styles.realtimeModelResponseText}`}>
+                            {`↳ ${responseModel}`}
+                          </small>
+                          <span className={styles.realtimeModelMismatchBadge}>
+                            {t('monitoring.model_mismatch')}
+                          </span>
+                        </div>
                       ) : null}
                     </div>
                   </td>
@@ -1273,7 +1330,7 @@ export function RealtimeEventsPanel({
                       tooltipId={`${tooltipIdPrefix}-token-usage-tooltip-${row.id}`}
                     />
                   </td>
-                  <td>{hasPrices ? formatUsd(row.totalCost) : '--'}</td>
+                  <td>{hasPrices ? formatUsd(row.totalCost, 3) : '--'}</td>
                 </tr>
               );
             })}

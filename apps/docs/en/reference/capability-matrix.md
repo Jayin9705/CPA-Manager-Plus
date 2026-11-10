@@ -9,19 +9,19 @@ Use this page to confirm which features each usage option provides and what evid
 
 ## By Usage Option
 
-| Capability                                                | CPAMP Lightweight Panel     | CPAMP Full Mode |
-| --------------------------------------------------------- | --------------------------- | --------------- |
-| CPA config, providers, auth files, OAuth, quota, and logs | ✅                          | ✅              |
-| Plugin management and plugin pages                        | Depends on CPA/plugin paths | ✅              |
-| Browser-local account checks                              | ✅                          | ✅              |
-| SQLite request history                                    | ❌                          | ✅              |
-| Request monitoring and failure diagnosis                  | ❌                          | ✅              |
-| Usage and cost analytics                                  | ❌                          | ✅              |
-| Model prices and API key aliases                          | ❌                          | ✅              |
-| Scheduled account inspection and history                  | ❌                          | ✅              |
-| Quota cooldowns and account action queue                  | ❌                          | ✅              |
-| Login credential                                          | CPA Management Key          | CPAMP Admin Key |
-| Backups, migration state, and pprof                       | ❌                          | ✅              |
+| Capability                                       | CPAMP Lightweight Panel     | CPAMP Full Mode |
+| ------------------------------------------------ | --------------------------- | --------------- |
+| CPA config, providers, Accounts, OAuth, and logs | ✅                          | ✅              |
+| Plugin management and plugin pages               | Depends on CPA/plugin paths | ✅              |
+| Browser-local account checks                     | ✅                          | ✅              |
+| SQLite request history                           | ❌                          | ✅              |
+| Request monitoring and failure diagnosis         | ❌                          | ✅              |
+| Usage and cost analytics                         | ❌                          | ✅              |
+| Model prices and API key aliases                 | ❌                          | ✅              |
+| Scheduled account inspection and history         | ❌                          | ✅              |
+| Quota cooldowns and account action queue         | ❌                          | ✅              |
+| Login credential                                 | CPA Management Key          | CPAMP Admin Key |
+| Backups, migration state, and pprof              | ❌                          | ✅              |
 
 The CPAMP Lightweight Panel is an enhanced WebUI hosted directly by CPA and requires no additional service, just like the official panel. It does not connect to or read Manager Server. Use the Manager Server `:18317/management.html` entry for the server-backed capabilities in this table.
 
@@ -47,8 +47,13 @@ Docker and native packages provide the same Full Mode capabilities; only the ins
 | Claude                               | Provider and OAuth/Auth File                               | Base quota, weekly quota, and model-scoped limits when returned       | Quota read without model requests |
 | xAI/Grok OAuth                       | Provider/Auth File/OAuth                                   | CLI billing, paid OAuth identity fallback, and request-event evidence | Local and server                  |
 | xAI API Key                          | `xai-api-key`, priority, models, and key testing           | Request results and provider responses                                | Provider key test                 |
+| Muse / Meta OAuth                    | OAuth/Auth File (Device Flow)                              | `meta:window`, `meta:weekly`, and reset/period metadata                | Quota read without model requests |
+| Meta API Key                         | `meta-api-key`, priority, models, and key testing          | Request results and provider responses                                | Provider key test                 |
 | Gemini / Vertex / Antigravity / Kimi | Provider, auth file, or OAuth depending on CPA             | Provider-specific quota or recent request evidence                    | Depends on CPA and provider APIs  |
+| Devin                                | Provider, Auth File, OAuth, `devin.sensitive-words`        | Daily/weekly quota percentages, exact reset, Devin plan metadata      | Quota read without model requests |
 | OpenAI-compatible                    | Base URL, API key, headers, model mapping, and key testing | Request status, latency, redacted failures, and cost                  | No assumed common quota API       |
+
+Full Muse / Meta support requires CPA `v7.3.4+`. OAuth DCA credentials and `meta-api-key` inference credentials are separate and are not interchangeable.
 
 ## Data And Automation Boundaries
 
@@ -62,7 +67,6 @@ Docker and native packages provide the same Full Mode capabilities; only the ins
 ## Related Guides
 
 - [Account Inspection](../manual/codex-inspection.md)
-- [Quota](../manual/quota.md)
-- [Auth Files](../manual/auth-files.md)
+- [Accounts And Credential Health](../manual/accounts.md)
 - [Account Action Queue](../manual/account-actions.md)
 - [Manager Server Guide](../operations/manager-server.md)

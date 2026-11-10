@@ -10,12 +10,17 @@ import {
   compatibleCachedTokens,
   extractTotalTokens,
   formatCompactNumber,
+  formatCompactUsd,
+  formatUsd,
   getServiceTierMultiplier,
   inferCacheInputMode,
+  isOpaqueUsageSourceId,
   loadModelPrices,
+  normalizeAnalyticsModel,
   normalizeCacheAccounting,
   normalizeUsageSourceId,
 } from './usage';
+import { sha256Hex } from './apiKeyHash';
 import { maskSensitiveText } from './format';
 import cacheInputAccountingFixtures from './cacheInputAccounting.fixtures.json';
 
@@ -24,14 +29,58 @@ afterEach(() => {
 });
 
 describe('formatCompactNumber', () => {
-  it('keeps large values compact as data grows beyond millions', () => {
+  it('keeps large values compact across units and rounding boundaries', () => {
+    expect(formatCompactNumber(0)).toBe('0');
     expect(formatCompactNumber(999)).toBe('999');
-    expect(formatCompactNumber(1_200)).toBe('1.2K');
-    expect(formatCompactNumber(999_950)).toBe('1.0M');
-    expect(formatCompactNumber(2_795_200_000)).toBe('2.8B');
-    expect(formatCompactNumber(1_200_000_000_000)).toBe('1.2T');
+    expect(formatCompactNumber(1_000)).toBe('1.0K');
+    expect(formatCompactNumber(777_770)).toBe('777.8K');
+    expect(formatCompactNumber(888_880_000)).toBe('888.9M');
+    expect(formatCompactNumber(999_999_999)).toBe('1.0B');
+    expect(formatCompactNumber(1_000_000_000)).toBe('1.0B');
+    expect(formatCompactNumber(1_000_190_000)).toBe('1.0B');
+    expect(formatCompactNumber(1_250_000_000)).toBe('1.3B');
+    expect(formatCompactNumber(1_000_000_000_000)).toBe('1.0T');
     expect(formatCompactNumber(-2_500_000_000_000_000)).toBe('-2.5P');
     expect(formatCompactNumber(Number.POSITIVE_INFINITY)).toBe('0');
+  });
+});
+
+describe('formatCompactUsd', () => {
+  it('keeps small amounts precise and compacts larger amounts with rollover', () => {
+    expect(formatCompactUsd(0)).toBe('$0.00');
+    expect(formatCompactUsd(12.3)).toBe('$12.30');
+    expect(formatCompactUsd(999.99)).toBe('$999.99');
+    expect(formatCompactUsd(1_000)).toBe('$1.00K');
+    expect(formatCompactUsd(1_234.56)).toBe('$1.23K');
+    expect(formatCompactUsd(12_345.67)).toBe('$12.35K');
+    expect(formatCompactUsd(999_999.99)).toBe('$1.00M');
+    expect(formatCompactUsd(1_000_000)).toBe('$1.00M');
+    expect(formatCompactUsd(1_234_567.89)).toBe('$1.23M');
+    expect(formatCompactUsd(1_000_000_000)).toBe('$1.00B');
+    expect(formatCompactUsd(999.994)).toBe('$999.99');
+    expect(formatCompactUsd(999.999)).toBe('$1.00K');
+    expect(formatCompactUsd(999_999.999)).toBe('$1.00M');
+    expect(formatCompactUsd(999_999_999.999)).toBe('$1.00B');
+    expect(formatCompactUsd(-999.999)).toBe('$-1.00K');
+  });
+
+  it('uses the existing invalid-value fallback', () => {
+    expect(formatCompactUsd(Number.NaN)).toBe('$0.00');
+    expect(formatCompactUsd(Number.POSITIVE_INFINITY)).toBe('$0.00');
+  });
+});
+
+describe('formatUsd', () => {
+  it('formats costs globally to two decimal places', () => {
+    expect(formatUsd(19.99)).toBe('$19.99');
+    expect(formatUsd(0.006)).toBe('$0.01');
+    expect(formatUsd(Number.NaN)).toBe('$0.00');
+  });
+
+  it('allows request-scoped precision overrides', () => {
+    expect(formatUsd(19.99, 3)).toBe('$19.990');
+    expect(formatUsd(0.0006, 3)).toBe('$0.001');
+    expect(formatUsd(Number.NaN, 3)).toBe('$0.000');
   });
 });
 
@@ -108,6 +157,66 @@ describe('usage source candidates', () => {
 
   it('preserves legacy UI-masked source IDs when no raw secret is present', () => {
     expect(normalizeUsageSourceId('m:sk******ef')).toBe('m:sk******ef');
+  });
+
+  it('preserves canonical hashed sources without converting them to k:', () => {
+    const validHash = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const normalized = normalizeUsageSourceId(`h:${validHash}`);
+    expect(normalized).toBe(`h:${validHash}`);
+    expect(normalized).not.toMatch(/^k:/);
+  });
+
+  it('canonicalizes uppercase hashed sources to lowercase', () => {
+    const mixedCase = '0123456789ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef';
+    const expected = mixedCase.toLowerCase();
+    expect(normalizeUsageSourceId(`h:${mixedCase}`)).toBe(`h:${expected}`);
+  });
+
+  it('does not trust malformed h: sources that contain raw secrets', () => {
+    const rawSecret = 'sk-proj-malformed-secret-token-1234567890';
+    const normalized = normalizeUsageSourceId(`h:${rawSecret}`);
+    expect(normalized).toMatch(/^k:/);
+    expect(normalized).not.toContain(rawSecret);
+    expect(normalized).not.toBe(`h:${rawSecret}`);
+  });
+
+  it('includes h:<sha256(apiKey)> candidate alongside legacy candidates', () => {
+    const apiKey = 'sk-proj-test-long-and-strong-credential-key-value-123456';
+    const candidates = buildCandidateUsageSourceIds({ apiKey });
+    const expectedHash = sha256Hex(apiKey);
+
+    expect(candidates).toContain(`h:${expectedHash}`);
+    expect(candidates.some((c) => c.startsWith('k:'))).toBe(true);
+    expect(candidates.some((c) => c.startsWith('m:'))).toBe(true);
+    expect(candidates).not.toContain(apiKey);
+  });
+
+  it('identifies opaque usage source identities correctly', () => {
+    expect(
+      isOpaqueUsageSourceId('h:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')
+    ).toBe(true);
+    expect(isOpaqueUsageSourceId('k:0123456789abcdef')).toBe(true);
+    expect(isOpaqueUsageSourceId('m:sk-1...cdef')).toBe(true);
+    expect(isOpaqueUsageSourceId('m:sk******ef')).toBe(true);
+    expect(isOpaqueUsageSourceId('t:codex')).toBe(false);
+    expect(isOpaqueUsageSourceId('codex')).toBe(false);
+    expect(isOpaqueUsageSourceId('api.example.com')).toBe(false);
+    expect(isOpaqueUsageSourceId('h:not-a-64-char-hex')).toBe(false);
+    expect(isOpaqueUsageSourceId('')).toBe(false);
+  });
+});
+
+describe('normalizeAnalyticsModel', () => {
+  it('removes only supported CPA reasoning suffixes', () => {
+    expect(normalizeAnalyticsModel('deepseek-v4-flash(max)')).toBe('deepseek-v4-flash');
+    expect(normalizeAnalyticsModel('gemini-2.5-pro(+08192)')).toBe('gemini-2.5-pro');
+    expect(normalizeAnalyticsModel('gemini-2.5-pro(-000)')).toBe('gemini-2.5-pro');
+    expect(normalizeAnalyticsModel('custom(model)(HIGH)')).toBe('custom(model)');
+    expect(normalizeAnalyticsModel('custom-model(region-us)')).toBe('custom-model(region-us)');
+    expect(normalizeAnalyticsModel('custom-model(9223372036854775808)')).toBe(
+      'custom-model(9223372036854775808)'
+    );
+    expect(normalizeAnalyticsModel(' custom-model(max) ')).toBe(' custom-model(max) ');
   });
 });
 
@@ -209,7 +318,7 @@ describe('usage detail collection', () => {
     );
   });
 
-  it('extracts resolved_model alongside the requested model name', () => {
+  it('extracts analytics, requested, and resolved model identities', () => {
     const usageData = {
       apis: {
         'POST /v1/chat/completions': {
@@ -220,6 +329,8 @@ describe('usage detail collection', () => {
                   timestamp: '2026-05-19T10:00:00Z',
                   source: 'alice@example.com',
                   auth_index: 'auth-1',
+                  analytics_model: 'gpt-5',
+                  requested_model: 'gpt-5.4(max)',
                   resolved_model: 'gpt-5.5',
                   tokens: { input_tokens: 1 },
                   failed: false,
@@ -233,8 +344,53 @@ describe('usage detail collection', () => {
 
     const detail = collectUsageDetails(usageData)[0];
     expect(detail.__modelName).toBe('gpt-5.4');
+    expect(detail.__requestedModel).toBe('gpt-5.4(max)');
     expect(detail.__resolvedModel).toBe('gpt-5.5');
-    expect(collectUsageDetailsWithEndpoint(usageData)[0].__resolvedModel).toBe('gpt-5.5');
+    expect(collectUsageDetailsWithEndpoint(usageData)[0]).toMatchObject({
+      __modelName: 'gpt-5.4',
+      __requestedModel: 'gpt-5.4(max)',
+      __resolvedModel: 'gpt-5.5',
+    });
+  });
+
+  it('derives analytics identity for legacy payloads without analytics_model', () => {
+    const usageData = {
+      apis: {
+        'POST /v1/chat/completions': {
+          models: {
+            'deepseek-v4-flash(max)': {
+              details: [
+                {
+                  timestamp: '2026-05-19T10:00:00Z',
+                  tokens: { input_tokens: 1 },
+                  failed: false,
+                },
+              ],
+            },
+            'custom-model(region-us)': {
+              details: [
+                {
+                  timestamp: '2026-05-19T10:00:01Z',
+                  tokens: { input_tokens: 1 },
+                  failed: false,
+                },
+              ],
+            },
+          },
+        },
+      },
+    };
+
+    expect(collectUsageDetailsWithEndpoint(usageData)).toEqual([
+      expect.objectContaining({
+        __modelName: 'deepseek-v4-flash',
+        __requestedModel: 'deepseek-v4-flash(max)',
+      }),
+      expect.objectContaining({
+        __modelName: 'custom-model(region-us)',
+        __requestedModel: 'custom-model(region-us)',
+      }),
+    ]);
   });
 
   it('copies TTFT metadata into normalized usage details', () => {
@@ -425,6 +581,51 @@ describe('cache input accounting semantics', () => {
 
   it.each([
     {
+      name: 'Devin executor standalone',
+      context: { executorType: 'DevinExecutor' },
+      mode: 'read_included_creation_separate',
+    },
+    {
+      name: 'Devin executor beats Claude alias',
+      context: { executorType: 'DevinExecutor', resolvedModel: 'claude-fable-5-1' },
+      mode: 'read_included_creation_separate',
+    },
+    {
+      name: 'SomeDevinLikeExecutor does not match Devin, falls back to Claude',
+      context: { executorType: 'SomeDevinLikeExecutor', resolvedModel: 'claude-fable-5-1' },
+      mode: 'separate_from_input',
+    },
+    {
+      name: 'SomeDevinLikeExecutor does not match Devin, falls back to GPT-5',
+      context: { executorType: 'SomeDevinLikeExecutor', resolvedModel: 'gpt-5' },
+      mode: 'included_in_input',
+    },
+    {
+      name: 'Devin provider beats Claude alias',
+      context: { provider: 'devin', requestedModel: 'claude-fable-5-1' },
+      mode: 'read_included_creation_separate',
+    },
+    {
+      name: 'Devin provider prefix',
+      context: { provider: 'devin/custom' },
+      mode: 'read_included_creation_separate',
+    },
+    {
+      name: 'Devin exact model',
+      context: { resolvedModel: 'devin' },
+      mode: 'read_included_creation_separate',
+    },
+    {
+      name: 'Devin resolved model',
+      context: { resolvedModel: 'devin/swe-2' },
+      mode: 'read_included_creation_separate',
+    },
+    {
+      name: 'Devin hybrid claude model',
+      context: { resolvedModel: 'devin/claude-3-7-sonnet' },
+      mode: 'read_included_creation_separate',
+    },
+    {
       name: 'OpenAICompat executor beats Claude alias',
       context: { executorType: 'OpenAICompatExecutor', resolvedModel: 'claude-sonnet-4' },
       mode: 'included_in_input',
@@ -461,6 +662,20 @@ describe('cache input accounting semantics', () => {
         0
       )
     ).toBe('separate_from_input');
+    expect(
+      inferCacheInputMode(
+        { explicitMode: 'read_included_creation_separate', executorType: 'ClaudeExecutor' },
+        20,
+        0
+      )
+    ).toBe('read_included_creation_separate');
+    expect(
+      inferCacheInputMode(
+        { explicitMode: 'included_in_input', executorType: 'DevinExecutor' },
+        20,
+        0
+      )
+    ).toBe('included_in_input');
   });
 
   it('normalizes included and separate totals with the mirrored Go formulas', () => {
@@ -492,6 +707,38 @@ describe('cache input accounting semantics', () => {
       uncachedInputTokens: 100,
       totalInputTokens: 130,
     });
+    expect(
+      normalizeCacheAccounting({
+        context: { executorType: 'DevinExecutor' },
+        inputTokens: 229788,
+        cachedTokens: 228021,
+        cacheTokens: 0,
+        cacheReadTokens: 228021,
+        cacheCreationTokens: 0,
+      })
+    ).toMatchObject({
+      mode: 'read_included_creation_separate',
+      uncachedInputTokens: 1767,
+      totalInputTokens: 229788,
+      cacheReadTokens: 228021,
+      cacheCreationTokens: 0,
+    });
+    expect(
+      normalizeCacheAccounting({
+        context: { executorType: 'DevinExecutor' },
+        inputTokens: 53,
+        cachedTokens: 0,
+        cacheTokens: 0,
+        cacheReadTokens: 50,
+        cacheCreationTokens: 14361,
+      })
+    ).toMatchObject({
+      mode: 'read_included_creation_separate',
+      uncachedInputTokens: 3,
+      totalInputTokens: 14414,
+      cacheReadTokens: 50,
+      cacheCreationTokens: 14361,
+    });
   });
 
   it.each([
@@ -519,6 +766,19 @@ describe('cache input accounting semantics', () => {
       detail: {},
       tokenMode: 'separate_from_input',
       totalInput: 130,
+    },
+    {
+      name: 'Devin executor mixed input',
+      model: 'claude-fable-5-1',
+      detail: { executor_type: 'DevinExecutor', provider: 'devin' },
+      totalInput: 110,
+    },
+    {
+      name: 'nested explicit read_included_creation_separate mode',
+      model: 'claude-3-7-sonnet',
+      detail: {},
+      tokenMode: 'read_included_creation_separate',
+      totalInput: 110,
     },
   ])('$name is applied by readTokens', ({ model, detail, tokenMode, totalInput }) => {
     const usageData = {
@@ -589,6 +849,65 @@ describe('cache input accounting semantics', () => {
     ).toBeCloseTo(0.4);
     expect(cost).toBeCloseTo(0.000064);
   });
+
+  it('correctly normalizes Issue 838 Devin cache-read sample with collectUsageDetails', () => {
+    const usageData = {
+      apis: {
+        'POST /v1/chat/completions': {
+          models: {
+            'claude-fable-5-1': {
+              details: [
+                {
+                  timestamp: '2026-07-15T00:00:00Z',
+                  source: 'account',
+                  auth_index: 'auth-1',
+                  cache_input_mode: 'read_included_creation_separate',
+                  executor_type: 'DevinExecutor',
+                  provider: 'devin',
+                  alias: 'claude-fable-5-1',
+                  tokens: {
+                    input_tokens: 229788,
+                    output_tokens: 1775,
+                    cached_tokens: 228021,
+                    cache_read_tokens: 228021,
+                    cache_creation_tokens: 0,
+                    total_tokens: 231563,
+                  },
+                  failed: false,
+                },
+              ],
+            },
+          },
+        },
+      },
+    };
+    const [detail] = collectUsageDetails(usageData);
+
+    expect(detail.cache_input_mode).toBe('read_included_creation_separate');
+    expect(detail.tokens.input_tokens).toBe(229788);
+    expect(detail.tokens.total_tokens).toBe(231563);
+    expect(detail.tokens.cache_read_tokens).toBe(228021);
+    expect(detail.tokens.cache_creation_tokens).toBe(0);
+  });
+
+  it('prices Devin cache without provider-specific logic in pricing', () => {
+    // 针对 input=53, read=50, creation=14361:
+    // canonical totalInput = 14414, cacheRead = 50, cacheCreation = 14361
+    // pricing promptTokens = 14414 - 50 - 14361 = 3
+    const accounting = normalizeCacheAccounting({
+      context: { executorType: 'DevinExecutor', provider: 'devin' },
+      inputTokens: 53,
+      cachedTokens: 0,
+      cacheTokens: 0,
+      cacheReadTokens: 50,
+      cacheCreationTokens: 14361,
+    });
+    const promptTokens =
+      accounting.totalInputTokens - accounting.cacheReadTokens - accounting.cacheCreationTokens;
+    expect(accounting.totalInputTokens).toBe(14414);
+    expect(accounting.uncachedInputTokens).toBe(3);
+    expect(promptTokens).toBe(3);
+  });
 });
 
 describe('sensitive text masking', () => {
@@ -644,6 +963,37 @@ describe('calculateCost model price preference', () => {
       prices
     );
     expect(cost).toBeCloseTo(50);
+  });
+
+  it('prefers analytics model pricing before the raw requested suffix model', () => {
+    const cost = calculateCost(
+      {
+        tokens: { input_tokens: 1_000_000, output_tokens: 0 },
+        __modelName: 'deepseek-v4-flash',
+        __requestedModel: 'deepseek-v4-flash(max)',
+      },
+      {
+        'deepseek-v4-flash': { prompt: 2, completion: 0, cache: 0 },
+        'deepseek-v4-flash(max)': { prompt: 9, completion: 0, cache: 0 },
+      }
+    );
+
+    expect(cost).toBeCloseTo(2);
+  });
+
+  it('falls back to the raw requested model when analytics pricing is unavailable', () => {
+    const cost = calculateCost(
+      {
+        tokens: { input_tokens: 1_000_000, output_tokens: 0 },
+        __modelName: 'deepseek-v4-flash',
+        __requestedModel: 'deepseek-v4-flash(max)',
+      },
+      {
+        'deepseek-v4-flash(max)': { prompt: 9, completion: 0, cache: 0 },
+      }
+    );
+
+    expect(cost).toBeCloseTo(9);
   });
 
   it('keeps resolved model tier behavior when using a requested price fallback', () => {

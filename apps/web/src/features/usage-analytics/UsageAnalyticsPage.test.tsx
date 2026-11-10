@@ -1,11 +1,14 @@
 import { act } from 'react';
 import { create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { SVGRenderer } from 'echarts/renderers';
+import { echarts } from '@/components/charts/echartsCore';
 import { EChartsView } from '@/components/charts/EChartsView';
 import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
 import {
   USAGE_ANALYTICS_DEFAULT_FILTERS,
+  type UsageDrilldownEvent,
   type UsageRankRow,
   type UsageTimelinePoint,
 } from './usageAnalyticsModel';
@@ -15,6 +18,7 @@ const { mocks } = vi.hoisted(() => ({
   mocks: {
     navigate: vi.fn(),
     copyToClipboard: vi.fn(async () => true),
+    translationCalls: [] as Array<[string, Record<string, unknown> | undefined]>,
     usageState: null as unknown,
   },
 }));
@@ -28,6 +32,7 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     i18n: { language: 'en' },
     t: (key: string, options?: Record<string, unknown>) => {
+      mocks.translationCalls.push([key, options]);
       if (!options) return key;
       return Object.entries(options).reduce(
         (value, [name, replacement]) => value.replace(`{{${name}}}`, String(replacement)),
@@ -117,6 +122,50 @@ const createRankRow = (overrides: Partial<UsageRankRow> = {}): UsageRankRow => (
   estimatedCost: 1.25,
   averageLatencyMs: null,
   share: 1,
+  ...overrides,
+});
+
+const createApiKeyRows = (count: number): UsageRankRow[] =>
+  Array.from({ length: count }, (_, index) =>
+    createRankRow({
+      id: `api-key-${index + 1}`,
+      label: `client-key-${index + 1}`,
+      apiKeyHash: `api-key-${index + 1}`,
+      apiKeyCopyValue: undefined,
+      model: undefined,
+      provider: 'codex',
+      requestCount: count - index,
+      contexts: [],
+      models: [],
+    })
+  );
+
+const createDrilldownEvent = (
+  overrides: Partial<UsageDrilldownEvent> = {}
+): UsageDrilldownEvent => ({
+  requestId: 'request-1',
+  eventHash: 'event-1',
+  timestampMs: 1_780_000_000_000,
+  model: 'gpt-4o',
+  apiKeyHash: 'abcdef1234567890',
+  apiKeyLabel: 'sk-****7890',
+  source: 'codex',
+  authIndex: 'auth-1',
+  provider: 'codex',
+  endpoint: 'POST /v1/chat/completions',
+  totalTokens: 100,
+  estimatedCost: 0,
+  latencyMs: 250,
+  ttftMs: 80,
+  failed: false,
+  failStatusCode: null,
+  failSummary: '',
+  headerErrorKind: '',
+  headerErrorCode: '',
+  headerTraceId: '',
+  headerQuotaPlanType: 'pro',
+  headerQuotaUsedPercent: 25,
+  headerQuotaRecoverAtMs: null,
   ...overrides,
 });
 
@@ -493,6 +542,7 @@ beforeEach(() => {
   mocks.navigate.mockReset();
   mocks.copyToClipboard.mockReset();
   mocks.copyToClipboard.mockResolvedValue(true);
+  mocks.translationCalls.length = 0;
   mocks.usageState = createUsageState();
 });
 
@@ -519,6 +569,54 @@ describe('UsageAnalyticsPage', () => {
     expect(text).not.toContain('usage_analytics.favorite_views_title');
     expect(text).not.toContain('usage_analytics.recent_views_title');
     expect(text).not.toContain('usage_analytics.model_rank_title');
+  });
+
+  it('keeps cost axis labels separate from token labels while preserving exact tooltip costs', () => {
+    const renderer = renderPage();
+    const chart = renderer.root.findAllByType(EChartsView).find((node) =>
+      Array.isArray(node.props.option.yAxis) && node.props.option.yAxis.length === 3
+    );
+    expect(chart).toBeDefined();
+    const option = chart!.props.option;
+    expect(option.yAxis[2].axisLabel.formatter(1000)).toBe('$1.00K');
+    expect(option.yAxis[1].offset).toBeGreaterThanOrEqual(64);
+    expect(option.grid.outerBoundsMode).toBe('same');
+    expect(option.grid.right).toBe(10);
+    const costSeries = option.series.find((series: { yAxisIndex: number }) => series.yAxisIndex === 2);
+    expect(option.tooltip.formatter([{ dataIndex: 0, data: 1234.5, seriesName: costSeries.name }])).toContain('$1,234.50');
+    act(() => renderer.unmount());
+  });
+
+  it.each([324, 702, 1148])('keeps the multi-axis plot readable in a %i px chart', (width) => {
+    const first = createTimelinePoint({ label: '07/01', requestCount: 0, totalTokens: 0, estimatedCost: 0 });
+    const last = createTimelinePoint({ label: '08/05', requestCount: 8000, totalTokens: 1_200_000_000, estimatedCost: 1000 });
+    mocks.usageState = createUsageState({ timeline: [first, last] });
+    const renderer = renderPage();
+    const chart = renderer.root.findAllByType(EChartsView).find((node) =>
+      Array.isArray(node.props.option.yAxis) && node.props.option.yAxis.length === 3
+    );
+    echarts.use([SVGRenderer]);
+    const instance = echarts.init(null, undefined, { renderer: 'svg', ssr: true, width, height: 350 });
+    try {
+      instance.setOption({ ...chart!.props.option, animation: false });
+      const start = instance.convertToPixel({ xAxisIndex: 0 }, first.label) as number;
+      const end = instance.convertToPixel({ xAxisIndex: 0 }, last.label) as number;
+      expect(end - start).toBeGreaterThan(Math.max(130, width * 0.45));
+    } finally {
+      instance.dispose();
+      act(() => renderer.unmount());
+    }
+  });
+
+  it('uses the unified full plan label in drilldown diagnostics', () => {
+    mocks.usageState = createUsageState({
+      drilldownPreview: [createDrilldownEvent()],
+    });
+    const renderer = renderPage();
+    const text = getText(renderer.root);
+
+    expect(text).toContain('Pro 20x');
+    expect(text).not.toContain('self_serve_business_prolite');
   });
 
   it('renders trends as a focused time-series workspace', () => {
@@ -567,6 +665,96 @@ describe('UsageAnalyticsPage', () => {
       .find((series) => series.name === 'usage_analytics.metric_cached_tokens');
 
     expect(cacheSeries?.data).toEqual([100]);
+  });
+
+  it('keeps zero-request health buckets unavailable in charts and tooltips', () => {
+    const firstPoint = createTimelinePoint({
+      successRate: 0.9,
+      failureRate: 0.1,
+      averageLatencyMs: 500,
+    });
+    const emptyPoint = createTimelinePoint({
+      bucketMs: firstPoint.bucketMs + 60 * 60 * 1000,
+      bucketEndMs: firstPoint.bucketEndMs + 60 * 60 * 1000,
+      label: '06/04 13:00',
+      requestCount: 0,
+      totalTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      successCount: 0,
+      failureCount: 0,
+      successRate: 0,
+      failureRate: 0,
+      averageLatencyMs: null,
+      p95LatencyMs: null,
+      p95TtftMs: null,
+      cacheHitRate: 0,
+      averageTokensPerRequest: 0,
+    });
+    const lastPoint = createTimelinePoint({
+      bucketMs: firstPoint.bucketMs + 2 * 60 * 60 * 1000,
+      bucketEndMs: firstPoint.bucketEndMs + 2 * 60 * 60 * 1000,
+      label: '06/04 14:00',
+      successCount: 10,
+      failureCount: 0,
+      successRate: 1,
+      failureRate: 0,
+      averageLatencyMs: 400,
+    });
+    mocks.usageState = createUsageState({
+      activeTab: 'trends',
+      timeline: [firstPoint, emptyPoint, lastPoint],
+      selectedBucket: null,
+      anomalyAnalysis: null,
+    });
+
+    const renderer = renderPage();
+    const healthChart = renderer.root.findAllByType(EChartsView).find((node) => {
+      const series = (node.props.option?.series ?? []) as Array<{ name?: string }>;
+      return series.some((item) => item.name === 'usage_analytics.success_rate');
+    });
+    const healthOption = healthChart?.props.option as
+      | {
+          series?: Array<{ name?: string; data?: Array<number | null> }>;
+          tooltip?: { formatter?: (params: unknown) => string };
+        }
+      | undefined;
+
+    expect(healthOption).toBeDefined();
+    const findSeriesData = (name: string) =>
+      healthOption?.series?.find((series) => series.name === name)?.data;
+    expect(findSeriesData('usage_analytics.success_rate')).toEqual([0.9, null, 1]);
+    expect(findSeriesData('usage_analytics.failure_rate')).toEqual([0.1, null, 0]);
+    expect(findSeriesData('usage_analytics.metric_average_latency')).toEqual([500, null, 400]);
+
+    const formatter = healthOption?.tooltip?.formatter;
+    if (!formatter) throw new Error('Health chart tooltip formatter not found');
+    const tooltip = formatter([
+      {
+        dataIndex: 1,
+        seriesName: 'usage_analytics.success_rate',
+        data: null,
+        marker: '',
+      },
+      {
+        dataIndex: 1,
+        seriesName: 'usage_analytics.failure_rate',
+        data: null,
+        marker: '',
+      },
+      {
+        dataIndex: 1,
+        seriesName: 'usage_analytics.metric_average_latency',
+        data: null,
+        marker: '',
+      },
+    ]);
+    expect(tooltip.match(/>-<\/strong>/g)).toHaveLength(3);
+    expect(tooltip).not.toContain('0.00%');
+    expect(tooltip).not.toContain('0ms');
   });
 
   it('renders fine-grained cache buckets in rank tables', () => {
@@ -627,6 +815,34 @@ describe('UsageAnalyticsPage', () => {
     expect(getText(renderer.root)).toContain('analytics failed');
   });
 
+  it('shows current and comparison archive coverage separately', () => {
+    mocks.usageState = createUsageState({
+      coverage: {
+        scope: 'time_range',
+        mode: 'mixed',
+        raw_complete: false,
+        core_aggregate_used: true,
+        raw_event_count: 4,
+        raw_deleted_event_count: 2,
+        min_deleted_timestamp_ms: 1,
+        max_deleted_timestamp_ms: 2,
+        comparison_raw_event_count: 0,
+        comparison_raw_deleted_event_count: 3,
+        comparison_min_deleted_timestamp_ms: 3,
+        comparison_max_deleted_timestamp_ms: 4,
+        fidelity_limitations: ['event_details_require_raw_events'],
+      },
+    });
+
+    const renderer = renderPage();
+    const text = getText(renderer.root);
+
+    expect(text).toContain('monitoring.coverage_warning_title');
+    expect(text).toContain('monitoring.coverage_warning_current');
+    expect(text).toContain('monitoring.coverage_warning_comparison');
+    expect(text).toContain('monitoring.coverage_warning_limited');
+  });
+
   it('navigates to request monitoring details for a selected anomaly bucket', () => {
     mocks.usageState = createUsageState({
       filters: {
@@ -679,6 +895,43 @@ describe('UsageAnalyticsPage', () => {
     expect(text).not.toContain('usage_analytics.common_views_title');
   });
 
+  it('excludes fallback API key IDs from API key filter options', () => {
+    mocks.usageState = createUsageState({
+      filterOptions: {
+        models: ['gpt-4o'],
+        api_key_hashes: [' real-filter-hash ', 'unknown-client-api-key:filter-option'],
+        api_key_stats: [
+          {
+            id: 'unknown-client-api-key:stats-row',
+            api_key_hash: '',
+          },
+        ],
+        providers: ['openai'],
+        auth_files: ['auth.json'],
+      },
+      apiKeyRows: [
+        createRankRow({
+          id: 'real-row-hash',
+          label: 'Real API key',
+          apiKeyHash: 'real-row-hash',
+        }),
+        createRankRow({
+          id: 'unknown-client-api-key:rank-row',
+          label: 'Unknown client API key',
+          apiKeyHash: 'unknown-client-api-key:rank-row',
+        }),
+      ],
+    });
+    const renderer = renderPage();
+    const apiKeySelect = renderer.root
+      .findAllByType(Select)
+      .find((node) => node.props.ariaLabel === 'usage_analytics.filter_api_key');
+
+    const values = apiKeySelect?.props.options.map((option: { value: string }) => option.value);
+    expect(values).toEqual(expect.arrayContaining(['all', 'real-filter-hash', 'real-row-hash']));
+    expect(values).toHaveLength(3);
+  });
+
   it('does not render selected filter chips for active filters', () => {
     mocks.usageState = createUsageState({
       filters: {
@@ -729,6 +982,51 @@ describe('UsageAnalyticsPage', () => {
     expect(event.stopPropagation).toHaveBeenCalledTimes(1);
     expect(mocks.copyToClipboard).toHaveBeenCalledWith('sk-client-key-original');
     expect(usageState.setSelectedApiKeyHash).not.toHaveBeenCalled();
+  });
+
+  it('keeps fallback API key rows visible without filter or drilldown actions', () => {
+    const fallbackRow = createRankRow({
+      id: 'unknown-client-api-key:rank-row',
+      label: 'Unknown client API key',
+      apiKeyHash: 'unknown-client-api-key:rank-row',
+      model: undefined,
+      contexts: [],
+      models: [],
+    });
+    const usageState = createUsageState({
+      activeTab: 'apiKeys',
+      apiKeyRows: [fallbackRow],
+      selectedApiKey: fallbackRow,
+      keyAnomalies: [
+        {
+          id: fallbackRow.id,
+          label: fallbackRow.label,
+          severity: 'medium',
+          reasonKey: 'usage_analytics.anomaly_reason_error_rate',
+          triggeredAtMs: 1_780_000_000_000,
+          row: fallbackRow,
+        },
+      ],
+    });
+    mocks.usageState = usageState;
+    const renderer = renderPage();
+    const rankRow = renderer.root
+      .findAllByType('tr')
+      .find((node) => getText(node).includes('Unknown client API key'));
+    if (!rankRow) throw new Error('Fallback API key rank row not found');
+
+    act(() => {
+      rankRow.props.onClick();
+    });
+
+    expect(getText(renderer.root)).toContain('Unknown client API key');
+    expect(usageState.setSelectedApiKeyHash).not.toHaveBeenCalled();
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .filter((node) => getText(node).includes('usage_analytics.view_request_details'))
+    ).toHaveLength(0);
+    expect(mocks.navigate).not.toHaveBeenCalled();
   });
 
   it('renders the API Key tab with key-dimension cards, unit-economics columns, and anomaly drilldown', () => {
@@ -789,6 +1087,83 @@ describe('UsageAnalyticsPage', () => {
       apiKeyHash: 'abcdef1234567890',
     });
     expect(usageState.setActiveTab).toHaveBeenCalledWith('heatmap');
+  });
+
+  it('caps API key ranking at the shared limit and exposes the filtered total', () => {
+    const apiKeyRows = createApiKeyRows(23);
+    mocks.usageState = createUsageState({
+      activeTab: 'apiKeys',
+      apiKeyRows,
+      keyAnomalies: [],
+      selectedApiKey: apiKeyRows[0],
+      selectedApiKeyTrendSeries: [],
+    });
+    const renderer = renderPage();
+    const rankSection = renderer.root
+      .findAllByType('section')
+      .find((section) =>
+        section
+          .findAllByType('h2')
+          .some((heading) => getText(heading) === 'usage_analytics.api_key_rank_title')
+      );
+    if (!rankSection) throw new Error('API key rank section not found');
+    const rankBody = rankSection.findAllByType('tbody')[0];
+    if (!rankBody) throw new Error('API key rank body not found');
+
+    const rankRows = rankBody.findAllByType('tr');
+    const text = getText(renderer.root);
+    expect(rankRows).toHaveLength(8);
+    expect(getText(rankRows[7])).toContain('client-key-8');
+    expect(getText(rankRows[7])).not.toContain('client-key-9');
+    expect(text).toContain('usage_analytics.api_key_rank_context_top');
+    expect(mocks.translationCalls).toContainEqual([
+      'usage_analytics.api_key_rank_context_top',
+      { limit: 8, total: 23 },
+    ]);
+    expect(text).not.toContain('usage_analytics.rank_show_all');
+    expect(text).not.toContain('usage_analytics.rank_collapse');
+  });
+
+  it.each([5, 8])('shows all %s API keys without a misleading Top-8 label', (total) => {
+    const apiKeyRows = createApiKeyRows(total);
+    mocks.usageState = createUsageState({
+      activeTab: 'apiKeys',
+      filters: {
+        ...USAGE_ANALYTICS_DEFAULT_FILTERS,
+        apiKeyKeyword: 'client-key',
+      },
+      apiKeyRows,
+      filterOptions: {
+        models: ['gpt-4o'],
+        api_key_hashes: createApiKeyRows(23).map((row) => row.apiKeyHash || row.id),
+        providers: ['codex'],
+        auth_files: ['auth.json'],
+      },
+      keyAnomalies: [],
+      selectedApiKey: apiKeyRows[0],
+      selectedApiKeyTrendSeries: [],
+    });
+    const renderer = renderPage();
+    const rankSection = renderer.root
+      .findAllByType('section')
+      .find((section) =>
+        section
+          .findAllByType('h2')
+          .some((heading) => getText(heading) === 'usage_analytics.api_key_rank_title')
+      );
+    if (!rankSection) throw new Error('API key rank section not found');
+    const rankBody = rankSection.findAllByType('tbody')[0];
+    if (!rankBody) throw new Error('API key rank body not found');
+
+    const text = getText(renderer.root);
+    expect(rankBody.findAllByType('tr')).toHaveLength(total);
+    expect(text).toContain('usage_analytics.api_key_rank_context_total');
+    expect(text).not.toContain('usage_analytics.api_key_rank_context_top');
+    expect(mocks.translationCalls).toContainEqual([
+      'usage_analytics.api_key_rank_context_total',
+      { total },
+    ]);
+    expect(text).not.toContain('usage_analytics.rank_show_all');
   });
 
   it('renders the models tab with unit-economics columns and no insights panel', () => {
@@ -911,6 +1286,7 @@ describe('UsageAnalyticsPage', () => {
     mocks.usageState = createUsageState({
       activeTab: 'credentials',
       credentialTrendLoading: true,
+      credentialTrendSeries: [],
     });
     let renderer = renderPage();
     expect(getText(renderer.root)).toContain('common.loading');
@@ -918,12 +1294,62 @@ describe('UsageAnalyticsPage', () => {
     mocks.usageState = createUsageState({
       activeTab: 'credentials',
       credentialTrendError: 'timeline failed',
+      credentialTrendSeries: [],
     });
     renderer = renderPage();
     const text = getText(renderer.root);
     expect(text).toContain('usage_analytics.error_title');
     expect(text).toContain('timeline failed');
   });
+
+  it.each(['credentials', 'heatmap'] as const)(
+    'retains a successful empty %s snapshot during refresh, failure, and recovery',
+    (tab) => {
+      const state = createUsageState({
+        activeTab: tab,
+        credentialTrendLoaded: true,
+        credentialTrendSeries: [],
+        heatmapDateLoaded: true,
+        heatmapDetail: null,
+        selectedHeatmapCell: { weekday: 1, hour: 9 },
+        selectedHeatmapDateKey: '2026-06-08',
+      });
+      mocks.usageState = state;
+      const renderer = renderPage();
+      const panel = () => renderer.root.find(n => typeof n.type === 'function' && n.type.name === (tab === 'credentials' ? 'EntityTrendChart' : 'HeatmapDetailPanel'));
+      const emptyLabel = tab === 'credentials' ? 'usage_analytics.empty_title' : 'usage_analytics.heatmap_date_empty';
+      for (const phase of ['pending', 'failure', 'recovery']) {
+        Object.assign(state, {
+          credentialTrendLoading: phase === 'pending',
+          heatmapDateLoading: phase === 'pending',
+          credentialTrendError: phase === 'failure' ? 'empty refresh offline' : '',
+          heatmapDateError: phase === 'failure' ? 'empty refresh offline' : '',
+        });
+        act(() => renderer.update(<UsageAnalyticsPage />));
+        expect(getText(panel())).toContain(emptyLabel);
+        expect(getText(panel())).not.toContain('common.loading');
+        expect(panel().findAllByProps({ role: 'alert' }).length).toBe(phase === 'failure' ? 1 : 0);
+      }
+    }
+  );
+
+  it.each([true, false])(
+    'keeps the credential trend visible during pending/failure revalidation (loading=%s)',
+    (loading) => {
+      mocks.usageState = createUsageState({
+        activeTab: 'credentials',
+        credentialTrendLoading: loading,
+        credentialTrendError: loading ? '' : 'refresh offline',
+      });
+      const renderer = renderPage();
+      expect(
+        renderer.root
+          .findAllByType(EChartsView)
+          .some((node) => node.props.ariaLabel === 'usage_analytics.entity_trend_title')
+      ).toBe(true);
+      if (!loading) expect(getText(renderer.root)).toContain('refresh offline');
+    }
+  );
 
   it('renders the heatmap tab as a focused time-window workspace', () => {
     const usageState = createUsageState({ activeTab: 'heatmap' });
@@ -1072,43 +1498,47 @@ describe('UsageAnalyticsPage', () => {
     expect(text).not.toContain('usage_analytics.heatmap_focus_title');
   });
 
-  it('keeps heatmap detail content mounted while a date tab refreshes', () => {
-    const point = {
-      weekday: 1,
-      hour: 9,
-      requestCount: 12,
-      successCount: 11,
-      failureCount: 1,
-      totalTokens: 1200,
-      estimatedCost: 1.25,
-      failureRate: 1 / 12,
-    };
-    mocks.usageState = createUsageState({
-      activeTab: 'heatmap',
-      heatmapDateLoading: true,
-      heatmapDetail: {
-        point,
-        metricValue: 12,
-        overallBaseline: 12,
-        weekdayBaseline: 12,
-        hourBaseline: 12,
-        overallDelta: 0,
-        weekdayDelta: 0,
-        hourDelta: 0,
-        rank: 1,
-        totalCells: 1,
-      },
-      selectedHeatmapCell: { weekday: 1, hour: 9 },
-      selectedHeatmapDateKey: '2026-06-08',
-    });
-    const renderer = renderPage();
-    const text = getText(renderer.root);
+  it.each([true, false])(
+    'keeps heatmap detail content mounted during pending/failure (loading=%s)',
+    (loading) => {
+      const point = {
+        weekday: 1,
+        hour: 9,
+        requestCount: 12,
+        successCount: 11,
+        failureCount: 1,
+        totalTokens: 1200,
+        estimatedCost: 1.25,
+        failureRate: 1 / 12,
+      };
+      mocks.usageState = createUsageState({
+        activeTab: 'heatmap',
+        heatmapDateLoading: loading,
+        heatmapDateError: loading ? '' : 'date refresh offline',
+        heatmapDetail: {
+          point,
+          metricValue: 12,
+          overallBaseline: 12,
+          weekdayBaseline: 12,
+          hourBaseline: 12,
+          overallDelta: 0,
+          weekdayDelta: 0,
+          hourDelta: 0,
+          rank: 1,
+          totalCells: 1,
+        },
+        selectedHeatmapCell: { weekday: 1, hour: 9 },
+        selectedHeatmapDateKey: '2026-06-08',
+      });
+      const renderer = renderPage();
+      const text = getText(renderer.root);
 
-    expect(text).toContain('common.loading');
-    expect(text).toContain('usage_analytics.metric_request_count');
-    expect(text).toContain('usage_analytics.metric_total_tokens');
-    expect(text).not.toContain('usage_analytics.heatmap_date_empty');
-  });
+      expect(text).toContain(loading ? 'common.loading' : 'date refresh offline');
+      expect(text).toContain('usage_analytics.metric_request_count');
+      expect(text).toContain('usage_analytics.metric_total_tokens');
+      expect(text).not.toContain('usage_analytics.heatmap_date_empty');
+    }
+  );
 
   it('offers time range and status controls that update usage filters', () => {
     const usageState = createUsageState();

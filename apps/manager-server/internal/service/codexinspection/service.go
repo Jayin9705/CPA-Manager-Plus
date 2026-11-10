@@ -22,13 +22,16 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/codexquota"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
 	codexinspectionrepo "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/codexinspection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/cpa"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/cpaauthfiles"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/credentialpolicy"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/managerconfig"
+	quotasnapshotsvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/quotasnapshot"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/store"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
 const (
@@ -72,6 +75,7 @@ type Service struct {
 	managerConfigService *managerconfig.Service
 	client               *http.Client
 	authFileMutations    *cpaauthfiles.MutationCoordinator
+	quotaSnapshots       quotaSnapshotWriter
 
 	mu                             sync.Mutex
 	cancelMu                       sync.Mutex
@@ -91,6 +95,10 @@ type Service struct {
 	manualActionPersistenceTimeout time.Duration
 	logMu                          sync.Mutex
 	logGate                        chan struct{}
+}
+
+type quotaSnapshotWriter interface {
+	WriteCodexInspectionResult(context.Context, model.CodexInspectionResult) error
 }
 
 type ServiceOptions struct {
@@ -163,19 +171,21 @@ type ExecuteActionsResult struct {
 type authFile map[string]any
 
 type account struct {
-	Key              string
-	RuntimeID        string
-	FileName         string
-	DisplayAccount   string
-	AccountSnapshot  string
-	AuthIndex        string
-	AccountID        string
-	Provider         string
-	Disabled         bool
-	AutoRecoverOwned bool
-	Status           string
-	State            string
-	File             authFile
+	Key                    string
+	RuntimeID              string
+	FileName               string
+	DisplayAccount         string
+	AccountSnapshot        string
+	AccountSnapshotInvalid bool
+	AuthIndex              string
+	AccountID              string
+	AccountIDInvalid       bool
+	Provider               string
+	Disabled               bool
+	AutoRecoverOwned       bool
+	Status                 string
+	State                  string
+	File                   authFile
 }
 
 type apiCallResponse struct {
@@ -218,7 +228,7 @@ const (
 
 const (
 	fileActionDuplicateReason       = "该认证目标已由另一条结果处理"
-	fileActionMixedReason           = "同一认证文件下存在多个不同建议动作，文件级处理已阻止，请到认证文件管理中手动处理"
+	fileActionMixedReason           = "同一认证文件下存在多个不同建议动作，文件级处理已阻止，请到凭证管理中手动处理"
 	fileDeleteCoverageReason        = "实时认证文件包含未被删除建议完整覆盖的凭证，文件级删除已阻止，请人工确认"
 	inspectionIdentityMissingReason = "巡检结果缺少稳定账号标识，已阻止处理，请人工确认"
 	statusMutationScopeReason       = "当前凭证缺少可安全独立修改的运行时标识，或该标识代表共享源文件，已阻止状态修改，请人工确认"
@@ -248,6 +258,19 @@ type codexClassifiedWindows struct {
 type codexWindowMeta struct {
 	ID       string
 	LabelKey string
+}
+
+type codexAdditionalRateLimitFamily struct {
+	sourceIndex        int
+	rateInfo           *codexRateLimit
+	limitName          string
+	modelScope         codexquota.ModelScope
+	baseIDPrefix       string
+	featureIDPrefix    string
+	legacyBaseIDPrefix string
+	legacyPrefixes     []string
+	idPrefix           string
+	sortKey            string
 }
 
 func (w codexClassifiedWindows) longWindow() *codexWindow {
@@ -315,6 +338,7 @@ func NewWithOptions(st *store.Store, managerConfigService *managerconfig.Service
 		managerConfigService:           managerConfigService,
 		client:                         client,
 		authFileMutations:              authFileMutations,
+		quotaSnapshots:                 quotasnapshotsvc.New(st),
 		ownerID:                        ownerID,
 		leaseDuration:                  leaseDuration,
 		heartbeatInterval:              heartbeatInterval,
@@ -1800,6 +1824,12 @@ func (s *Service) inspectSingleAccount(
 	}
 	base.PlanType = planType
 	base.QuotaWindows = buildCodexInspectionQuotaWindows(payload, planType)
+	base.QuotaInventoryObserved = codexQuotaInventoryObserved(payload)
+	if base.QuotaInventoryObserved && len(base.QuotaWindows) == 0 {
+		// Preserve the distinction between an explicitly observed empty inventory
+		// and a successful response whose quota schema could not be recognized.
+		base.QuotaWindowsJSON = "[]"
+	}
 	base.Error = ""
 	if statusCode < 200 || statusCode >= 300 {
 		base.ErrorKind = "http_status"
@@ -2230,6 +2260,16 @@ func (s *Service) executeAction(
 	sourceMembers []model.CodexInspectionResult,
 	automatic bool,
 ) error {
+	if automatic && normalizeInspectionProvider(item.Provider) == "codex" {
+		if strings.TrimSpace(item.AuthIndex) == "" {
+			return errors.New(inspectionIdentityMissingReason)
+		}
+		for _, member := range sourceMembers {
+			if normalizeInspectionProvider(member.Provider) == "codex" && strings.TrimSpace(member.AuthIndex) == "" {
+				return errors.New(inspectionIdentityMissingReason)
+			}
+		}
+	}
 	fileNames := make([]string, 0, len(sourceMembers)+1)
 	fileNames = append(fileNames, item.FileName)
 	for _, member := range sourceMembers {
@@ -2410,11 +2450,12 @@ func (s *Service) executeAction(
 }
 
 func inspectionAuthFileIdentity(item model.CodexInspectionResult) cpaauthfiles.Identity {
+	provider := normalizeInspectionProvider(item.Provider)
 	return cpaauthfiles.Identity{
 		AuthFileName:      strings.TrimSpace(item.FileName),
 		AuthIndex:         strings.TrimSpace(item.AuthIndex),
-		Provider:          strings.TrimSpace(item.Provider),
-		AccountSnapshot:   directInspectionAccountSnapshot(item.FileName, item.AccountSnapshot),
+		Provider:          provider,
+		AccountSnapshot:   inspectionAccountSnapshot(provider, item.FileName, item.AccountSnapshot),
 		AccountIDSnapshot: strings.TrimSpace(item.AccountID),
 	}
 }
@@ -3137,14 +3178,21 @@ func inspectionActionIdentityKey(result model.CodexInspectionResult) string {
 
 func inspectionIdentityKey(fileName, provider, authIndex, accountID, accountSnapshot string) string {
 	fileName = strings.TrimSpace(fileName)
+	provider = normalizeInspectionProvider(provider)
 	accountID = strings.TrimSpace(accountID)
-	normalizedAccountSnapshot := ""
-	if accountID == "" {
-		normalizedAccountSnapshot = directInspectionAccountSnapshot(fileName, accountSnapshot)
+	normalizedAccountSnapshot := inspectionAccountSnapshot(provider, fileName, accountSnapshot)
+	if provider == "codex" && normalizedAccountSnapshot == "" {
+		// chatgpt_account_id identifies a shared Workspace, not a member. Do
+		// not let a Workspace-only result become the identity used to group or
+		// mutate a credential when the credential-level fallback is absent.
+		accountID = ""
+	}
+	if provider != "codex" && accountID != "" {
+		normalizedAccountSnapshot = ""
 	}
 	encoded, _ := json.Marshal([]string{
 		fileName,
-		normalizeInspectionProvider(provider),
+		provider,
 		strings.TrimSpace(authIndex),
 		accountID,
 		normalizedAccountSnapshot,
@@ -3153,12 +3201,19 @@ func inspectionIdentityKey(fileName, provider, authIndex, accountID, accountSnap
 }
 
 func hasInspectionActionIdentity(result model.CodexInspectionResult) bool {
-	if strings.TrimSpace(result.FileName) == "" || normalizeInspectionProvider(result.Provider) == "" {
+	fileName := strings.TrimSpace(result.FileName)
+	provider := normalizeInspectionProvider(result.Provider)
+	if fileName == "" || provider == "" {
 		return false
 	}
-	return strings.TrimSpace(result.AuthIndex) != "" ||
-		strings.TrimSpace(result.AccountID) != "" ||
-		directInspectionAccountSnapshot(result.FileName, result.AccountSnapshot) != ""
+	if provider == "codex" {
+		return strings.TrimSpace(result.AuthIndex) != ""
+	}
+	if strings.TrimSpace(result.AuthIndex) != "" {
+		return true
+	}
+	return strings.TrimSpace(result.AccountID) != "" ||
+		inspectionAccountSnapshot(provider, fileName, result.AccountSnapshot) != ""
 }
 
 func allowAutoAction(mode string, autoRecoverEnabled bool, result model.CodexInspectionResult) bool {
@@ -3184,6 +3239,14 @@ func (s *Service) applyDisableOwnership(ctx context.Context, accounts []account,
 		return
 	}
 	for _, item := range items {
+		if disableOwnershipHasDuplicateCredentialLocator(item, accounts) {
+			logger.warning(ctx, "巡检禁用所有权凭证定位不唯一，跳过自动恢复", map[string]any{
+				"fileName":  item.FileName,
+				"authIndex": item.AuthIndex,
+				"provider":  item.Provider,
+			})
+			continue
+		}
 		matchedIndexes := make([]int, 0, 1)
 		disabledMatchCount := 0
 		for index := range accounts {
@@ -3193,6 +3256,18 @@ func (s *Service) applyDisableOwnership(ctx context.Context, accounts []account,
 					disabledMatchCount++
 				}
 			}
+		}
+		if len(matchedIndexes) > 1 && strings.TrimSpace(item.AuthIndex) != "" {
+			// A legacy ownership row with a credential locator is still useful,
+			// but duplicate credentials must not be narrowed by Workspace/member
+			// evidence. Keep the row for a later unambiguous inventory instead of
+			// authorizing recovery or deleting the ownership record.
+			logger.warning(ctx, "巡检禁用所有权匹配到多个凭证，跳过自动恢复", map[string]any{
+				"fileName":  item.FileName,
+				"authIndex": item.AuthIndex,
+				"provider":  item.Provider,
+			})
+			continue
 		}
 		if len(matchedIndexes) != 1 || disabledMatchCount == 0 {
 			if err := s.store.DeleteCodexInspectionDisableOwnership(ctx, disableOwnershipTarget(item)); err != nil {
@@ -3208,36 +3283,56 @@ func (s *Service) applyDisableOwnership(ctx context.Context, accounts []account,
 	}
 }
 
+func disableOwnershipHasDuplicateCredentialLocator(
+	item model.CodexInspectionDisableOwnership,
+	accounts []account,
+) bool {
+	fileName := strings.TrimSpace(item.FileName)
+	authIndex := strings.TrimSpace(item.AuthIndex)
+	provider := normalizeInspectionProvider(item.Provider)
+	if fileName == "" || authIndex == "" || provider == "" {
+		return false
+	}
+	count := 0
+	for _, candidate := range accounts {
+		if strings.TrimSpace(candidate.FileName) != fileName ||
+			normalizeInspectionProvider(candidate.Provider) != provider ||
+			strings.TrimSpace(candidate.AuthIndex) != authIndex {
+			continue
+		}
+		count++
+		if count > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 func disableOwnershipMatchesAccount(item model.CodexInspectionDisableOwnership, candidate account) bool {
 	provider := normalizeInspectionProvider(item.Provider)
 	candidateProvider := normalizeInspectionProvider(candidate.Provider)
 	if provider == "" || candidateProvider == "" {
 		return false
 	}
-	if candidate.FileName != strings.TrimSpace(item.FileName) ||
+	if strings.TrimSpace(candidate.FileName) != strings.TrimSpace(item.FileName) ||
 		candidateProvider != provider {
 		return false
 	}
-	authIndex := strings.TrimSpace(item.AuthIndex)
-	if authIndex != "" && candidate.AuthIndex != authIndex {
-		return false
-	}
-	accountID := strings.TrimSpace(item.AccountID)
-	if accountID != "" {
-		return strings.TrimSpace(candidate.AccountID) == accountID
-	}
-	accountSnapshot := directInspectionAccountSnapshot(item.FileName, item.AccountSnapshot)
-	if accountSnapshot == "" {
-		return authIndex != ""
-	}
-	return directInspectionAccountSnapshot(candidate.FileName, candidate.AccountSnapshot) == accountSnapshot
+	return inspectionIdentityMatchesAccount(
+		provider,
+		item.FileName,
+		item.AuthIndex,
+		item.AccountID,
+		item.AccountSnapshot,
+		candidate,
+	)
 }
 
 func disableOwnershipTarget(item model.CodexInspectionDisableOwnership) model.CodexInspectionDisableOwnershipTarget {
 	provider := normalizeInspectionProvider(item.Provider)
 	authIndex := strings.TrimSpace(item.AuthIndex)
 	accountID := strings.TrimSpace(item.AccountID)
-	accountSnapshot := directInspectionAccountSnapshot(item.FileName, item.AccountSnapshot)
+	accountSnapshot := inspectionAccountSnapshot(provider, item.FileName, item.AccountSnapshot)
 	return model.CodexInspectionDisableOwnershipTarget{
 		FileName:        strings.TrimSpace(item.FileName),
 		Provider:        &provider,
@@ -3287,7 +3382,7 @@ func selectManualActionItems(
 			outcomes = append(outcomes, skippedActionOutcome(result, result.Action, "该建议动作已跳过"))
 			continue
 		case model.CodexInspectionActionStatusNeedsReview:
-			outcomes = append(outcomes, needsReviewActionOutcome(result, result.Action, "该建议动作需要到认证文件管理中人工处理"))
+			outcomes = append(outcomes, needsReviewActionOutcome(result, result.Action, "该建议动作需要到凭证管理中人工处理"))
 			continue
 		}
 		if fileName == "" {
@@ -3706,23 +3801,14 @@ func inspectionResultMatchesCurrentAccount(result model.CodexInspectionResult, c
 	if provider == "" || currentProvider == "" || provider != currentProvider {
 		return false
 	}
-	authIndex := strings.TrimSpace(result.AuthIndex)
-	accountID := strings.TrimSpace(result.AccountID)
-	if authIndex != "" && authIndex != strings.TrimSpace(current.AuthIndex) {
-		return false
-	}
-	if accountID != "" {
-		return accountID == strings.TrimSpace(current.AccountID)
-	}
-	accountSnapshot := directInspectionAccountSnapshot(result.FileName, result.AccountSnapshot)
-	if accountSnapshot == "" {
-		return authIndex != ""
-	}
-	currentSnapshot := directInspectionAccountSnapshot(current.FileName, current.AccountSnapshot)
-	if currentSnapshot == "" {
-		return false
-	}
-	return accountSnapshot == currentSnapshot
+	return inspectionIdentityMatchesAccount(
+		provider,
+		result.FileName,
+		result.AuthIndex,
+		result.AccountID,
+		result.AccountSnapshot,
+		current,
+	)
 }
 
 func directInspectionAccountSnapshot(fileName, value string) string {
@@ -3731,6 +3817,64 @@ func directInspectionAccountSnapshot(fileName, value string) string {
 		return ""
 	}
 	return snapshot
+}
+
+func inspectionAccountSnapshot(provider, fileName, value string) string {
+	snapshot := directInspectionAccountSnapshot(fileName, value)
+	if normalizeInspectionProvider(provider) != "codex" {
+		return snapshot
+	}
+	member, ok := usageidentity.NormalizeCodexMemberSnapshot(snapshot)
+	if !ok {
+		return ""
+	}
+	return member
+}
+
+func inspectionIdentityMatchesAccount(
+	provider, fileName, authIndex, accountID, accountSnapshot string,
+	candidate account,
+) bool {
+	if normalizeInspectionProvider(provider) == "codex" &&
+		(candidate.AccountIDInvalid || candidate.AccountSnapshotInvalid) {
+		return false
+	}
+	authIndex = strings.TrimSpace(authIndex)
+	if authIndex != "" && authIndex != strings.TrimSpace(candidate.AuthIndex) {
+		return false
+	}
+	accountID = strings.TrimSpace(accountID)
+	member := inspectionAccountSnapshot(provider, fileName, accountSnapshot)
+	if normalizeInspectionProvider(provider) == "codex" {
+		candidateAccountID := strings.TrimSpace(candidate.AccountID)
+		candidateMember := inspectionAccountSnapshot(candidate.Provider, candidate.FileName, candidate.AccountSnapshot)
+		if accountID != "" {
+			if candidateAccountID != "" && candidateAccountID != accountID {
+				return false
+			}
+			if member != "" && candidateMember != "" && candidateMember != member {
+				return false
+			}
+			return authIndex != ""
+		}
+		if member != "" {
+			if candidateMember != "" && candidateMember != member {
+				return false
+			}
+			return authIndex != ""
+		}
+		// A Workspace-only ownership record is not a recovery identity. An
+		// auth-index match is still a credential-level fallback, but a wildcard
+		// record must fail closed even when only one candidate is present.
+		return authIndex != ""
+	}
+	if accountID != "" {
+		return accountID == strings.TrimSpace(candidate.AccountID)
+	}
+	if member == "" {
+		return authIndex != ""
+	}
+	return member == directInspectionAccountSnapshot(candidate.FileName, candidate.AccountSnapshot)
 }
 
 func matchCurrentAccount(candidates []account, result model.CodexInspectionResult) (account, bool) {
@@ -3962,7 +4106,7 @@ func (s *Service) persistInspectionResults(
 		}
 		result.RunID = runID
 		writeCtx, cancel := context.WithTimeout(persistCtx, resultWriteTimeout)
-		_, err := s.store.InsertCodexInspectionResult(writeCtx, result)
+		stored, err := s.store.InsertCodexInspectionResult(writeCtx, result)
 		cancel()
 		if err != nil {
 			failures++
@@ -3971,6 +4115,20 @@ func (s *Service) persistInspectionResults(
 				"displayAccount": result.DisplayAccount,
 				"retryScheduled": true,
 				"error":          err.Error(),
+			})
+			continue
+		}
+		results[index] = stored
+		snapshotCtx, snapshotCancel := context.WithTimeout(persistCtx, resultWriteTimeout)
+		snapshotErr := s.quotaSnapshots.WriteCodexInspectionResult(snapshotCtx, stored)
+		snapshotCancel()
+		if snapshotErr != nil {
+			failures++
+			logger.warning(ctx, "写入巡检额度快照失败", map[string]any{
+				"fileName":       result.FileName,
+				"displayAccount": result.DisplayAccount,
+				"retryScheduled": true,
+				"error":          snapshotErr.Error(),
 			})
 		}
 	}
@@ -4112,26 +4270,30 @@ func countAccounts(items []account, disabled bool) int {
 }
 
 func toAccount(file authFile) account {
-	fileName := firstNonEmpty(readString(file, "name"), readString(file, "id"), normalizeAuthIndex(file["auth_index"]), normalizeAuthIndex(file["authIndex"]), "unknown-auth-file")
-	authIndex := firstNonEmpty(normalizeAuthIndex(file["auth_index"]), normalizeAuthIndex(file["authIndex"]), normalizeAuthIndex(file["auth-index"]))
-	provider := normalizeInspectionProvider(firstNonEmpty(readString(file, "provider"), readString(file, "type")))
-	runtimeID := readString(file, "id")
-	accountSnapshot := firstNonEmpty(
+	parsed := cpaauthfiles.FromMap(map[string]any(file))
+	fileName := firstNonEmpty(parsed.Name, normalizeAuthIndex(file["auth_index"]), normalizeAuthIndex(file["authIndex"]), "unknown-auth-file")
+	authIndex := parsed.AuthIndex
+	provider := parsed.Provider
+	runtimeID := parsed.ID
+	displaySnapshot := firstNonEmpty(
 		readString(file, "account"),
 		readString(file, "email"),
 		readString(file, "display_account"),
 		readString(file, "displayAccount"),
 	)
+	accountSnapshot := parsed.AccountSnapshot
+	accountSnapshotInvalid := parsed.AccountSnapshotInvalid
 	displayAccount := firstNonEmpty(
-		accountSnapshot,
+		displaySnapshot,
 		readString(file, "label"),
 		fileName,
 	)
-	accountID := resolveCodexAccountID(file)
+	accountID := parsed.AccountID
+	accountIDInvalid := parsed.AccountIDInvalid
 	key := fileName + "::" + authIndex
 	if authIndex == "" {
 		switch {
-		case accountID != "" || accountSnapshot != "":
+		case accountSnapshot != "" || (provider != "codex" && accountID != ""):
 			key = fileName + "::-::" + inspectionIdentityKey(fileName, provider, authIndex, accountID, accountSnapshot)
 		case strings.TrimSpace(runtimeID) != "" && strings.TrimSpace(runtimeID) != strings.TrimSpace(fileName):
 			encoded, _ := json.Marshal([]string{provider, strings.TrimSpace(runtimeID)})
@@ -4141,18 +4303,20 @@ func toAccount(file authFile) account {
 		}
 	}
 	return account{
-		Key:             key,
-		RuntimeID:       runtimeID,
-		FileName:        fileName,
-		DisplayAccount:  displayAccount,
-		AccountSnapshot: accountSnapshot,
-		AuthIndex:       authIndex,
-		AccountID:       accountID,
-		Provider:        provider,
-		Disabled:        isDisabledAuthFile(file),
-		Status:          readString(file, "status"),
-		State:           readString(file, "state"),
-		File:            file,
+		Key:                    key,
+		RuntimeID:              runtimeID,
+		FileName:               fileName,
+		DisplayAccount:         displayAccount,
+		AccountSnapshot:        accountSnapshot,
+		AccountSnapshotInvalid: accountSnapshotInvalid,
+		AuthIndex:              authIndex,
+		AccountID:              accountID,
+		AccountIDInvalid:       accountIDInvalid,
+		Provider:               provider,
+		Disabled:               isDisabledAuthFile(file),
+		Status:                 readString(file, "status"),
+		State:                  readString(file, "state"),
+		File:                   file,
 	}
 }
 
@@ -4165,59 +4329,6 @@ func normalizeInspectionProvider(value string) string {
 	default:
 		return normalized
 	}
-}
-
-func resolveCodexAccountID(file authFile) string {
-	metadata := readMap(file, "metadata")
-	attributes := readMap(file, "attributes")
-	candidates := []any{
-		file["chatgpt_account_id"],
-		file["chatgptAccountId"],
-		file["account_id"],
-		file["accountId"],
-		metadata["chatgpt_account_id"],
-		metadata["chatgptAccountId"],
-		metadata["account_id"],
-		metadata["accountId"],
-		attributes["chatgpt_account_id"],
-		attributes["chatgptAccountId"],
-		attributes["account_id"],
-		attributes["accountId"],
-	}
-	for _, candidate := range candidates {
-		if id := extractDirectCodexAccountID(candidate); id != "" {
-			return id
-		}
-	}
-	tokenCandidates := []any{
-		file["id_token"],
-		metadata["id_token"],
-		attributes["id_token"],
-	}
-	for _, candidate := range tokenCandidates {
-		if id := extractCodexAccountIDFromToken(candidate); id != "" {
-			return id
-		}
-	}
-	return ""
-}
-
-func extractDirectCodexAccountID(value any) string {
-	if direct := readPlainString(value); direct != "" {
-		return direct
-	}
-	if direct := readAccountIDCandidate(value); direct != "" {
-		return direct
-	}
-	return ""
-}
-
-func extractCodexAccountIDFromToken(value any) string {
-	payload := parseIDTokenPayload(value)
-	if payload == nil {
-		return ""
-	}
-	return readAccountIDCandidate(payload)
 }
 
 func resolveCodexPlanType(file authFile) string {
@@ -4264,27 +4375,6 @@ func readCodexPlanTypeCandidate(value any) string {
 	default:
 		return normalizeCodexPlanType(fmt.Sprint(value))
 	}
-}
-
-func readPlainString(value any) string {
-	text, ok := value.(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(text)
-}
-
-func readAccountIDCandidate(value any) string {
-	record, ok := value.(map[string]any)
-	if !ok {
-		return ""
-	}
-	return firstNonEmpty(
-		readString(record, "chatgpt_account_id"),
-		readString(record, "chatgptAccountId"),
-		readString(record, "account_id"),
-		readString(record, "accountId"),
-	)
 }
 
 func parseIDTokenPayload(value any) map[string]any {
@@ -4407,9 +4497,11 @@ func buildCodexInspectionQuotaWindows(payload map[string]any, planType string) [
 		codexWindowMeta{ID: "five-hour", LabelKey: "codex_quota.primary_window"},
 		codexWindowMeta{ID: "weekly", LabelKey: "codex_quota.secondary_window"},
 		codexWindowMeta{ID: "monthly", LabelKey: "codex_quota.monthly_window"},
+		"",
 		"codex_quota.generic_window",
 		nil,
 		teamPlan,
+		codexquota.MainScope(),
 	)
 	addCodexRateLimitWindows(
 		&windows,
@@ -4417,12 +4509,40 @@ func buildCodexInspectionQuotaWindows(payload map[string]any, planType string) [
 		codexWindowMeta{ID: "code-review-five-hour", LabelKey: "codex_quota.code_review_primary_window"},
 		codexWindowMeta{ID: "code-review-weekly", LabelKey: "codex_quota.code_review_secondary_window"},
 		codexWindowMeta{ID: "code-review-monthly", LabelKey: "codex_quota.code_review_monthly_window"},
+		"code-review",
 		"codex_quota.code_review_generic_window",
 		nil,
 		teamPlan,
+		codexquota.CodeReviewScope(),
 	)
 	addAdditionalRateLimitWindows(&windows, readMapSlice(payload, "additional_rate_limits", "additionalRateLimits"), teamPlan)
 	return windows
+}
+
+func codexQuotaInventoryObserved(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	for _, key := range []string{"rate_limit", "rateLimit", "code_review_rate_limit", "codeReviewRateLimit"} {
+		raw, exists := payload[key]
+		if !exists {
+			continue
+		}
+		if _, ok := raw.(map[string]any); ok {
+			return true
+		}
+	}
+	for _, key := range []string{"additional_rate_limits", "additionalRateLimits"} {
+		raw, exists := payload[key]
+		if !exists {
+			continue
+		}
+		switch raw.(type) {
+		case []any, []map[string]any:
+			return true
+		}
+	}
+	return false
 }
 
 func addCodexRateLimitWindows(
@@ -4431,24 +4551,26 @@ func addCodexRateLimitWindows(
 	fiveHourMeta codexWindowMeta,
 	weeklyMeta codexWindowMeta,
 	monthlyMeta codexWindowMeta,
+	genericIDPrefix string,
 	genericLabelKey string,
 	genericLabelParams map[string]any,
 	teamPlan bool,
+	modelScope codexquota.ModelScope,
 ) {
 	if limit == nil {
 		return
 	}
 	classified := classifyWindows(limit, codexPlanTypeForTeam(teamPlan))
 	added := make(map[*codexWindow]bool)
-	addCodexWindowInfo(windows, fiveHourMeta.ID, fiveHourMeta.LabelKey, genericLabelParams, classified.FiveHour, limit.LimitReached, limit.Allowed)
+	addCodexWindowInfo(windows, fiveHourMeta.ID, fiveHourMeta.LabelKey, genericLabelParams, classified.FiveHour, limit.LimitReached, limit.Allowed, modelScope)
 	if classified.FiveHour != nil {
 		added[classified.FiveHour] = true
 	}
-	addCodexWindowInfo(windows, weeklyMeta.ID, weeklyMeta.LabelKey, genericLabelParams, classified.Weekly, limit.LimitReached, limit.Allowed)
+	addCodexWindowInfo(windows, weeklyMeta.ID, weeklyMeta.LabelKey, genericLabelParams, classified.Weekly, limit.LimitReached, limit.Allowed, modelScope)
 	if classified.Weekly != nil {
 		added[classified.Weekly] = true
 	}
-	addCodexWindowInfo(windows, monthlyMeta.ID, monthlyMeta.LabelKey, genericLabelParams, classified.Monthly, limit.LimitReached, limit.Allowed)
+	addCodexWindowInfo(windows, monthlyMeta.ID, monthlyMeta.LabelKey, genericLabelParams, classified.Monthly, limit.LimitReached, limit.Allowed, modelScope)
 	if classified.Monthly != nil {
 		added[classified.Monthly] = true
 	}
@@ -4457,11 +4579,9 @@ func addCodexRateLimitWindows(
 			continue
 		}
 		duration := formatCodexWindowDuration(window.LimitWindowSeconds)
-		prefix := ""
-		if name, ok := genericLabelParams["name"]; ok {
-			if normalizedName := normalizeCodexWindowID(fmt.Sprint(name)); normalizedName != "" {
-				prefix = normalizedName + "-"
-			}
+		prefix := normalizeCodexWindowID(genericIDPrefix)
+		if prefix != "" {
+			prefix += "-"
 		}
 		addCodexWindowInfo(
 			windows,
@@ -4471,6 +4591,7 @@ func addCodexRateLimitWindows(
 			window,
 			limit.LimitReached,
 			limit.Allowed,
+			modelScope,
 		)
 	}
 }
@@ -4497,11 +4618,14 @@ func addCodexWindowInfo(
 	window *codexWindow,
 	limitReached bool,
 	allowed *bool,
+	modelScope codexquota.ModelScope,
 ) {
 	if window == nil {
 		return
 	}
-	resetLabel := formatCodexResetLabel(window)
+	observedAt := time.Now()
+	resetAtMS, resetAccuracy := resolveCodexInspectionReset(window, observedAt)
+	resetLabel := formatCodexResetLabelAt(window, observedAt)
 	usedPercent := window.UsedPercent
 	if usedPercent == nil && (limitReached || (allowed != nil && !*allowed)) && resetLabel != "-" {
 		usedPercent = ptrFloat(100)
@@ -4512,36 +4636,201 @@ func addCodexWindowInfo(
 		LabelParams:        copyCodexLabelParams(labelParams),
 		UsedPercent:        usedPercent,
 		ResetLabel:         resetLabel,
+		ResetAtMS:          resetAtMS,
+		ResetAccuracy:      resetAccuracy,
 		LimitWindowSeconds: window.LimitWindowSeconds,
+		ModelScope:         codexInspectionQuotaModelScope(modelScope),
 	})
 }
 
+func codexInspectionQuotaModelScope(scope codexquota.ModelScope) *model.CodexInspectionQuotaModelScope {
+	return &model.CodexInspectionQuotaModelScope{
+		Kind:     scope.Kind,
+		Key:      scope.Key,
+		Models:   append([]string(nil), scope.Models...),
+		Complete: scope.Complete,
+	}
+}
+
 func addAdditionalRateLimitWindows(windows *[]model.CodexInspectionQuotaWindow, additionalRateLimits []map[string]any, teamPlan bool) {
+	families := make([]codexAdditionalRateLimitFamily, 0, len(additionalRateLimits))
+	baseIDPrefixCounts := make(map[string]int)
+	legacyBaseIDPrefixCounts := make(map[string]int)
 	for index, limitItem := range additionalRateLimits {
 		rateInfo := parseRateLimit(readMap(limitItem, "rate_limit", "rateLimit"))
 		if rateInfo == nil {
 			continue
 		}
+		meteredFeature := readString(limitItem, "metered_feature", "meteredFeature")
 		limitName := firstNonEmpty(
 			readString(limitItem, "limit_name", "limitName"),
-			readString(limitItem, "metered_feature", "meteredFeature"),
+			meteredFeature,
 			fmt.Sprintf("additional-%d", index+1),
 		)
-		idPrefix := normalizeCodexWindowID(limitName)
-		if idPrefix == "" {
-			idPrefix = fmt.Sprintf("additional-%d", index+1)
+		scopeResolution := codexquota.ResolveAdditionalScope(codexquota.AdditionalScopeInput{
+			MeteredFeature:    meteredFeature,
+			LimitName:         readString(limitItem, "limit_name", "limitName"),
+			AnonymousIdentity: anonymousCodexAdditionalIdentity(rateInfo),
+		})
+		legacyBaseIDPrefix := normalizeCodexWindowID(limitName)
+		if legacyBaseIDPrefix == "" {
+			legacyBaseIDPrefix = fmt.Sprintf("additional-%d", index+1)
 		}
+		families = append(families, codexAdditionalRateLimitFamily{
+			sourceIndex:        index,
+			rateInfo:           rateInfo,
+			limitName:          limitName,
+			modelScope:         scopeResolution.Scope,
+			baseIDPrefix:       scopeResolution.ProviderWindowPrefix,
+			featureIDPrefix:    normalizeCodexWindowID(meteredFeature),
+			legacyBaseIDPrefix: legacyBaseIDPrefix,
+			legacyPrefixes:     append([]string(nil), scopeResolution.LegacyPrefixes...),
+			sortKey:            codexAdditionalRateLimitSortKey(rateInfo),
+		})
+		baseIDPrefixCounts[scopeResolution.ProviderWindowPrefix]++
+		legacyBaseIDPrefixCounts[legacyBaseIDPrefix]++
+	}
+
+	familiesByIDPrefix := make(map[string][]int)
+	for index := range families {
+		family := &families[index]
+		family.idPrefix = family.baseIDPrefix
+		if baseIDPrefixCounts[family.baseIDPrefix] > 1 && family.featureIDPrefix != "" && family.featureIDPrefix != family.baseIDPrefix {
+			family.idPrefix += "--" + family.featureIDPrefix
+		}
+		legacyPrefix := family.legacyBaseIDPrefix
+		if legacyBaseIDPrefixCounts[legacyPrefix] > 1 && family.featureIDPrefix != "" && family.featureIDPrefix != legacyPrefix {
+			legacyPrefix += "--" + family.featureIDPrefix
+		}
+		family.legacyPrefixes = append(family.legacyPrefixes, legacyPrefix)
+		familiesByIDPrefix[family.idPrefix] = append(familiesByIDPrefix[family.idPrefix], index)
+	}
+	familyIndexes := make(map[int]int, len(families))
+	for _, indexes := range familiesByIDPrefix {
+		sort.SliceStable(indexes, func(left, right int) bool {
+			leftFamily := families[indexes[left]]
+			rightFamily := families[indexes[right]]
+			if leftFamily.sortKey != rightFamily.sortKey {
+				return leftFamily.sortKey < rightFamily.sortKey
+			}
+			return leftFamily.sourceIndex < rightFamily.sourceIndex
+		})
+		for familyIndex, index := range indexes {
+			familyIndexes[index] = familyIndex
+		}
+	}
+
+	for index, family := range families {
+		familyIndex := familyIndexes[index]
+		start := len(*windows)
 		addCodexRateLimitWindows(
 			windows,
-			rateInfo,
-			codexWindowMeta{ID: fmt.Sprintf("%s-five-hour-%d", idPrefix, index), LabelKey: "codex_quota.additional_primary_window"},
-			codexWindowMeta{ID: fmt.Sprintf("%s-weekly-%d", idPrefix, index), LabelKey: "codex_quota.additional_secondary_window"},
-			codexWindowMeta{ID: fmt.Sprintf("%s-monthly-%d", idPrefix, index), LabelKey: "codex_quota.additional_monthly_window"},
+			family.rateInfo,
+			codexWindowMeta{ID: fmt.Sprintf("%s-five-hour-%d", family.idPrefix, familyIndex), LabelKey: "codex_quota.additional_primary_window"},
+			codexWindowMeta{ID: fmt.Sprintf("%s-weekly-%d", family.idPrefix, familyIndex), LabelKey: "codex_quota.additional_secondary_window"},
+			codexWindowMeta{ID: fmt.Sprintf("%s-monthly-%d", family.idPrefix, familyIndex), LabelKey: "codex_quota.additional_monthly_window"},
+			fmt.Sprintf("%s-%d", family.idPrefix, familyIndex),
 			"codex_quota.additional_generic_window",
-			map[string]any{"name": limitName},
+			map[string]any{"name": family.limitName},
 			teamPlan,
+			family.modelScope,
 		)
+		applyCodexProviderWindowAliases((*windows)[start:], family.idPrefix, family.legacyPrefixes)
 	}
+}
+
+func applyCodexProviderWindowAliases(
+	windows []model.CodexInspectionQuotaWindow,
+	providerWindowPrefix string,
+	legacyPrefixes []string,
+) {
+	aliases := make([]string, 0, len(legacyPrefixes))
+	seen := make(map[string]struct{}, len(legacyPrefixes))
+	for _, prefix := range legacyPrefixes {
+		prefix = strings.ToLower(strings.TrimSpace(prefix))
+		if prefix == "" || prefix == providerWindowPrefix {
+			continue
+		}
+		if _, exists := seen[prefix]; exists {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		aliases = append(aliases, prefix)
+	}
+	sort.Strings(aliases)
+	for index := range windows {
+		if !strings.HasPrefix(windows[index].ID, providerWindowPrefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(windows[index].ID, providerWindowPrefix)
+		windows[index].ProviderWindowAliases = make([]string, 0, len(aliases))
+		for _, prefix := range aliases {
+			windows[index].ProviderWindowAliases = append(
+				windows[index].ProviderWindowAliases,
+				prefix+suffix,
+			)
+		}
+	}
+}
+
+func anonymousCodexAdditionalIdentity(rateInfo *codexRateLimit) string {
+	if rateInfo == nil {
+		return "additional-p-none-s-none"
+	}
+	return strings.Join([]string{
+		"additional",
+		"p",
+		codexAdditionalWindowIdentityPart(rateInfo.PrimaryWindow),
+		"s",
+		codexAdditionalWindowIdentityPart(rateInfo.SecondaryWindow),
+	}, "-")
+}
+
+func codexAdditionalWindowIdentityPart(window *codexWindow) string {
+	if window == nil {
+		return "none"
+	}
+	if window.LimitWindowSeconds == nil {
+		return "unknown"
+	}
+	return fmt.Sprintf("%g", *window.LimitWindowSeconds)
+}
+
+func codexAdditionalRateLimitSortKey(rateInfo *codexRateLimit) string {
+	if rateInfo == nil {
+		return ""
+	}
+	allowed := ""
+	if rateInfo.Allowed != nil {
+		allowed = fmt.Sprintf("%t", *rateInfo.Allowed)
+	}
+	return strings.Join([]string{
+		codexAdditionalWindowSortKey(rateInfo.PrimaryWindow),
+		codexAdditionalWindowSortKey(rateInfo.SecondaryWindow),
+		allowed,
+		fmt.Sprintf("%t", rateInfo.LimitReached),
+	}, "|")
+}
+
+func codexAdditionalWindowSortKey(window *codexWindow) string {
+	if window == nil {
+		return "none"
+	}
+	values := []*float64{
+		window.LimitWindowSeconds,
+		window.UsedPercent,
+		window.ResetAfterSeconds,
+		window.ResetAt,
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == nil {
+			parts = append(parts, "")
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%g", *value))
+	}
+	return strings.Join(parts, ":")
 }
 
 func readMapSlice(record map[string]any, keys ...string) []map[string]any {
@@ -4565,6 +4854,10 @@ func readMapSlice(record map[string]any, keys ...string) []map[string]any {
 }
 
 func formatCodexResetLabel(window *codexWindow) string {
+	return formatCodexResetLabelAt(window, time.Now())
+}
+
+func formatCodexResetLabelAt(window *codexWindow, observedAt time.Time) string {
 	if window == nil {
 		return "-"
 	}
@@ -4572,10 +4865,23 @@ func formatCodexResetLabel(window *codexWindow) string {
 		return formatUnixSeconds(*window.ResetAt)
 	}
 	if window.ResetAfterSeconds != nil && *window.ResetAfterSeconds > 0 {
-		targetSeconds := float64(time.Now().Unix()) + math.Floor(*window.ResetAfterSeconds)
+		targetSeconds := float64(observedAt.Unix()) + math.Floor(*window.ResetAfterSeconds)
 		return formatUnixSeconds(targetSeconds)
 	}
 	return "-"
+}
+
+func resolveCodexInspectionReset(window *codexWindow, observedAt time.Time) (int64, string) {
+	if window == nil {
+		return 0, "unknown"
+	}
+	if window.ResetAt != nil && *window.ResetAt > 0 {
+		return int64(math.Floor(*window.ResetAt)) * 1000, "exact"
+	}
+	if window.ResetAfterSeconds != nil && *window.ResetAfterSeconds > 0 {
+		return observedAt.Add(time.Duration(*window.ResetAfterSeconds * float64(time.Second))).UnixMilli(), "derived"
+	}
+	return 0, "unknown"
 }
 
 func formatUnixSeconds(seconds float64) string {

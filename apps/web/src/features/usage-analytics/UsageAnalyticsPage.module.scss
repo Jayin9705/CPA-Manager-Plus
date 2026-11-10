@@ -318,6 +318,41 @@
   padding: 12px;
 }
 
+.usageSummaryGridCompact {
+  grid-auto-rows: minmax(96px, auto);
+  gap: 8px;
+}
+
+.usageSummaryCardCompact {
+  gap: 16px;
+  min-height: 96px;
+  padding: 10px;
+
+  .usageSummaryIcon {
+    width: 24px;
+    height: 24px;
+    flex-basis: 24px;
+
+    svg {
+      width: 14px;
+      height: 14px;
+    }
+  }
+
+  .usageSummaryLabel {
+    font-size: 11px;
+  }
+
+  .usageSummaryCardBody {
+    margin-top: 0;
+  }
+
+  .usageSummaryValue {
+    font-size: 15px;
+    line-height: 1.1;
+  }
+}
+
 .usageSummaryCard:hover {
   z-index: 5;
   border-color: var(--usage-strong-border);
@@ -336,6 +371,14 @@
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.usageSummaryCardExtra {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  z-index: 2;
 }
 
 .usageSummaryIcon {
@@ -688,6 +731,13 @@
 
 .echartsTooltipWrapper {
   overflow: hidden;
+}
+
+// ECharts keeps append-to-body tooltips at their last desktop coordinates after
+// hiding them. Remove only the hidden overlay from layout so a viewport change
+// cannot create blank document-level horizontal scrolling.
+.echartsTooltipWrapper[style*='visibility: hidden'] {
+  display: none !important;
 }
 
 .echartsTooltip {

@@ -6,12 +6,14 @@ import {
   getAuthFileStatusIdentityKey,
   readAuthFileStatusAccountId,
   readAuthFileStatusAccountSnapshot,
+  readAuthFileStatusCodexMember,
 } from '@/utils/authFileStatusMutation';
 import {
   buildCodexQuotaWindowInfos,
   classifyCodexRateLimitWindows,
   deriveCodexRateLimitUsedPercent,
   getCodexQuotaWindowUsedPercent,
+  hasCodexQuotaInventory,
   isCodexRateLimitReached,
   isDisabledAuthFile,
   normalizePlanType,
@@ -95,10 +97,13 @@ export const toInspectionAccount = (file: AuthFileItem): CodexInspectionAccount 
   const runtimeId = readString(file.id) || null;
   const fileName = readAuthFileName(file);
   const displayAccount = readDisplayAccount(file);
-  const accountSnapshot = readAuthFileStatusAccountSnapshot(file) || null;
   const authIndex = normalizeAuthIndex(file['auth_index'] ?? file.authIndex);
   const accountId = readAuthFileStatusAccountId(file);
   const provider = resolveAuthProvider(file);
+  const accountSnapshot =
+    (provider === 'codex'
+      ? readAuthFileStatusCodexMember(file)
+      : readAuthFileStatusAccountSnapshot(file)) || null;
   return {
     key: buildInspectionAccountKey({
       fileName,
@@ -373,7 +378,8 @@ export const inspectSingleAccount = async (
   account: CodexInspectionAccount,
   settings: CodexInspectionSettings,
   onLog?: CodexInspectionLogHandler,
-  t: TFunction = identityT
+  t: TFunction = identityT,
+  scopedRequestConfig?: AxiosRequestConfig
 ): Promise<CodexInspectionResultItem> => {
   if (!account.authIndex) {
     onLog?.(
@@ -403,8 +409,10 @@ export const inspectSingleAccount = async (
   }
 
   const authIndex = account.authIndex;
-  const requestConfig: AxiosRequestConfig =
-    settings.timeout > 0 ? { timeout: settings.timeout } : {};
+  const requestConfig: AxiosRequestConfig = {
+    ...(scopedRequestConfig ?? {}),
+    ...(settings.timeout > 0 ? { timeout: settings.timeout } : {}),
+  };
 
   try {
     const { result, payload } = await withRetry(settings.retries, () =>
@@ -513,6 +521,7 @@ export const inspectSingleAccount = async (
       error: '',
       planType,
       quotaWindows,
+      quotaInventoryObserved: payload ? hasCodexQuotaInventory(payload) : false,
       errorKind: result.statusCode >= 200 && result.statusCode < 300 ? '' : 'http_status',
       errorDetail:
         result.statusCode >= 200 && result.statusCode < 300

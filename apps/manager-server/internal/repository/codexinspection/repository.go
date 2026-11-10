@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/model"
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usageidentity"
 )
 
 type Repository interface {
@@ -200,9 +201,25 @@ func (r *repository) InsertResult(ctx context.Context, result model.CodexInspect
 	if result.CreatedAtMS <= 0 {
 		result.CreatedAtMS = time.Now().UnixMilli()
 	}
-	if result.QuotaWindowsJSON == "" && len(result.QuotaWindows) > 0 {
-		result.QuotaWindowsJSON = model.MarshalCodexInspectionQuotaWindows(result.QuotaWindows)
+	quotaWindowsJSON := strings.TrimSpace(result.QuotaWindowsJSON)
+	if quotaWindowsJSON == "" {
+		switch {
+		case len(result.QuotaWindows) > 0:
+			quotaWindowsJSON = model.MarshalCodexInspectionQuotaWindows(result.QuotaWindows)
+		case result.QuotaInventoryObserved:
+			quotaWindowsJSON = "[]"
+		}
 	}
+	quotaWindows, quotaInventoryObserved := model.ParseCodexInspectionQuotaWindows(quotaWindowsJSON)
+	if quotaInventoryObserved {
+		quotaWindowsJSON = model.MarshalCodexInspectionQuotaWindows(quotaWindows)
+		if len(quotaWindows) == 0 {
+			quotaWindowsJSON = "[]"
+		}
+	}
+	result.QuotaWindowsJSON = quotaWindowsJSON
+	result.QuotaWindows = quotaWindows
+	result.QuotaInventoryObserved = quotaInventoryObserved
 	result.ActionStatus = model.NormalizeCodexInspectionActionStatus(result.ActionStatus, result.Action)
 	disabled := 0
 	if result.Disabled {
@@ -247,7 +264,10 @@ func (r *repository) InsertResult(ctx context.Context, result model.CodexInspect
 			executed_action = excluded.executed_action,
 			action_error = excluded.action_error,
 			plan_type = excluded.plan_type,
-			quota_windows_json = excluded.quota_windows_json,
+			quota_windows_json = case
+				when excluded.quota_windows_json is not null then excluded.quota_windows_json
+				else codex_inspection_results.quota_windows_json
+			end,
 				error_kind = excluded.error_kind,
 				error_detail = excluded.error_detail,
 				created_at_ms = excluded.created_at_ms
@@ -274,7 +294,7 @@ func (r *repository) InsertResult(ctx context.Context, result model.CodexInspect
 			nullString(result.ExecutedAction),
 			nullString(result.ActionError),
 			nullString(result.PlanType),
-			nullString(result.QuotaWindowsJSON),
+			nullStringIf(result.QuotaInventoryObserved, result.QuotaWindowsJSON),
 			nullString(result.ErrorKind),
 			nullString(result.ErrorDetail),
 			result.CreatedAtMS,
@@ -654,6 +674,14 @@ func normalizeDisableOwnership(item model.CodexInspectionDisableOwnership) model
 	item.AuthIndex = strings.TrimSpace(item.AuthIndex)
 	item.AccountID = strings.TrimSpace(item.AccountID)
 	item.AccountSnapshot = strings.TrimSpace(item.AccountSnapshot)
+	if item.Provider == "codex" {
+		if member, ok := usageidentity.NormalizeCodexMemberSnapshot(item.AccountSnapshot); ok {
+			item.AccountSnapshot = member
+		} else {
+			item.AccountSnapshot = ""
+		}
+		return item
+	}
 	if item.AccountID != "" {
 		item.AccountSnapshot = ""
 	}
@@ -688,6 +716,9 @@ func disableOwnershipMatchesTarget(item model.CodexInspectionDisableOwnership, t
 		provider := normalizeDisableOwnershipProvider(*target.Provider)
 		if item.Provider != "" && item.Provider != provider {
 			return false
+		}
+		if provider == "codex" {
+			return disableOwnershipMatchesCodexTarget(item, target)
 		}
 	}
 	if target.AuthIndex != nil {
@@ -728,6 +759,60 @@ func disableOwnershipMatchesTarget(item model.CodexInspectionDisableOwnership, t
 		} else if item.AccountSnapshot != "" && item.AccountSnapshot != accountSnapshot {
 			return false
 		}
+	}
+	return true
+}
+
+func disableOwnershipMatchesCodexTarget(item model.CodexInspectionDisableOwnership, target model.CodexInspectionDisableOwnershipTarget) bool {
+	if item.Provider != "" && item.Provider != "codex" {
+		return false
+	}
+
+	// This matcher is used for explicit cleanup, not recovery authorization.
+	// A concrete credential may therefore remove a weaker legacy record, but it
+	// must never remove a different member's workspace-qualified record.
+	if target.AuthIndex != nil {
+		targetAuthIndex := strings.TrimSpace(*target.AuthIndex)
+		if targetAuthIndex == "" {
+			if item.AuthIndex != "" {
+				return false
+			}
+		} else if item.AuthIndex != "" && item.AuthIndex != targetAuthIndex {
+			return false
+		}
+	}
+
+	targetAccountIDSet := target.AccountID != nil
+	targetAccountID := ""
+	if targetAccountIDSet {
+		targetAccountID = strings.TrimSpace(*target.AccountID)
+		if targetAccountID == "" {
+			if item.AccountID != "" {
+				return false
+			}
+		} else if item.AccountID != "" && item.AccountID != targetAccountID {
+			return false
+		}
+	} else if item.AccountID != "" {
+		// Without a target workspace, a workspace-qualified ownership record is
+		// not a compatible legacy wildcard.
+		return false
+	}
+
+	targetMemberSet := target.AccountSnapshot != nil
+	targetMember := ""
+	if targetMemberSet {
+		targetMember, _ = usageidentity.NormalizeCodexMemberSnapshot(*target.AccountSnapshot)
+	}
+	itemMember, _ := usageidentity.NormalizeCodexMemberSnapshot(item.AccountSnapshot)
+	if targetMember == "" {
+		// A target without reliable member evidence may only clean records that
+		// also lack member evidence. This prevents Alice's action from deleting
+		// Bob's member-specific ownership in a shared Workspace.
+		return itemMember == ""
+	}
+	if itemMember != "" && itemMember != targetMember {
+		return false
 	}
 	return true
 }
@@ -854,7 +939,10 @@ func scanResult(row scanner) (model.CodexInspectionResult, error) {
 	result.ActionError = actionError.String
 	result.PlanType = planType.String
 	result.QuotaWindowsJSON = quotaWindowsJSON.String
-	result.QuotaWindows = model.UnmarshalCodexInspectionQuotaWindows(result.QuotaWindowsJSON)
+	result.QuotaWindows, result.QuotaInventoryObserved = model.ParseCodexInspectionQuotaWindows(result.QuotaWindowsJSON)
+	if !result.QuotaInventoryObserved {
+		result.QuotaWindowsJSON = ""
+	}
 	result.ErrorKind = errorKind.String
 	result.ErrorDetail = errorDetail.String
 	if statusCode.Valid {
@@ -893,6 +981,13 @@ func scanLog(row scanner) (model.CodexInspectionLog, error) {
 
 func nullString(value string) any {
 	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullStringIf(ok bool, value string) any {
+	if !ok {
 		return nil
 	}
 	return value

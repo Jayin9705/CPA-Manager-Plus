@@ -9,10 +9,20 @@ import type {
   ManagerConfigResponse,
   ModelPriceUsageSummaryResponse,
   ModelPricesResponse,
+  MonitoringAccountHistoryRequest,
+  MonitoringAccountHistoryResponse,
+  MonitoringAccountWindowUsageRequest,
+  MonitoringAccountWindowUsageResponse,
   MonitoringAnalyticsRequest,
   MonitoringAnalyticsResponse,
   QuotaCooldownInfo,
+  RuntimeModelPricingStatusResponse,
+  UsageArchiveList,
+  UsageArchivePreview,
+  UsageArchiveRunSummary,
+  UsageArchiveStatus,
   UsageHeaderSnapshotsResponse,
+  UsageMaintenanceStatus,
   UsageServiceInfo,
   UsageServiceStatus,
 } from '@/services/api/usageService';
@@ -22,13 +32,25 @@ import type {
   CodexInspectionStoredLogEntry,
 } from '@/features/monitoring/codexInspection';
 import { formatActionLabel } from '@/features/monitoring/model/codexInspectionPresentation';
-import type { AuthFilesResponse } from '@/types/authFile';
+import type { AuthFileItem, AuthFilesResponse } from '@/types/authFile';
 import type { PluginListResponse, PluginStoreResponse } from '@/types/plugin';
+import type {
+  AntigravityQuotaState,
+  ClaudeQuotaState,
+  CodexQuotaState,
+  CredentialScopedQuotaState,
+  DevinQuotaState,
+  KimiQuotaState,
+  MetaQuotaState,
+  XaiQuotaState,
+} from '@/types';
 import type { ModelInfo } from '@/utils/models';
 import { formatXaiProbeIssue } from '@/utils/quota/xaiPresentation';
+import { buildQuotaCredentialIdentity } from '@/utils/quota/credentialScope';
 import type { TFunction } from 'i18next';
 import {
   DEMO_API_BASE,
+  getDemoMaintenanceScenario,
   DEMO_SERVER_VERSION,
   formatDemoDate,
   getDemoServerBuildDate,
@@ -41,6 +63,16 @@ type DemoApiCallPayload = {
   data?: string;
 };
 
+export type DemoQuotaStoreState = {
+  antigravityQuota: Record<string, AntigravityQuotaState>;
+  claudeQuota: Record<string, ClaudeQuotaState>;
+  codexQuota: Record<string, CodexQuotaState>;
+  devinQuota: Record<string, DevinQuotaState>;
+  kimiQuota: Record<string, KimiQuotaState>;
+  metaQuota: Record<string, MetaQuotaState>;
+  xaiQuota: Record<string, XaiQuotaState>;
+};
+
 const clone = <T>(value: T): T => {
   if (typeof structuredClone === 'function') {
     return structuredClone(value);
@@ -48,10 +80,512 @@ const clone = <T>(value: T): T => {
   return JSON.parse(JSON.stringify(value)) as T;
 };
 
+let demoEvidenceEpochMs: number | null = null;
+
+export const resetDemoEvidenceEpoch = (): void => {
+  demoEvidenceEpochMs = null;
+};
+
+export const getDemoEvidenceEpochMs = (): number => {
+  if (demoEvidenceEpochMs === null) {
+    demoEvidenceEpochMs = Date.now();
+  }
+  return demoEvidenceEpochMs;
+};
+
 const now = () => Date.now();
 const minute = 60 * 1000;
 const hour = 60 * minute;
 const day = 24 * hour;
+const demoOAuthAccountProviders = new Set(['codex', 'claude', 'antigravity', 'kimi', 'xai']);
+
+let demoUsageArchiveSequence = 2;
+const createDemoUsageArchiveStatuses = (): UsageArchiveStatus[] => [
+  {
+    run: {
+      id: 'demo-archive-2',
+      mode: 'retention',
+      status: 'completed',
+      cutoff_timestamp_ms: now() - 30 * day,
+      target_event_id: 142_000,
+      event_count: 37_000,
+      estimated_bytes: 48_200_000,
+      last_archived_event_id: 142_000,
+      archived_event_count: 37_000,
+      archived_uncompressed_bytes: 45_900_000,
+      archived_compressed_bytes: 7_800_000,
+      last_deleted_event_id: 142_000,
+      deleted_event_count: 37_000,
+      created_at_ms: now() - 29 * day,
+      updated_at_ms: now() - 29 * day + 120_000,
+      completed_at_ms: now() - 29 * day + 120_000,
+      has_error: false,
+    },
+    segments: [],
+  },
+  {
+    run: {
+      id: 'demo-archive-1',
+      mode: 'manual',
+      status: 'completed',
+      cutoff_timestamp_ms: now() - 60 * day,
+      target_event_id: 105_000,
+      event_count: 25_000,
+      estimated_bytes: 31_400_000,
+      last_archived_event_id: 105_000,
+      archived_event_count: 25_000,
+      archived_uncompressed_bytes: 30_100_000,
+      archived_compressed_bytes: 5_200_000,
+      last_deleted_event_id: 105_000,
+      deleted_event_count: 25_000,
+      created_at_ms: now() - 59 * day,
+      updated_at_ms: now() - 59 * day + 90_000,
+      completed_at_ms: now() - 59 * day + 90_000,
+      has_error: false,
+    },
+    segments: [],
+  },
+];
+let demoUsageArchiveStatuses = createDemoUsageArchiveStatuses();
+
+export const resetDemoUsageArchiveState = (): void => {
+  demoUsageArchiveSequence = 2;
+  demoUsageArchiveStatuses = createDemoUsageArchiveStatuses();
+};
+
+const summarizeDemoUsageArchive = (run: UsageArchiveRunSummary): UsageArchiveRunSummary => ({
+  ...run,
+});
+
+const createDemoUsageArchiveError = (code: string, status: number, message: string) => {
+  const error = new Error(message) as Error & { code?: string; status?: number };
+  error.code = code;
+  error.status = status;
+  return error;
+};
+
+const demoUsageArchiveIsActive = (run: UsageArchiveRunSummary) =>
+  !['completed', 'cancelled'].includes(run.status) &&
+  (run.mode === 'retention' || !['archived', 'verified'].includes(run.status));
+
+const requireDemoUsageArchive = (runId: string): UsageArchiveStatus => {
+  const status = demoUsageArchiveStatuses.find((item) => item.run.id === runId);
+  if (!status) {
+    throw createDemoUsageArchiveError(
+      'usage_archive_not_found',
+      404,
+      'usage archive run not found'
+    );
+  }
+  return status;
+};
+
+export const previewDemoUsageArchive = (cutoffTimestampMs: number): UsageArchivePreview => ({
+  cutoff_timestamp_ms: cutoffTimestampMs,
+  target_event_id: 184_260,
+  event_count: 12_480,
+  estimated_bytes: 18_600_000,
+  min_timestamp_ms: cutoffTimestampMs - 7 * day,
+  max_timestamp_ms: cutoffTimestampMs - 1,
+});
+
+export const createDemoUsageArchive = (cutoffTimestampMs: number): UsageArchiveStatus => {
+  const active = demoUsageArchiveStatuses.find((item) => demoUsageArchiveIsActive(item.run));
+  if (active) {
+    throw createDemoUsageArchiveError(
+      'usage_archive_maintenance_locked',
+      409,
+      `usage maintenance is already active: run ${active.run.id}`
+    );
+  }
+  const preview = previewDemoUsageArchive(cutoffTimestampMs);
+  const timestamp = now();
+  const status: UsageArchiveStatus = {
+    run: {
+      id: `demo-archive-${++demoUsageArchiveSequence}`,
+      mode: 'manual',
+      status: 'previewed',
+      cutoff_timestamp_ms: preview.cutoff_timestamp_ms,
+      target_event_id: preview.target_event_id,
+      event_count: preview.event_count,
+      estimated_bytes: preview.estimated_bytes,
+      last_archived_event_id: 0,
+      archived_event_count: 0,
+      archived_uncompressed_bytes: 0,
+      archived_compressed_bytes: 0,
+      last_deleted_event_id: 0,
+      deleted_event_count: 0,
+      created_at_ms: timestamp,
+      updated_at_ms: timestamp,
+      has_error: false,
+    },
+    segments: [],
+  };
+  demoUsageArchiveStatuses.unshift(status);
+  return clone(status);
+};
+
+export const getDemoUsageArchive = (runId: string): UsageArchiveStatus =>
+  clone(requireDemoUsageArchive(runId));
+
+export const getDemoUsageArchives = (limit = 20): UsageArchiveList => {
+  const runs = demoUsageArchiveStatuses
+    .slice()
+    .sort((left, right) => right.run.created_at_ms - left.run.created_at_ms)
+    .slice(0, limit)
+    .map((item) => summarizeDemoUsageArchive(item.run));
+  return {
+    runs,
+    total: demoUsageArchiveStatuses.length,
+    status_counts: demoUsageArchiveStatuses.reduce<Record<string, number>>((counts, item) => {
+      counts[item.run.status] = (counts[item.run.status] ?? 0) + 1;
+      return counts;
+    }, {}),
+  };
+};
+
+export const resumeDemoUsageArchive = (runId: string): UsageArchiveStatus => {
+  const status = requireDemoUsageArchive(runId);
+  const resumeStatus =
+    status.run.status === 'failed' ? status.run.resume_status : status.run.status;
+  if (resumeStatus === 'previewed' || resumeStatus === 'archiving') {
+    const timestamp = now();
+    status.run.status = 'archived';
+    status.run.resume_status = undefined;
+    status.run.has_error = false;
+    status.run.last_archived_event_id = status.run.target_event_id;
+    status.run.archived_event_count = status.run.event_count;
+    status.run.archived_uncompressed_bytes = status.run.estimated_bytes;
+    status.run.archived_compressed_bytes = Math.round(status.run.estimated_bytes * 0.18);
+    status.run.archived_at_ms = timestamp;
+    status.run.updated_at_ms = timestamp;
+    status.segments = [
+      {
+        run_id: status.run.id,
+        sequence: 1,
+        status: 'published',
+        first_event_id: Math.max(1, status.run.target_event_id - status.run.event_count + 1),
+        last_event_id: status.run.target_event_id,
+        min_timestamp_ms: status.run.cutoff_timestamp_ms - 7 * day,
+        max_timestamp_ms: status.run.cutoff_timestamp_ms - 1,
+        event_count: status.run.event_count,
+        uncompressed_bytes: status.run.archived_uncompressed_bytes,
+        compressed_bytes: status.run.archived_compressed_bytes,
+        created_at_ms: timestamp,
+      },
+    ];
+  } else if (resumeStatus === 'verifying') {
+    const timestamp = now();
+    status.run.status = 'verified';
+    status.run.resume_status = undefined;
+    status.run.has_error = false;
+    status.run.verified_at_ms = timestamp;
+    status.run.updated_at_ms = timestamp;
+    status.segments = status.segments.map((segment) => ({
+      ...segment,
+      status: 'verified',
+      verified_at_ms: timestamp,
+    }));
+  } else if (resumeStatus === 'deleting') {
+    const timestamp = now();
+    status.run.status = 'completed';
+    status.run.resume_status = undefined;
+    status.run.has_error = false;
+    status.run.deleted_event_count = status.run.event_count;
+    status.run.last_deleted_event_id = status.run.target_event_id;
+    status.run.completed_at_ms = timestamp;
+    status.run.updated_at_ms = timestamp;
+  } else {
+    throw createDemoUsageArchiveError(
+      'usage_archive_invalid_state',
+      409,
+      'usage archive run is in an invalid state'
+    );
+  }
+  return clone(status);
+};
+
+export const verifyDemoUsageArchive = (runId: string): UsageArchiveStatus => {
+  const status = requireDemoUsageArchive(runId);
+  if (status.run.status !== 'archived' && status.run.status !== 'verifying') {
+    throw createDemoUsageArchiveError(
+      'usage_archive_invalid_state',
+      409,
+      'usage archive run is in an invalid state'
+    );
+  }
+  const timestamp = now();
+  status.run.status = 'verified';
+  status.run.resume_status = undefined;
+  status.run.has_error = false;
+  status.run.verified_at_ms = timestamp;
+  status.run.updated_at_ms = timestamp;
+  status.segments = status.segments.map((segment) => ({
+    ...segment,
+    status: 'verified',
+    verified_at_ms: timestamp,
+  }));
+  return clone(status);
+};
+
+export const deleteDemoUsageArchive = (runId: string): UsageArchiveStatus => {
+  const status = requireDemoUsageArchive(runId);
+  if (status.run.status !== 'verified' && status.run.status !== 'deleting') {
+    throw createDemoUsageArchiveError(
+      'usage_archive_invalid_state',
+      409,
+      'usage archive run is in an invalid state'
+    );
+  }
+  const timestamp = now();
+  status.run.status = 'completed';
+  status.run.resume_status = undefined;
+  status.run.has_error = false;
+  status.run.deleted_event_count = status.run.event_count;
+  status.run.last_deleted_event_id = status.run.target_event_id;
+  status.run.completed_at_ms = timestamp;
+  status.run.updated_at_ms = timestamp;
+  return clone(status);
+};
+
+export const cancelDemoUsageArchive = (runId: string): UsageArchiveStatus => {
+  const status = requireDemoUsageArchive(runId);
+  if (status.run.status === 'cancelled') return clone(status);
+  const rawDeleteStarted =
+    status.run.status === 'deleting' ||
+    status.run.last_deleted_event_id > 0 ||
+    status.run.deleted_event_count > 0 ||
+    (status.run.delete_started_at_ms ?? 0) > 0 ||
+    (status.run.status === 'failed' && status.run.resume_status === 'deleting');
+  if (rawDeleteStarted) {
+    throw createDemoUsageArchiveError(
+      'usage_archive_cancel_unsafe',
+      409,
+      'usage archive task cannot be abandoned after raw deletion has started'
+    );
+  }
+  if (!['previewed', 'archived', 'verified', 'failed'].includes(status.run.status)) {
+    throw createDemoUsageArchiveError(
+      'usage_archive_invalid_state',
+      409,
+      'usage archive run is in an invalid state'
+    );
+  }
+  status.run.status = 'cancelled';
+  status.run.resume_status = undefined;
+  status.run.requested_stage = undefined;
+  status.run.has_error = false;
+  status.run.updated_at_ms = now();
+  return clone(status);
+};
+
+export const getDemoUsageMaintenance = (): UsageMaintenanceStatus => {
+  const active = demoUsageArchiveStatuses.find((item) => demoUsageArchiveIsActive(item.run));
+  const dynamicArchived = demoUsageArchiveStatuses.reduce(
+    (sum, item) => sum + Math.max(0, item.run.archived_event_count - item.run.deleted_event_count),
+    0
+  );
+  const dynamicDeleted = demoUsageArchiveStatuses
+    .slice(0, Math.max(0, demoUsageArchiveStatuses.length - 2))
+    .reduce((sum, item) => sum + item.run.deleted_event_count, 0);
+  return {
+    raw_event_count: Math.max(0, 184_260 - dynamicDeleted),
+    raw_min_timestamp_ms: now() - 120 * day,
+    raw_max_timestamp_ms: now() - minute,
+    raw_archived_event_count: dynamicArchived,
+    raw_deleted_event_count: 62_000 + dynamicDeleted,
+    active_run: active ? summarizeDemoUsageArchive(active.run) : undefined,
+    migration: {
+      name: 'usage_cache_accounting_v2',
+      status: 'completed',
+      last_event_id: 184_260,
+      target_event_id: 184_260,
+      processed_rows: 184_260,
+      changed_rows: 1_420,
+      updated_at_ms: now() - 3 * day,
+    },
+    hourly_aggregate: {
+      name: 'hourly_core',
+      schema_version: 1,
+      status: 'ready',
+      coverage_event_id: 184_260,
+      target_event_id: 184_260,
+      updated_at_ms: now() - minute,
+    },
+    readiness: {
+      migration_ready: true,
+      hourly_aggregate_ready: true,
+      archive_delete_enabled: true,
+    },
+    migration_coverage: {
+      status: 'completed',
+      watermark_event_id: 184_260,
+      target_event_id: 184_260,
+      complete: true,
+    },
+    hourly_aggregate_coverage: {
+      status: 'ready',
+      watermark_event_id: 184_260,
+      target_event_id: 184_260,
+      complete: true,
+    },
+    storage: {
+      page_size: 4_096,
+      page_count: 78_400,
+      freelist_count: 12_360,
+      reclaimable_bytes: 50_626_560,
+      database_bytes: 321_126_400,
+      wal_bytes: 0,
+      shm_bytes: 0,
+      total_bytes: 321_126_400,
+    },
+    compact_requires_stopped_server: true,
+  };
+};
+
+type DemoCredentialFilterable = {
+  id?: string;
+  auth_file_snapshot?: string;
+  auth_index?: string;
+  source?: string;
+  source_hash?: string;
+};
+
+type DemoCredentialFilters = {
+  authFiles: Set<string>;
+  authIndices: Set<string>;
+  credentialIds: Set<string>;
+};
+
+const normalizeDemoCredentialFilterValues = (values: string[] | undefined) =>
+  new Set((values ?? []).map((value) => value.trim()).filter(Boolean));
+
+const resolveDemoCredentialId = (row: DemoCredentialFilterable): string => {
+  for (const value of [
+    row.auth_file_snapshot,
+    row.auth_index,
+    row.source_hash,
+    row.source,
+    row.id,
+  ]) {
+    const normalized = value?.trim() ?? '';
+    if (normalized) return normalized;
+  }
+  return '-';
+};
+
+const buildDemoCredentialFilters = (
+  request?: MonitoringAnalyticsRequest
+): DemoCredentialFilters | null => {
+  const filters = {
+    authFiles: normalizeDemoCredentialFilterValues(request?.filters?.auth_files),
+    authIndices: normalizeDemoCredentialFilterValues(request?.filters?.auth_indices),
+    credentialIds: normalizeDemoCredentialFilterValues(request?.filters?.credential_ids),
+  };
+  return filters.authFiles.size > 0 ||
+    filters.authIndices.size > 0 ||
+    filters.credentialIds.size > 0
+    ? filters
+    : null;
+};
+
+const matchesDemoCredentialFilters = (
+  row: DemoCredentialFilterable,
+  filters: DemoCredentialFilters
+) => {
+  const authFile = row.auth_file_snapshot?.trim() ?? '';
+  const authIndex = row.auth_index?.trim() ?? '';
+  if (filters.authFiles.size > 0 && !filters.authFiles.has(authFile)) return false;
+  if (filters.authIndices.size > 0 && !filters.authIndices.has(authIndex)) return false;
+  if (filters.credentialIds.size > 0 && !filters.credentialIds.has(resolveDemoCredentialId(row))) {
+    return false;
+  }
+  return true;
+};
+
+const buildDemoScopedAccountStats = (
+  credentialStats: NonNullable<MonitoringAnalyticsResponse['credential_stats']>
+): NonNullable<MonitoringAnalyticsResponse['account_stats']> =>
+  credentialStats.map((row) => ({
+    id:
+      row.account_snapshot?.trim() ||
+      row.auth_label_snapshot?.trim() ||
+      row.source?.trim() ||
+      row.auth_index?.trim() ||
+      row.id,
+    account_snapshot: row.account_snapshot,
+    auth_label_snapshot: row.auth_label_snapshot,
+    auth_provider_snapshot: row.auth_provider_snapshot,
+    auth_indices: row.auth_index ? [row.auth_index] : [],
+    sources: row.source ? [row.source] : [],
+    source_hashes: row.source_hash ? [row.source_hash] : [],
+    calls: row.calls,
+    success_calls: row.success_calls,
+    failure_calls: row.failure_calls,
+    success_rate: row.success_rate,
+    input_tokens: row.input_tokens,
+    output_tokens: row.output_tokens,
+    cached_tokens: row.cached_tokens,
+    cache_read_tokens: row.cache_read_tokens,
+    cache_creation_tokens: row.cache_creation_tokens,
+    total_tokens: row.total_tokens,
+    cost: row.cost,
+    average_latency_ms: row.average_latency_ms,
+    last_seen_ms: row.last_seen_ms,
+    models: row.models,
+  }));
+
+const isDemoOAuthAccountProvider = (provider: unknown) =>
+  typeof provider === 'string' && demoOAuthAccountProviders.has(provider);
+
+const demoResetIso = (offsetMs: number, baseMs: number = getDemoEvidenceEpochMs()) =>
+  new Date(baseMs + offsetMs).toISOString();
+const formatDemoQuotaResetAtMs = (resetAtMs: number) => {
+  const value = new Date(resetAtMs);
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const dayOfMonth = String(value.getDate()).padStart(2, '0');
+  const hours = String(value.getHours()).padStart(2, '0');
+  const minutes = String(value.getMinutes()).padStart(2, '0');
+  return `${month}/${dayOfMonth} ${hours}:${minutes}`;
+};
+const demoQuotaResetMetadata = (offsetMs: number, baseMs: number = getDemoEvidenceEpochMs()) => ({
+  resetAtMs: baseMs + offsetMs,
+  resetAccuracy: 'estimated' as const,
+});
+const demoQuotaReset = (offsetMs: number, baseMs: number = getDemoEvidenceEpochMs()) => {
+  const metadata = demoQuotaResetMetadata(offsetMs, baseMs);
+  return {
+    resetLabel: formatDemoQuotaResetAtMs(metadata.resetAtMs),
+    ...metadata,
+  };
+};
+
+const demoRecentRequests = (
+  successBase: number,
+  options: {
+    failureEvery?: number;
+    failureSize?: number;
+    idlePrefix?: number;
+    quietEvery?: number;
+    surgeEvery?: number;
+  } = {}
+) =>
+  Array.from({ length: 20 }, (_, index) => {
+    const oneBasedIndex = index + 1;
+    if (index < (options.idlePrefix ?? 0) || oneBasedIndex % (options.quietEvery ?? 99) === 0) {
+      return { success: 0, failed: 0 };
+    }
+    const surge = options.surgeEvery && oneBasedIndex % options.surgeEvery === 0 ? 4 : 0;
+    const failed =
+      options.failureEvery && oneBasedIndex % options.failureEvery === 0
+        ? (options.failureSize ?? 1)
+        : 0;
+    return {
+      success: successBase + ((index * 3 + successBase) % 5) + surge,
+      failed,
+    };
+  });
+
 const identityT = ((key: string) => key) as TFunction;
 
 const startOfLocalDayIso = (input = now()) => {
@@ -203,11 +737,23 @@ const initialRawConfig: Record<string, unknown> = {
       ],
     },
   ],
+  'interactions-api-key': [
+    {
+      'api-key': 'interactions-demo-native-key',
+      'auth-index': 'interactions-native-01',
+      priority: 15,
+      weight: 2,
+      prefix: 'interactions',
+      'base-url': 'https://generativelanguage.googleapis.com',
+      models: [{ name: 'gemini-2.5-flash', alias: 'Interactions Native' }],
+    },
+  ],
   'codex-api-key': [
     {
       'api-key': 'codex-demo-team-pool',
       'auth-index': 'codex-team-01',
       priority: 20,
+      weight: 3,
       prefix: 'codex',
       'base-url': 'https://chatgpt.com',
       models: [{ name: 'gpt-5-codex', alias: 'Codex Team' }],
@@ -220,8 +766,20 @@ const initialRawConfig: Record<string, unknown> = {
       prefix: 'xai-team',
       'base-url': 'https://api.x.ai/v1',
       priority: 9,
+      weight: 2,
       websockets: true,
       models: [{ name: 'grok-4.5', alias: 'Grok Team' }],
+    },
+  ],
+  'meta-api-key': [
+    {
+      'api-key': 'meta-demo-team-key',
+      'auth-index': 'meta-api-team-01',
+      prefix: 'meta-team',
+      'base-url': 'https://api.meta.ai/v1',
+      priority: 15,
+      weight: 3,
+      models: [{ name: 'llama-3.3-70b-instruct', alias: 'Meta Llama 3.3' }],
     },
   ],
   'claude-api-key': [
@@ -229,6 +787,7 @@ const initialRawConfig: Record<string, unknown> = {
       'api-key': 'claude-demo-team-key',
       'auth-index': 'claude-team-01',
       priority: 30,
+      weight: 4,
       prefix: 'claude',
       'base-url': 'https://api.anthropic.com',
       models: [
@@ -242,6 +801,7 @@ const initialRawConfig: Record<string, unknown> = {
       'api-key': 'vertex-demo-service-account',
       'auth-index': 'vertex-prod-01',
       priority: 40,
+      weight: 5,
       prefix: 'vertex',
       'base-url': 'https://aiplatform.googleapis.com',
       models: [{ name: 'gemini-2.5-pro', alias: 'Vertex Regional' }],
@@ -267,8 +827,8 @@ const initialRawConfig: Record<string, unknown> = {
       name: 'kuaileshifu',
       'base-url': 'https://api.kuaileshifu.example/v1',
       'api-key-entries': [
-        { 'api-key': 'sk-kuai-demo-key-1111aaaa', 'auth-index': 'kuai-auth-1' },
-        { 'api-key': 'sk-kuai-demo-key-2222bbbb', 'auth-index': 'kuai-auth-2' },
+        { 'api-key': 'sk-kuai-demo-key-1111aaaa', 'auth-index': 'kuai-auth-1', weight: 3 },
+        { 'api-key': 'sk-kuai-demo-key-2222bbbb', 'auth-index': 'kuai-auth-2', weight: 1 },
       ],
       models: [
         { name: 'gpt-4.1-mini', alias: 'Kuai Mini' },
@@ -303,7 +863,7 @@ const initialRawConfig: Record<string, unknown> = {
 };
 
 const demoAuthFiles: AuthFilesResponse = {
-  total: 20,
+  total: 23,
   files: [
     {
       id: 'codex-upgrade-demo-runtime',
@@ -313,16 +873,18 @@ const demoAuthFiles: AuthFilesResponse = {
       authIndex: 'codex-upgrade-demo-01',
       disabled: false,
       status: 'healthy',
-      statusMessage: 'Ready',
       size: 4612,
       modified: now() - 4 * hour,
       last_refresh: new Date(now() - 4 * hour).toISOString(),
       account_snapshot: 'Upgrade Demo',
+      account: 'Upgrade Demo',
+      label: 'Codex Upgrade Demo',
       account_id: 'acct_codex_upgrade_demo',
       plan_type: 'free',
       id_token: { plan_type: 'free' },
       success: 318,
       failed: 2,
+      recent_requests: demoRecentRequests(3, { failureEvery: 9 }),
     },
     {
       id: 'codex-team-01.json',
@@ -332,14 +894,22 @@ const demoAuthFiles: AuthFilesResponse = {
       authIndex: 'codex-team-01',
       disabled: false,
       status: 'healthy',
-      statusMessage: 'Ready',
       size: 4820,
       modified: now() - 2 * hour,
+      account: 'Platform Team',
+      label: 'Codex Team Primary',
       account_snapshot: 'Platform Team',
       account_id: 'acct_codex_team',
+      priority: 90,
+      note: '生产主力通道 · VIP集群',
+      id_token: {
+        plan_type: 'team',
+        chatgpt_subscription_active_until: demoResetIso(23 * day),
+      },
       plan_type: 'team',
       success: 1842,
       failed: 18,
+      recent_requests: demoRecentRequests(12, { failureEvery: 17, surgeEvery: 6 }),
     },
     {
       // Codex OAuth-style email identity: primary should be the email, secondary "codex".
@@ -350,7 +920,6 @@ const demoAuthFiles: AuthFilesResponse = {
       authIndex: 'codex-email-user-01',
       disabled: false,
       status: 'healthy',
-      statusMessage: 'Ready',
       size: 4680,
       modified: now() - 90 * minute,
       account_snapshot: 'fbcabcdef@vip.qq.com',
@@ -358,9 +927,16 @@ const demoAuthFiles: AuthFilesResponse = {
       account: 'fbcabcdef@vip.qq.com',
       label: 'codex',
       account_id: 'acct_codex_email',
+      priority: 88,
+      note: '研发支持个人席位',
+      id_token: {
+        plan_type: 'plus',
+        chatgpt_subscription_active_until: demoResetIso(5 * day),
+      },
       plan_type: 'plus',
       success: 640,
       failed: 6,
+      recent_requests: demoRecentRequests(8, { failureEvery: 15, surgeEvery: 7 }),
     },
     {
       id: 'codex-pro-20x-01.json',
@@ -370,14 +946,22 @@ const demoAuthFiles: AuthFilesResponse = {
       authIndex: 'codex-pro-20x-01',
       disabled: false,
       status: 'healthy',
-      statusMessage: 'Ready',
       size: 4960,
       modified: now() - hour,
+      account: 'Pro 20x Workspace',
+      label: 'Codex Pro 20x',
       account_snapshot: 'Pro 20x Workspace',
       account_id: 'acct_codex_pro_20x',
+      priority: 84,
+      note: '高并发推理池 · 临期需续费',
+      id_token: {
+        plan_type: 'pro',
+        chatgpt_subscription_active_until: demoResetIso(2 * day),
+      },
       plan_type: 'pro',
       success: 1260,
       failed: 8,
+      recent_requests: demoRecentRequests(10, { failureEvery: 19, surgeEvery: 6 }),
     },
     {
       id: 'codex-fallback-02.json',
@@ -387,14 +971,48 @@ const demoAuthFiles: AuthFilesResponse = {
       authIndex: 'codex-fallback-02',
       disabled: true,
       status: 'cooldown',
-      statusMessage: 'Recovering from quota pressure',
+      statusMessage: '5 小时配额已耗尽，处于 CPAMP 冷却保护中',
       size: 4710,
       modified: now() - 6 * hour,
+      account: 'Automation Pool',
+      label: 'Codex Fallback Pool',
       account_snapshot: 'Automation Pool',
       account_id: 'acct_codex_auto',
+      priority: -10,
+      note: '夜间降级兜底池',
+      id_token: {
+        plan_type: 'team',
+        chatgpt_subscription_active_until: demoResetIso(12 * day),
+      },
       plan_type: 'team',
       success: 934,
       failed: 42,
+      recent_requests: demoRecentRequests(4, {
+        failureEvery: 4,
+        failureSize: 2,
+        surgeEvery: 9,
+      }),
+    },
+    {
+      name: 'codex-expired-oauth-03.json',
+      type: 'codex',
+      provider: 'codex',
+      authIndex: 'codex-expired-oauth-03',
+      disabled: false,
+      status: 'auth_error',
+      statusMessage: 'OAuth 授权凭据已失效，请重新登录授权',
+      size: 4688,
+      modified: now() - 5 * hour,
+      account: 'Design Tools Seat',
+      label: 'Codex Design Seat',
+      account_snapshot: 'Design Tools Seat',
+      account_id: 'acct_codex_design',
+      priority: 35,
+      note: '离职人员留存凭证',
+      id_token: { plan_type: 'free' },
+      success: 284,
+      failed: 29,
+      recent_requests: demoRecentRequests(1, { failureEvery: 2, failureSize: 1, idlePrefix: 2 }),
     },
     {
       name: 'claude-team-01.json',
@@ -405,35 +1023,15 @@ const demoAuthFiles: AuthFilesResponse = {
       status: 'healthy',
       size: 3920,
       modified: now() - day,
+      account: 'Research Team',
+      label: 'Claude Team',
       account_snapshot: 'Research Team',
+      priority: 80,
+      note: '算法组 Claude 专享专线',
+      plan_type: 'pro',
       success: 1520,
       failed: 9,
-    },
-    {
-      name: 'gemini-prod-01.json',
-      type: 'gemini',
-      provider: 'gemini',
-      authIndex: 'gemini-prod-01',
-      disabled: false,
-      status: 'healthy',
-      project_id: 'demo-gemini-prod',
-      size: 5160,
-      modified: now() - 3 * hour,
-      success: 2104,
-      failed: 11,
-    },
-    {
-      name: 'vertex-regional-01.json',
-      type: 'vertex',
-      provider: 'vertex',
-      authIndex: 'vertex-regional-01',
-      disabled: false,
-      status: 'healthy',
-      projectId: 'demo-vertex-regional',
-      size: 5544,
-      modified: now() - 5 * hour,
-      success: 642,
-      failed: 7,
+      recent_requests: demoRecentRequests(10, { failureEvery: 10, surgeEvery: 8 }),
     },
     {
       name: 'antigravity-builder.json',
@@ -445,8 +1043,31 @@ const demoAuthFiles: AuthFilesResponse = {
       project_id: 'demo-antigravity-project',
       size: 4980,
       modified: now() - 9 * hour,
+      account: 'Builder Lab',
+      label: 'Antigravity Builder',
+      account_snapshot: 'Builder Lab',
+      priority: 65,
       success: 721,
       failed: 5,
+      recent_requests: demoRecentRequests(6, { failureEvery: 14, surgeEvery: 7 }),
+    },
+    {
+      name: 'antigravity-free-weekly.json',
+      type: 'antigravity',
+      provider: 'antigravity',
+      authIndex: 'antigravity-free-weekly-05',
+      disabled: false,
+      status: 'healthy',
+      project_id: 'demo-antigravity-project',
+      size: 4588,
+      modified: now() - 2 * hour,
+      account: 'AG Free Seat',
+      label: 'Antigravity Free Weekly',
+      account_snapshot: 'AG Free Seat',
+      priority: 48,
+      success: 318,
+      failed: 11,
+      recent_requests: demoRecentRequests(4, { failureEvery: 10, surgeEvery: 6 }),
     },
     {
       name: 'kimi-coding.json',
@@ -455,11 +1076,16 @@ const demoAuthFiles: AuthFilesResponse = {
       authIndex: 'kimi-coding-01',
       disabled: true,
       status: 'disabled',
-      statusMessage: 'Queued for review',
+      statusMessage: 'Disabled after repeated quota warnings',
       size: 2360,
       modified: now() - 2 * day,
+      account: 'Kimi Coding',
+      label: 'Kimi Coding',
+      account_snapshot: 'Kimi Coding',
+      priority: 20,
       success: 186,
       failed: 36,
+      recent_requests: demoRecentRequests(2, { failureEvery: 3, failureSize: 1, quietEvery: 5 }),
     },
     {
       // xAI OAuth-style email identity: primary should be the email, secondary "xai".
@@ -477,8 +1103,10 @@ const demoAuthFiles: AuthFilesResponse = {
       email: 'oc0demo01@yijihwjw.com',
       account: 'oc0demo01@yijihwjw.com',
       label: 'xai',
+      priority: 45,
       success: 294,
       failed: 4,
+      recent_requests: demoRecentRequests(5, { failureEvery: 11 }),
     },
     {
       id: 'xai-email-user.json',
@@ -494,8 +1122,10 @@ const demoAuthFiles: AuthFilesResponse = {
       email: 'oc1demo02@yijihwjw.com',
       account: 'oc1demo02@yijihwjw.com',
       label: 'xai',
+      priority: 38,
       success: 188,
       failed: 3,
+      recent_requests: demoRecentRequests(6, { failureEvery: 16, surgeEvery: 8 }),
     },
     {
       id: 'xai-expired.json',
@@ -514,6 +1144,7 @@ const demoAuthFiles: AuthFilesResponse = {
       label: 'xai',
       success: 82,
       failed: 12,
+      recent_requests: demoRecentRequests(3, { failureEvery: 4 }),
     },
     {
       name: 'openai-support-02.json',
@@ -525,8 +1156,11 @@ const demoAuthFiles: AuthFilesResponse = {
       size: 3440,
       modified: now() - 4 * hour,
       account_snapshot: 'Support Desk',
+      account: 'Support Desk',
+      label: 'OpenAI Support',
       success: 1086,
       failed: 12,
+      recent_requests: demoRecentRequests(4, { failureEvery: 13 }),
     },
     {
       name: 'claude-research-02.json',
@@ -537,83 +1171,168 @@ const demoAuthFiles: AuthFilesResponse = {
       status: 'healthy',
       size: 4048,
       modified: now() - 7 * hour,
+      account: 'Batch Research',
+      label: 'Claude Batch',
       account_snapshot: 'Batch Research',
+      priority: 60,
+      plan_type: 'pro',
       success: 934,
       failed: 18,
+      recent_requests: demoRecentRequests(7, { failureEvery: 8, failureSize: 2 }),
     },
     {
-      name: 'gemini-batch-02.json',
-      type: 'gemini',
-      provider: 'gemini',
-      authIndex: 'gemini-batch-02',
+      name: 'claude-extra-usage-03.json',
+      type: 'claude',
+      provider: 'claude',
+      authIndex: 'claude-extra-usage-03',
       disabled: false,
       status: 'healthy',
-      project_id: 'demo-gemini-batch',
-      size: 5216,
-      modified: now() - 11 * hour,
-      account_snapshot: 'Gemini Batch',
-      success: 844,
-      failed: 9,
+      size: 3976,
+      modified: now() - 4 * hour,
+      account: 'Overage Research',
+      label: 'Claude Extra Usage',
+      account_snapshot: 'Overage Research',
+      priority: 55,
+      plan_type: 'pro',
+      success: 612,
+      failed: 18,
+      recent_requests: demoRecentRequests(5, { failureEvery: 9, failureSize: 1, surgeEvery: 6 }),
     },
     {
-      name: 'deepseek-ops-01.json',
-      type: 'openai',
-      provider: 'deepseek',
-      authIndex: 'deepseek-ops-01',
+      name: 'antigravity-daily-exhausted.json',
+      type: 'antigravity',
+      provider: 'antigravity',
+      authIndex: 'antigravity-daily-02',
       disabled: false,
       status: 'cooldown',
-      statusMessage: 'Short retry backoff',
-      size: 2860,
-      modified: now() - 14 * hour,
-      account_snapshot: 'Edge Experiments',
-      success: 312,
-      failed: 16,
-    },
-    {
-      name: 'kuai-auth-1.json',
-      type: 'openai',
-      provider: 'openai',
-      authIndex: 'kuai-auth-1',
-      disabled: false,
-      status: 'healthy',
-      size: 2680,
-      modified: now() - 2 * hour,
-      account_snapshot: 'kuaileshifu',
-      label: 'kuaileshifu',
-      success: 420,
-      failed: 5,
-    },
-    {
-      name: 'kuai-auth-2.json',
-      type: 'openai',
-      provider: 'openai',
-      authIndex: 'kuai-auth-2',
-      disabled: false,
-      status: 'healthy',
-      size: 2680,
+      statusMessage: 'Gemini 5-hour pool exhausted; waiting for Antigravity reset',
+      project_id: 'demo-antigravity-project',
+      size: 4864,
       modified: now() - 3 * hour,
-      account_snapshot: 'kuaileshifu',
-      label: 'kuaileshifu',
-      success: 360,
-      failed: 4,
+      account: 'AG Gemini Pool',
+      label: 'Antigravity Gemini Pool',
+      account_snapshot: 'AG Gemini Pool',
+      priority: 40,
+      success: 386,
+      failed: 31,
+      recent_requests: demoRecentRequests(3, { failureEvery: 4, failureSize: 2, surgeEvery: 8 }),
     },
     {
-      name: 'anyrouter-auth-1.json',
-      type: 'openai',
-      provider: 'openai',
-      authIndex: 'anyrouter-auth-1',
+      name: 'antigravity-monthly-low.json',
+      type: 'antigravity',
+      provider: 'antigravity',
+      authIndex: 'antigravity-monthly-03',
       disabled: false,
       status: 'healthy',
-      size: 2540,
-      modified: now() - 4 * hour,
-      account_snapshot: 'anyrouter.top #1',
-      label: 'anyrouter.top #1',
-      success: 280,
-      failed: 3,
+      project_id: 'demo-antigravity-project',
+      size: 4924,
+      modified: now() - 11 * hour,
+      account: 'AG Claude Pool',
+      label: 'Antigravity Claude Pool',
+      account_snapshot: 'AG Claude Pool',
+      priority: 35,
+      success: 492,
+      failed: 9,
+      recent_requests: demoRecentRequests(4, { failureEvery: 13, surgeEvery: 5 }),
     },
-  ],
+    {
+      name: 'antigravity-pro-matrix.json',
+      type: 'antigravity',
+      provider: 'antigravity',
+      authIndex: 'antigravity-pro-matrix-04',
+      disabled: false,
+      status: 'healthy',
+      project_id: 'demo-antigravity-project',
+      size: 5012,
+      modified: now() - 38 * minute,
+      account: 'AG Pro Matrix',
+      label: 'Antigravity Pro Matrix',
+      account_snapshot: 'AG Pro Matrix',
+      priority: 52,
+      success: 548,
+      failed: 22,
+      recent_requests: demoRecentRequests(5, { failureEvery: 6, failureSize: 1, surgeEvery: 4 }),
+    },
+    {
+      name: 'kimi-healthy.json',
+      type: 'kimi',
+      provider: 'kimi',
+      authIndex: 'kimi-healthy-02',
+      disabled: false,
+      status: 'healthy',
+      size: 2288,
+      modified: now() - 5 * hour,
+      account: 'Kimi Explore',
+      label: 'Kimi Explore',
+      account_snapshot: 'Kimi Explore',
+      priority: 50,
+      success: 522,
+      failed: 8,
+      recent_requests: demoRecentRequests(4, { failureEvery: 18, surgeEvery: 7 }),
+    },
+    {
+      name: 'kimi-exhausted.json',
+      type: 'kimi',
+      provider: 'kimi',
+      authIndex: 'kimi-exhausted-03',
+      disabled: false,
+      status: 'cooldown',
+      statusMessage: 'Kimi 5-hour quota exhausted; low-priority jobs paused',
+      size: 2312,
+      modified: now() - 90 * minute,
+      account: 'Kimi 5h Cap',
+      label: 'Kimi 5h Cap',
+      account_snapshot: 'Kimi 5h Cap',
+      priority: 15,
+      success: 74,
+      failed: 21,
+      recent_requests: demoRecentRequests(1, { failureEvery: 2, failureSize: 2, idlePrefix: 1 }),
+    },
+    {
+      name: 'xai-payg-buffer.json',
+      type: 'xai',
+      provider: 'xai',
+      authIndex: 'xai-payg-buffer-02',
+      disabled: false,
+      status: 'healthy',
+      size: 3212,
+      modified: now() - 2 * hour,
+      account: 'xAI PAYG Buffer',
+      label: 'xAI PAYG Buffer',
+      account_snapshot: 'xAI PAYG Buffer',
+      priority: 42,
+      success: 436,
+      failed: 10,
+      recent_requests: demoRecentRequests(4, { failureEvery: 12, surgeEvery: 6 }),
+    },
+    {
+      name: 'xai-payg-cap.json',
+      type: 'xai',
+      provider: 'xai',
+      authIndex: 'xai-payg-cap-03',
+      disabled: false,
+      status: 'cooldown',
+      statusMessage: 'Monthly credits and pay-as-you-go cap are both exhausted',
+      size: 3196,
+      modified: now() - 40 * minute,
+      account: 'xAI Cap Reached',
+      label: 'xAI Cap Reached',
+      account_snapshot: 'xAI Cap Reached',
+      priority: 18,
+      success: 118,
+      failed: 32,
+      recent_requests: demoRecentRequests(2, { failureEvery: 3, failureSize: 2, idlePrefix: 1 }),
+    },
+  ].map((file) => ({
+    ...file,
+    id:
+      typeof file.id === 'string' && file.id.trim()
+        ? file.id
+        : `demo-auth-${String(file.authIndex ?? file.name).trim()}`,
+  })),
 };
 
+const getDemoAuthFileItems = (): AuthFileItem[] => demoAuthFiles.files;
 const DEMO_CODEX_UPGRADE_AUTH_ID = 'codex-upgrade-demo-runtime';
 const DEMO_CODEX_UPGRADE_FILE_NAME = 'codex-upgrade-demo.json';
 const DEMO_CODEX_UPGRADE_POLL_COUNT = 2;
@@ -792,7 +1511,7 @@ const demoManagerConfig: ManagerConfigResponse = {
   config: {
     cpaConnection: {
       cpaBaseUrl: DEMO_API_BASE,
-      managementKey: 'demo-cpa-management-key',
+      managementKeyConfigured: true,
     },
     collector: {
       enabled: true,
@@ -862,23 +1581,21 @@ const demoModelPriceUsageSummary: ModelPriceUsageSummaryResponse = {
 };
 
 const demoApiAliases: ApiKeyAlias[] = [
-  { apiKeyHash: 'hash_openai_primary', alias: 'OpenAI Primary', updatedAtMs: now() - day },
   { apiKeyHash: 'hash_codex_team', alias: 'Codex Team', updatedAtMs: now() - 2 * hour },
-  { apiKeyHash: 'hash_gemini_prod', alias: 'Gemini Production', updatedAtMs: now() - 3 * hour },
   { apiKeyHash: 'hash_automation_pool', alias: 'Automation Pool', updatedAtMs: now() - 4 * hour },
   { apiKeyHash: 'hash_research_shared', alias: 'Research Shared', updatedAtMs: now() - 5 * hour },
-  { apiKeyHash: 'hash_support_console', alias: 'Support Console', updatedAtMs: now() - 6 * hour },
   { apiKeyHash: 'hash_research_batch', alias: 'Research Batch', updatedAtMs: now() - 7 * hour },
-  { apiKeyHash: 'hash_gemini_batch', alias: 'Gemini Batch', updatedAtMs: now() - 8 * hour },
   { apiKeyHash: 'hash_kimi_coding', alias: 'Kimi Coding', updatedAtMs: now() - 9 * hour },
   { apiKeyHash: 'hash_builder_lab', alias: 'Builder Lab', updatedAtMs: now() - 10 * hour },
   { apiKeyHash: 'hash_xai_ops', alias: 'xAI Ops', updatedAtMs: now() - 11 * hour },
   { apiKeyHash: 'hash_xai_email_user', alias: 'xAI Email User', updatedAtMs: now() - 9 * hour },
   { apiKeyHash: 'hash_codex_email_user', alias: 'Codex Email User', updatedAtMs: now() - 8 * hour },
+  { apiKeyHash: 'hash_codex_pro_20x', alias: 'Codex Pro 20x', updatedAtMs: now() - 7 * hour },
   { apiKeyHash: 'hash_kuai_key_1', alias: 'kuaileshifu #1', updatedAtMs: now() - 6 * hour },
   { apiKeyHash: 'hash_kuai_key_2', alias: 'kuaileshifu #2', updatedAtMs: now() - 5 * hour },
   { apiKeyHash: 'hash_anyrouter_top', alias: 'anyrouter.top #1', updatedAtMs: now() - 4 * hour },
   { apiKeyHash: 'hash_deepseek_ops', alias: 'DeepSeek Ops', updatedAtMs: now() - 12 * hour },
+  { apiKeyHash: 'hash_codex_design', alias: 'Codex Design Seat', updatedAtMs: now() - 13 * hour },
 ];
 
 const dashboardBase = (inputNow = now()): DashboardSummaryResponse => {
@@ -1199,8 +1916,16 @@ const buildMonitoringAnalytics = (
   baseNow = now(),
   request?: MonitoringAnalyticsRequest
 ): MonitoringAnalyticsResponse => {
-  const dashboard = dashboardBase(baseNow);
-  const analyticsNow = dashboard.generated_at_ms;
+  const requestNow =
+    typeof request?.now_ms === 'number' && Number.isFinite(request.now_ms) && request.now_ms > 0
+      ? request.now_ms
+      : baseNow;
+  const rangeEnd =
+    typeof request?.to_ms === 'number' && Number.isFinite(request.to_ms) && request.to_ms > 0
+      ? request.to_ms
+      : requestNow;
+  const analyticsNow = Math.min(requestNow, rangeEnd);
+  const dashboard = dashboardBase(requestNow);
   const timeline = Array.from({ length: 14 }, (_, index) => {
     const bucket = analyticsNow - (13 - index) * day;
     const calls = 1180 + ((index * 137) % 620);
@@ -1247,7 +1972,6 @@ const buildMonitoringAnalytics = (
     buildNestedModelRow('gemini-2.5-flash', 2140, 24, 1_780_000, 28.9, analyticsNow - 6 * minute),
     buildNestedModelRow('qwen-plus', 1160, 18, 980_000, 12.6, analyticsNow - 34 * minute),
     buildNestedModelRow('claude-haiku-4-5', 980, 12, 860_000, 18.4, analyticsNow - 52 * minute),
-    buildNestedModelRow('deepseek-chat', 740, 20, 610_000, 6.8, analyticsNow - 44 * minute),
     buildNestedModelRow('grok-4-fast', 860, 14, 690_000, 12.2, analyticsNow - 55 * minute),
   ].map(({ last_seen_ms: _lastSeenMs, ...row }) => row);
   const summaryCalls = modelStats.reduce((sum, row) => sum + row.calls, 0);
@@ -1490,6 +2214,25 @@ const buildMonitoringAnalytics = (
       ],
     },
     {
+      id: 'acct_ag_free_weekly',
+      account_snapshot: 'AG Free Seat',
+      auth_label_snapshot: 'Antigravity Free Weekly',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-free-weekly-05'],
+      sources: ['free-weekly'],
+      source_hashes: ['src_antigravity_free'],
+      calls: 410,
+      failure_calls: 11,
+      total_tokens: 310_000,
+      cost: 5.9,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 14 * minute,
+      models: [
+        buildNestedModelRow('gemini-2.5-flash', 245, 5, 190_000, 3.1, analyticsNow - 14 * minute),
+        buildNestedModelRow('claude-sonnet-4-5', 165, 6, 120_000, 2.8, analyticsNow - 23 * minute),
+      ],
+    },
+    {
       // xAI email identity: primary masked email, secondary "xai".
       id: 'acct_ops_console',
       account_snapshot: 'oc0demo01@yijihwjw.com',
@@ -1544,6 +2287,25 @@ const buildMonitoringAnalytics = (
       models: [
         buildNestedModelRow('gpt-4.1-mini', 680, 8, 460_000, 6.2, analyticsNow - 9 * minute),
         buildNestedModelRow('gpt-4.1', 300, 4, 320_000, 10.6, analyticsNow - 22 * minute),
+      ],
+    },
+    {
+      id: 'acct_codex_pro_20x',
+      account_snapshot: 'Pro 20x Workspace',
+      auth_label_snapshot: 'Codex Pro 20x',
+      auth_provider_snapshot: 'codex',
+      auth_indices: ['codex-pro-20x-01'],
+      sources: ['team'],
+      source_hashes: ['src_codex_pro_20x'],
+      calls: 1260,
+      failure_calls: 8,
+      total_tokens: 1_040_000,
+      cost: 22.4,
+      average_latency_ms: 1110,
+      last_seen_ms: analyticsNow - 6 * minute,
+      models: [
+        buildNestedModelRow('gpt-4.1-mini', 800, 5, 660_000, 11.2, analyticsNow - 6 * minute),
+        buildNestedModelRow('gpt-4.1', 460, 3, 380_000, 11.2, analyticsNow - 18 * minute),
       ],
     },
     {
@@ -1614,13 +2376,188 @@ const buildMonitoringAnalytics = (
       sources: ['ops'],
       source_hashes: ['src_deepseek_ops'],
       calls: 740,
-      failure_calls: 20,
-      total_tokens: 610_000,
-      cost: 6.8,
-      average_latency_ms: 1580,
-      last_seen_ms: analyticsNow - 44 * minute,
+      failure_calls: 18,
+      total_tokens: 1_120_000,
+      cost: 34.6,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 22 * minute,
       models: [
-        buildNestedModelRow('deepseek-chat', 740, 20, 610_000, 6.8, analyticsNow - 44 * minute),
+        buildNestedModelRow(
+          'claude-sonnet-4-5',
+          520,
+          14,
+          860_000,
+          29.4,
+          analyticsNow - 22 * minute
+        ),
+        buildNestedModelRow('claude-haiku-4-5', 220, 4, 260_000, 5.2, analyticsNow - 39 * minute),
+      ],
+    },
+    {
+      id: 'acct_codex_design',
+      account_snapshot: 'Design Tools Seat',
+      auth_label_snapshot: 'Codex Design Seat',
+      auth_provider_snapshot: 'codex',
+      auth_indices: ['codex-expired-oauth-03'],
+      sources: ['design'],
+      source_hashes: ['src_codex_design'],
+      calls: 320,
+      failure_calls: 38,
+      total_tokens: 240_000,
+      cost: 5.2,
+      average_latency_ms: 1980,
+      last_seen_ms: analyticsNow - 37 * minute,
+      models: [buildNestedModelRow('gpt-4.1', 320, 38, 240_000, 5.2, analyticsNow - 37 * minute)],
+    },
+    {
+      id: 'acct_claude_extra_usage',
+      account_snapshot: 'Overage Research',
+      auth_label_snapshot: 'Claude Extra Usage',
+      auth_provider_snapshot: 'claude',
+      auth_indices: ['claude-extra-usage-03'],
+      sources: ['overage'],
+      source_hashes: ['src_claude_overage'],
+      calls: 740,
+      failure_calls: 18,
+      total_tokens: 1_120_000,
+      cost: 34.6,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 22 * minute,
+      models: [
+        buildNestedModelRow(
+          'claude-sonnet-4-5',
+          520,
+          14,
+          860_000,
+          29.4,
+          analyticsNow - 22 * minute
+        ),
+        buildNestedModelRow('claude-haiku-4-5', 220, 4, 260_000, 5.2, analyticsNow - 39 * minute),
+      ],
+    },
+    {
+      id: 'acct_ag_daily_queue',
+      account_snapshot: 'AG Gemini Pool',
+      auth_label_snapshot: 'Antigravity Gemini Pool',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-daily-02'],
+      sources: ['daily-cap'],
+      source_hashes: ['src_antigravity_daily'],
+      calls: 540,
+      failure_calls: 44,
+      total_tokens: 460_000,
+      cost: 8.7,
+      average_latency_ms: 1860,
+      last_seen_ms: analyticsNow - 16 * minute,
+      models: [
+        buildNestedModelRow('gemini-2.5-flash', 540, 44, 460_000, 8.7, analyticsNow - 16 * minute),
+      ],
+    },
+    {
+      id: 'acct_ag_month_end',
+      account_snapshot: 'AG Claude Pool',
+      auth_label_snapshot: 'Antigravity Claude Pool',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-monthly-03'],
+      sources: ['month-end'],
+      source_hashes: ['src_antigravity_monthly'],
+      calls: 680,
+      failure_calls: 16,
+      total_tokens: 610_000,
+      cost: 10.2,
+      average_latency_ms: 1380,
+      last_seen_ms: analyticsNow - 32 * minute,
+      models: [
+        buildNestedModelRow('gemini-2.5-pro', 420, 10, 420_000, 7.8, analyticsNow - 32 * minute),
+        buildNestedModelRow('gpt-4.1-mini', 260, 6, 190_000, 2.4, analyticsNow - 41 * minute),
+      ],
+    },
+    {
+      id: 'acct_ag_pro_matrix',
+      account_snapshot: 'AG Pro Matrix',
+      auth_label_snapshot: 'Antigravity Pro Matrix',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-pro-matrix-04'],
+      sources: ['matrix-stress'],
+      source_hashes: ['src_antigravity_matrix'],
+      calls: 720,
+      failure_calls: 22,
+      total_tokens: 690_000,
+      cost: 12.8,
+      average_latency_ms: 1290,
+      last_seen_ms: analyticsNow - 9 * minute,
+      models: [
+        buildNestedModelRow('gemini-2.5-pro', 360, 5, 370_000, 6.9, analyticsNow - 9 * minute),
+        buildNestedModelRow('claude-sonnet-4-5', 220, 12, 230_000, 4.3, analyticsNow - 18 * minute),
+        buildNestedModelRow('gpt-4.1-mini', 140, 5, 90_000, 1.6, analyticsNow - 26 * minute),
+      ],
+    },
+    {
+      id: 'acct_kimi_explore',
+      account_snapshot: 'Kimi Explore',
+      auth_label_snapshot: 'Kimi Explore',
+      auth_provider_snapshot: 'kimi',
+      auth_indices: ['kimi-healthy-02'],
+      sources: ['explore'],
+      source_hashes: ['src_kimi_explore'],
+      calls: 700,
+      failure_calls: 8,
+      total_tokens: 520_000,
+      cost: 7.4,
+      average_latency_ms: 1560,
+      last_seen_ms: analyticsNow - 26 * minute,
+      models: [buildNestedModelRow('qwen-plus', 700, 8, 520_000, 7.4, analyticsNow - 26 * minute)],
+    },
+    {
+      id: 'acct_kimi_daily_cap',
+      account_snapshot: 'Kimi 5h Cap',
+      auth_label_snapshot: 'Kimi 5h Cap',
+      auth_provider_snapshot: 'kimi',
+      auth_indices: ['kimi-exhausted-03'],
+      sources: ['daily-cap'],
+      source_hashes: ['src_kimi_daily_cap'],
+      calls: 180,
+      failure_calls: 34,
+      total_tokens: 140_000,
+      cost: 2.1,
+      average_latency_ms: 2210,
+      last_seen_ms: analyticsNow - 11 * minute,
+      models: [buildNestedModelRow('qwen-plus', 180, 34, 140_000, 2.1, analyticsNow - 11 * minute)],
+    },
+    {
+      id: 'acct_xai_payg_buffer',
+      account_snapshot: 'xAI PAYG Buffer',
+      auth_label_snapshot: 'xAI PAYG Buffer',
+      auth_provider_snapshot: 'xai',
+      auth_indices: ['xai-payg-buffer-02'],
+      sources: ['payg-buffer'],
+      source_hashes: ['src_xai_payg_buffer'],
+      calls: 620,
+      failure_calls: 10,
+      total_tokens: 510_000,
+      cost: 9.8,
+      average_latency_ms: 1430,
+      last_seen_ms: analyticsNow - 17 * minute,
+      models: [
+        buildNestedModelRow('grok-4-fast', 620, 10, 510_000, 9.8, analyticsNow - 17 * minute),
+      ],
+    },
+    {
+      id: 'acct_xai_cap_reached',
+      account_snapshot: 'xAI Cap Reached',
+      auth_label_snapshot: 'xAI Cap Reached',
+      auth_provider_snapshot: 'xai',
+      auth_indices: ['xai-payg-cap-03'],
+      sources: ['payg-cap'],
+      source_hashes: ['src_xai_payg_cap'],
+      calls: 260,
+      failure_calls: 48,
+      total_tokens: 210_000,
+      cost: 4.9,
+      average_latency_ms: 2340,
+      last_seen_ms: analyticsNow - 7 * minute,
+      models: [
+        buildNestedModelRow('grok-4-fast', 260, 48, 210_000, 4.9, analyticsNow - 7 * minute),
       ],
     },
   ].map((row) => {
@@ -1637,6 +2574,7 @@ const buildMonitoringAnalytics = (
       cache_creation_tokens: tokenSplit.cache_creation_tokens,
     };
   });
+  const getAccountModels = (id: string) => accountStats.find((row) => row.id === id)?.models ?? [];
 
   const credentialStats = [
     {
@@ -1654,7 +2592,7 @@ const buildMonitoringAnalytics = (
       cost: 88.1,
       average_latency_ms: 1220,
       last_seen_ms: analyticsNow - 8 * minute,
-      models: accountStats[0].models,
+      models: getAccountModels('acct_platform_team'),
     },
     {
       id: 'claude-team-01',
@@ -1671,7 +2609,7 @@ const buildMonitoringAnalytics = (
       cost: 158.7,
       average_latency_ms: 1380,
       last_seen_ms: analyticsNow - 13 * minute,
-      models: accountStats[1].models,
+      models: getAccountModels('acct_research_team'),
     },
     {
       id: 'gemini-prod-01',
@@ -1742,7 +2680,7 @@ const buildMonitoringAnalytics = (
       cost: 31.7,
       average_latency_ms: 2140,
       last_seen_ms: analyticsNow - 18 * minute,
-      models: accountStats[4].models,
+      models: getAccountModels('acct_automation_pool'),
     },
     {
       id: 'kimi-coding-01',
@@ -1759,7 +2697,7 @@ const buildMonitoringAnalytics = (
       cost: 15.8,
       average_latency_ms: 1710,
       last_seen_ms: analyticsNow - 48 * minute,
-      models: accountStats[8].models,
+      models: getAccountModels('acct_kimi_coding'),
     },
     {
       id: 'antigravity-builder',
@@ -1776,7 +2714,24 @@ const buildMonitoringAnalytics = (
       cost: 14.4,
       average_latency_ms: 1320,
       last_seen_ms: analyticsNow - 27 * minute,
-      models: accountStats[9].models,
+      models: getAccountModels('acct_builder_lab'),
+    },
+    {
+      id: 'antigravity-free-weekly-05',
+      auth_file_snapshot: 'antigravity-free-weekly.json',
+      auth_index: 'antigravity-free-weekly-05',
+      source: 'free-weekly',
+      source_hash: 'src_antigravity_free',
+      account_snapshot: 'AG Free Seat',
+      auth_label_snapshot: 'Antigravity Free Weekly',
+      auth_provider_snapshot: 'antigravity',
+      calls: 410,
+      failure_calls: 11,
+      total_tokens: 310_000,
+      cost: 5.9,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 14 * minute,
+      models: getAccountModels('acct_ag_free_weekly'),
     },
     {
       id: 'xai-ops-01',
@@ -1793,7 +2748,7 @@ const buildMonitoringAnalytics = (
       cost: 12.2,
       average_latency_ms: 1490,
       last_seen_ms: analyticsNow - 55 * minute,
-      models: accountStats[10].models,
+      models: getAccountModels('acct_ops_console'),
     },
     {
       id: 'xai-email-user-01',
@@ -1810,7 +2765,7 @@ const buildMonitoringAnalytics = (
       cost: 7.4,
       average_latency_ms: 1420,
       last_seen_ms: analyticsNow - 14 * minute,
-      models: accountStats[11].models,
+      models: getAccountModels('acct_xai_email_user'),
     },
     {
       id: 'codex-email-user-01',
@@ -1827,7 +2782,24 @@ const buildMonitoringAnalytics = (
       cost: 16.8,
       average_latency_ms: 1180,
       last_seen_ms: analyticsNow - 9 * minute,
-      models: accountStats[12].models,
+      models: getAccountModels('acct_codex_email_user'),
+    },
+    {
+      id: 'codex-pro-20x-01',
+      auth_file_snapshot: 'codex-pro-20x-01.json',
+      auth_index: 'codex-pro-20x-01',
+      source: 'team',
+      source_hash: 'src_codex_pro_20x',
+      account_snapshot: 'Pro 20x Workspace',
+      auth_label_snapshot: 'Codex Pro 20x',
+      auth_provider_snapshot: 'codex',
+      calls: 1260,
+      failure_calls: 8,
+      total_tokens: 1_040_000,
+      cost: 22.4,
+      average_latency_ms: 1110,
+      last_seen_ms: analyticsNow - 6 * minute,
+      models: getAccountModels('acct_codex_pro_20x'),
     },
     {
       id: 'kuai-auth-1',
@@ -1844,7 +2816,7 @@ const buildMonitoringAnalytics = (
       cost: 18.6,
       average_latency_ms: 1040,
       last_seen_ms: analyticsNow - 5 * minute,
-      models: accountStats[13].models,
+      models: getAccountModels('acct_kuaileshifu_key_1'),
     },
     {
       id: 'kuai-auth-2',
@@ -1861,7 +2833,7 @@ const buildMonitoringAnalytics = (
       cost: 14.2,
       average_latency_ms: 1090,
       last_seen_ms: analyticsNow - 7 * minute,
-      models: accountStats[14].models,
+      models: getAccountModels('acct_kuaileshifu_key_2'),
     },
     {
       id: 'anyrouter-auth-1',
@@ -1878,7 +2850,7 @@ const buildMonitoringAnalytics = (
       cost: 9.6,
       average_latency_ms: 980,
       last_seen_ms: analyticsNow - 12 * minute,
-      models: accountStats[15].models,
+      models: getAccountModels('acct_anyrouter_top'),
     },
     {
       id: 'openai-support-02',
@@ -1895,7 +2867,7 @@ const buildMonitoringAnalytics = (
       cost: 32.4,
       average_latency_ms: 980,
       last_seen_ms: analyticsNow - 11 * minute,
-      models: accountStats[5].models,
+      models: [],
     },
     {
       id: 'claude-research-02',
@@ -1912,7 +2884,7 @@ const buildMonitoringAnalytics = (
       cost: 83.5,
       average_latency_ms: 1510,
       last_seen_ms: analyticsNow - 19 * minute,
-      models: accountStats[6].models,
+      models: getAccountModels('acct_research_batch'),
     },
     {
       id: 'gemini-batch-02',
@@ -1930,7 +2902,7 @@ const buildMonitoringAnalytics = (
       cost: 38.2,
       average_latency_ms: 1120,
       last_seen_ms: analyticsNow - 24 * minute,
-      models: accountStats[7].models,
+      models: [],
     },
     {
       id: 'deepseek-ops-01',
@@ -1947,22 +2919,216 @@ const buildMonitoringAnalytics = (
       cost: 6.8,
       average_latency_ms: 1580,
       last_seen_ms: analyticsNow - 44 * minute,
-      models: accountStats[16].models,
+      models: getAccountModels('acct_edge_experiments'),
     },
-  ].map((row) => {
-    const tokenSplit = splitTokens(row.total_tokens);
-    const successCalls = row.calls - row.failure_calls;
-    return {
-      ...row,
-      success_calls: successCalls,
-      success_rate: safeRate(successCalls, row.calls),
-      input_tokens: tokenSplit.input_tokens,
-      output_tokens: tokenSplit.output_tokens,
-      cached_tokens: tokenSplit.cached_tokens,
-      cache_read_tokens: tokenSplit.cache_read_tokens,
-      cache_creation_tokens: tokenSplit.cache_creation_tokens,
-    };
-  });
+    {
+      id: 'codex-expired-oauth-03',
+      auth_file_snapshot: 'codex-expired-oauth-03.json',
+      auth_index: 'codex-expired-oauth-03',
+      source: 'design',
+      source_hash: 'src_codex_design',
+      account_snapshot: 'Design Tools Seat',
+      auth_label_snapshot: 'Codex Design Seat',
+      auth_provider_snapshot: 'codex',
+      calls: 320,
+      failure_calls: 38,
+      total_tokens: 240_000,
+      cost: 5.2,
+      average_latency_ms: 1980,
+      last_seen_ms: analyticsNow - 37 * minute,
+      models: getAccountModels('acct_codex_design'),
+    },
+    {
+      id: 'claude-extra-usage-03',
+      auth_file_snapshot: 'claude-extra-usage-03.json',
+      auth_index: 'claude-extra-usage-03',
+      source: 'overage',
+      source_hash: 'src_claude_overage',
+      account_snapshot: 'Overage Research',
+      auth_label_snapshot: 'Claude Extra Usage',
+      auth_provider_snapshot: 'claude',
+      calls: 740,
+      failure_calls: 18,
+      total_tokens: 1_120_000,
+      cost: 34.6,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 22 * minute,
+      models: getAccountModels('acct_claude_extra_usage'),
+    },
+    {
+      id: 'antigravity-daily-02',
+      auth_file_snapshot: 'antigravity-daily-exhausted.json',
+      auth_index: 'antigravity-daily-02',
+      source: 'daily-cap',
+      source_hash: 'src_antigravity_daily',
+      account_snapshot: 'AG Gemini Pool',
+      auth_label_snapshot: 'Antigravity Gemini Pool',
+      auth_provider_snapshot: 'antigravity',
+      calls: 540,
+      failure_calls: 44,
+      total_tokens: 460_000,
+      cost: 8.7,
+      average_latency_ms: 1860,
+      last_seen_ms: analyticsNow - 16 * minute,
+      models: getAccountModels('acct_ag_daily_queue'),
+    },
+    {
+      id: 'antigravity-monthly-03',
+      auth_file_snapshot: 'antigravity-monthly-low.json',
+      auth_index: 'antigravity-monthly-03',
+      source: 'month-end',
+      source_hash: 'src_antigravity_monthly',
+      account_snapshot: 'AG Claude Pool',
+      auth_label_snapshot: 'Antigravity Claude Pool',
+      auth_provider_snapshot: 'antigravity',
+      calls: 680,
+      failure_calls: 16,
+      total_tokens: 610_000,
+      cost: 10.2,
+      average_latency_ms: 1380,
+      last_seen_ms: analyticsNow - 32 * minute,
+      models: getAccountModels('acct_ag_month_end'),
+    },
+    {
+      id: 'antigravity-pro-matrix-04',
+      auth_file_snapshot: 'antigravity-pro-matrix.json',
+      auth_index: 'antigravity-pro-matrix-04',
+      source: 'matrix-stress',
+      source_hash: 'src_antigravity_matrix',
+      account_snapshot: 'AG Pro Matrix',
+      auth_label_snapshot: 'Antigravity Pro Matrix',
+      auth_provider_snapshot: 'antigravity',
+      calls: 720,
+      failure_calls: 22,
+      total_tokens: 690_000,
+      cost: 12.8,
+      average_latency_ms: 1290,
+      last_seen_ms: analyticsNow - 9 * minute,
+      models: getAccountModels('acct_ag_pro_matrix'),
+    },
+    {
+      id: 'kimi-healthy-02',
+      auth_file_snapshot: 'kimi-healthy.json',
+      auth_index: 'kimi-healthy-02',
+      source: 'explore',
+      source_hash: 'src_kimi_explore',
+      account_snapshot: 'Kimi Explore',
+      auth_label_snapshot: 'Kimi Explore',
+      auth_provider_snapshot: 'kimi',
+      calls: 700,
+      failure_calls: 8,
+      total_tokens: 520_000,
+      cost: 7.4,
+      average_latency_ms: 1560,
+      last_seen_ms: analyticsNow - 26 * minute,
+      models: getAccountModels('acct_kimi_explore'),
+    },
+    {
+      id: 'kimi-exhausted-03',
+      auth_file_snapshot: 'kimi-exhausted.json',
+      auth_index: 'kimi-exhausted-03',
+      source: 'daily-cap',
+      source_hash: 'src_kimi_daily_cap',
+      account_snapshot: 'Kimi 5h Cap',
+      auth_label_snapshot: 'Kimi 5h Cap',
+      auth_provider_snapshot: 'kimi',
+      calls: 180,
+      failure_calls: 34,
+      total_tokens: 140_000,
+      cost: 2.1,
+      average_latency_ms: 2210,
+      last_seen_ms: analyticsNow - 11 * minute,
+      models: getAccountModels('acct_kimi_daily_cap'),
+    },
+    {
+      id: 'xai-payg-buffer-02',
+      auth_file_snapshot: 'xai-payg-buffer.json',
+      auth_index: 'xai-payg-buffer-02',
+      source: 'payg-buffer',
+      source_hash: 'src_xai_payg_buffer',
+      account_snapshot: 'xAI PAYG Buffer',
+      auth_label_snapshot: 'xAI PAYG Buffer',
+      auth_provider_snapshot: 'xai',
+      calls: 620,
+      failure_calls: 10,
+      total_tokens: 510_000,
+      cost: 9.8,
+      average_latency_ms: 1430,
+      last_seen_ms: analyticsNow - 17 * minute,
+      models: getAccountModels('acct_xai_payg_buffer'),
+    },
+    {
+      id: 'xai-payg-cap-03',
+      auth_file_snapshot: 'xai-payg-cap.json',
+      auth_index: 'xai-payg-cap-03',
+      source: 'payg-cap',
+      source_hash: 'src_xai_payg_cap',
+      account_snapshot: 'xAI Cap Reached',
+      auth_label_snapshot: 'xAI Cap Reached',
+      auth_provider_snapshot: 'xai',
+      calls: 260,
+      failure_calls: 48,
+      total_tokens: 210_000,
+      cost: 4.9,
+      average_latency_ms: 2340,
+      last_seen_ms: analyticsNow - 7 * minute,
+      models: getAccountModels('acct_xai_cap_reached'),
+    },
+    {
+      id: 'codex-upgrade-demo-01',
+      auth_file_snapshot: 'codex-upgrade-demo.json',
+      auth_index: 'codex-upgrade-demo-01',
+      source: 'upgrade',
+      source_hash: 'src_codex_upgrade',
+      account_snapshot: 'Upgrade Demo',
+      auth_label_snapshot: 'Codex Upgrade Demo',
+      auth_provider_snapshot: 'codex',
+      calls: 318,
+      failure_calls: 2,
+      total_tokens: 250_000,
+      cost: 4.8,
+      average_latency_ms: 1100,
+      last_seen_ms: analyticsNow - 4 * hour,
+      models: [],
+    },
+    {
+      id: 'xai-expired-01',
+      auth_file_snapshot: 'xai-expired.json',
+      auth_index: 'xai-expired-01',
+      source: 'expired',
+      source_hash: 'src_xai_expired',
+      account_snapshot: 'expired.demo@example.com',
+      auth_label_snapshot: 'xAI',
+      auth_provider_snapshot: 'xai',
+      calls: 82,
+      failure_calls: 12,
+      total_tokens: 96_000,
+      cost: 1.7,
+      average_latency_ms: 1820,
+      last_seen_ms: analyticsNow - 8 * hour,
+      models: [],
+    },
+  ]
+    .filter(
+      (row) =>
+        isDemoOAuthAccountProvider(row.auth_provider_snapshot) ||
+        row.auth_file_snapshot === 'openai-support-02.json'
+    )
+    .map((row) => {
+      const tokenSplit = splitTokens(row.total_tokens);
+      const successCalls = row.calls - row.failure_calls;
+      return {
+        ...row,
+        id: resolveDemoCredentialId(row),
+        success_calls: successCalls,
+        success_rate: safeRate(successCalls, row.calls),
+        input_tokens: tokenSplit.input_tokens,
+        output_tokens: tokenSplit.output_tokens,
+        cached_tokens: tokenSplit.cached_tokens,
+        cache_read_tokens: tokenSplit.cache_read_tokens,
+        cache_creation_tokens: tokenSplit.cache_creation_tokens,
+      };
+    });
 
   const apiKeyStats = [
     {
@@ -1980,7 +3146,7 @@ const buildMonitoringAnalytics = (
       cost: 45.8,
       average_latency_ms: 1080,
       last_seen_ms: analyticsNow - 10 * minute,
-      models: accountStats[3].models,
+      models: [],
     },
     {
       id: 'hash_codex_team',
@@ -1997,7 +3163,7 @@ const buildMonitoringAnalytics = (
       cost: 88.1,
       average_latency_ms: 1220,
       last_seen_ms: analyticsNow - 8 * minute,
-      models: accountStats[0].models,
+      models: getAccountModels('acct_platform_team'),
     },
     {
       id: 'hash_gemini_prod',
@@ -2014,7 +3180,7 @@ const buildMonitoringAnalytics = (
       cost: 153.3,
       average_latency_ms: 1160,
       last_seen_ms: analyticsNow - 6 * minute,
-      models: accountStats[2].models,
+      models: [],
     },
     {
       id: 'hash_automation_pool',
@@ -2031,7 +3197,7 @@ const buildMonitoringAnalytics = (
       cost: 31.7,
       average_latency_ms: 2140,
       last_seen_ms: analyticsNow - 18 * minute,
-      models: accountStats[4].models,
+      models: getAccountModels('acct_automation_pool'),
     },
     {
       id: 'hash_research_shared',
@@ -2048,7 +3214,7 @@ const buildMonitoringAnalytics = (
       cost: 167.1,
       average_latency_ms: 1420,
       last_seen_ms: analyticsNow - 13 * minute,
-      models: [...accountStats[1].models, ...credentialStats[5].models],
+      models: [...getAccountModels('acct_research_team'), ...getAccountModels('acct_kimi_coding')],
     },
     {
       id: 'hash_support_console',
@@ -2065,7 +3231,7 @@ const buildMonitoringAnalytics = (
       cost: 32.4,
       average_latency_ms: 980,
       last_seen_ms: analyticsNow - 11 * minute,
-      models: accountStats[5].models,
+      models: [],
     },
     {
       id: 'hash_research_batch',
@@ -2082,7 +3248,7 @@ const buildMonitoringAnalytics = (
       cost: 83.5,
       average_latency_ms: 1510,
       last_seen_ms: analyticsNow - 19 * minute,
-      models: accountStats[6].models,
+      models: getAccountModels('acct_research_batch'),
     },
     {
       id: 'hash_gemini_batch',
@@ -2099,7 +3265,7 @@ const buildMonitoringAnalytics = (
       cost: 38.2,
       average_latency_ms: 1120,
       last_seen_ms: analyticsNow - 24 * minute,
-      models: accountStats[7].models,
+      models: [],
     },
     {
       id: 'hash_kimi_coding',
@@ -2116,7 +3282,7 @@ const buildMonitoringAnalytics = (
       cost: 15.8,
       average_latency_ms: 1710,
       last_seen_ms: analyticsNow - 48 * minute,
-      models: accountStats[8].models,
+      models: getAccountModels('acct_kimi_coding'),
     },
     {
       id: 'hash_builder_lab',
@@ -2133,7 +3299,24 @@ const buildMonitoringAnalytics = (
       cost: 14.4,
       average_latency_ms: 1320,
       last_seen_ms: analyticsNow - 27 * minute,
-      models: accountStats[9].models,
+      models: getAccountModels('acct_builder_lab'),
+    },
+    {
+      id: 'hash_antigravity_free',
+      api_key_hash: 'hash_antigravity_free',
+      account_snapshot: 'AG Free Seat',
+      auth_label_snapshot: 'Antigravity Free Weekly',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-free-weekly-05'],
+      sources: ['free-weekly'],
+      source_hashes: ['src_antigravity_free'],
+      calls: 410,
+      failure_calls: 11,
+      total_tokens: 310_000,
+      cost: 5.9,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 14 * minute,
+      models: getAccountModels('acct_ag_free_weekly'),
     },
     {
       id: 'hash_xai_ops',
@@ -2150,7 +3333,7 @@ const buildMonitoringAnalytics = (
       cost: 12.2,
       average_latency_ms: 1490,
       last_seen_ms: analyticsNow - 55 * minute,
-      models: accountStats[10].models,
+      models: getAccountModels('acct_ops_console'),
     },
     {
       id: 'hash_xai_email_user',
@@ -2167,7 +3350,7 @@ const buildMonitoringAnalytics = (
       cost: 7.4,
       average_latency_ms: 1420,
       last_seen_ms: analyticsNow - 14 * minute,
-      models: accountStats[11].models,
+      models: getAccountModels('acct_xai_email_user'),
     },
     {
       id: 'hash_codex_email_user',
@@ -2184,7 +3367,24 @@ const buildMonitoringAnalytics = (
       cost: 16.8,
       average_latency_ms: 1180,
       last_seen_ms: analyticsNow - 9 * minute,
-      models: accountStats[12].models,
+      models: getAccountModels('acct_codex_email_user'),
+    },
+    {
+      id: 'hash_codex_pro_20x',
+      api_key_hash: 'hash_codex_pro_20x',
+      account_snapshot: 'Pro 20x Workspace',
+      auth_label_snapshot: 'Codex Pro 20x',
+      auth_provider_snapshot: 'codex',
+      auth_indices: ['codex-pro-20x-01'],
+      sources: ['team'],
+      source_hashes: ['src_codex_pro_20x'],
+      calls: 1260,
+      failure_calls: 8,
+      total_tokens: 1_040_000,
+      cost: 22.4,
+      average_latency_ms: 1110,
+      last_seen_ms: analyticsNow - 6 * minute,
+      models: getAccountModels('acct_codex_pro_20x'),
     },
     {
       id: 'hash_kuai_key_1',
@@ -2201,7 +3401,7 @@ const buildMonitoringAnalytics = (
       cost: 18.6,
       average_latency_ms: 1040,
       last_seen_ms: analyticsNow - 5 * minute,
-      models: accountStats[13].models,
+      models: getAccountModels('acct_kuaileshifu_key_1'),
     },
     {
       id: 'hash_kuai_key_2',
@@ -2218,7 +3418,7 @@ const buildMonitoringAnalytics = (
       cost: 14.2,
       average_latency_ms: 1090,
       last_seen_ms: analyticsNow - 7 * minute,
-      models: accountStats[14].models,
+      models: getAccountModels('acct_kuaileshifu_key_2'),
     },
     {
       id: 'hash_anyrouter_top',
@@ -2235,7 +3435,7 @@ const buildMonitoringAnalytics = (
       cost: 9.6,
       average_latency_ms: 980,
       last_seen_ms: analyticsNow - 12 * minute,
-      models: accountStats[15].models,
+      models: getAccountModels('acct_anyrouter_top'),
     },
     {
       id: 'hash_deepseek_ops',
@@ -2252,44 +3452,237 @@ const buildMonitoringAnalytics = (
       cost: 6.8,
       average_latency_ms: 1580,
       last_seen_ms: analyticsNow - 44 * minute,
-      models: accountStats[16].models,
+      models: getAccountModels('acct_edge_experiments'),
     },
-  ].map((row) => {
-    const tokenSplit = splitTokens(row.total_tokens);
-    const successCalls = row.calls - row.failure_calls;
-    return {
-      ...row,
-      success_calls: successCalls,
-      success_rate: safeRate(successCalls, row.calls),
-      input_tokens: tokenSplit.input_tokens,
-      output_tokens: tokenSplit.output_tokens,
-      cached_tokens: tokenSplit.cached_tokens,
-      cache_read_tokens: tokenSplit.cache_read_tokens,
-      cache_creation_tokens: tokenSplit.cache_creation_tokens,
-      contexts: row.auth_indices.map((authIndex, index) => {
-        const calls = Math.round(row.calls / row.auth_indices.length);
-        const failureCalls = Math.max(0, Math.round(row.failure_calls / row.auth_indices.length));
-        return {
-          id: `${row.id}-${authIndex}`,
-          account_snapshot: row.account_snapshot,
-          auth_label_snapshot: row.auth_label_snapshot,
-          auth_provider_snapshot: row.auth_provider_snapshot,
-          auth_index: authIndex,
-          source: row.sources[index] ?? row.sources[0],
-          source_hash: row.source_hashes[index] ?? row.source_hashes[0],
-          calls,
-          success_calls: calls - failureCalls,
-          failure_calls: failureCalls,
-          success_rate: safeRate(calls - failureCalls, calls),
-          failure_rate: safeRate(failureCalls, calls),
-          total_tokens: Math.round(row.total_tokens / row.auth_indices.length),
-          cost: round2(row.cost / row.auth_indices.length),
-          average_latency_ms: row.average_latency_ms,
-          last_seen_ms: row.last_seen_ms,
-        };
-      }),
-    };
-  });
+    {
+      id: 'hash_codex_design',
+      api_key_hash: 'hash_codex_design',
+      account_snapshot: 'Design Tools Seat',
+      auth_label_snapshot: 'Codex Design Seat',
+      auth_provider_snapshot: 'codex',
+      auth_indices: ['codex-expired-oauth-03'],
+      sources: ['design'],
+      source_hashes: ['src_codex_design'],
+      calls: 320,
+      failure_calls: 38,
+      total_tokens: 240_000,
+      cost: 5.2,
+      average_latency_ms: 1980,
+      last_seen_ms: analyticsNow - 37 * minute,
+      models: getAccountModels('acct_codex_design'),
+    },
+    {
+      id: 'hash_claude_overage',
+      api_key_hash: 'hash_claude_overage',
+      account_snapshot: 'Overage Research',
+      auth_label_snapshot: 'Claude Extra Usage',
+      auth_provider_snapshot: 'claude',
+      auth_indices: ['claude-extra-usage-03'],
+      sources: ['overage'],
+      source_hashes: ['src_claude_overage'],
+      calls: 740,
+      failure_calls: 18,
+      total_tokens: 1_120_000,
+      cost: 34.6,
+      average_latency_ms: 1460,
+      last_seen_ms: analyticsNow - 22 * minute,
+      models: getAccountModels('acct_claude_extra_usage'),
+    },
+    {
+      id: 'hash_antigravity_daily',
+      api_key_hash: 'hash_antigravity_daily',
+      account_snapshot: 'AG Gemini Pool',
+      auth_label_snapshot: 'Antigravity Gemini Pool',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-daily-02'],
+      sources: ['daily-cap'],
+      source_hashes: ['src_antigravity_daily'],
+      calls: 540,
+      failure_calls: 44,
+      total_tokens: 460_000,
+      cost: 8.7,
+      average_latency_ms: 1860,
+      last_seen_ms: analyticsNow - 16 * minute,
+      models: getAccountModels('acct_ag_daily_queue'),
+    },
+    {
+      id: 'hash_antigravity_monthly',
+      api_key_hash: 'hash_antigravity_monthly',
+      account_snapshot: 'AG Claude Pool',
+      auth_label_snapshot: 'Antigravity Claude Pool',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-monthly-03'],
+      sources: ['month-end'],
+      source_hashes: ['src_antigravity_monthly'],
+      calls: 680,
+      failure_calls: 16,
+      total_tokens: 610_000,
+      cost: 10.2,
+      average_latency_ms: 1380,
+      last_seen_ms: analyticsNow - 32 * minute,
+      models: getAccountModels('acct_ag_month_end'),
+    },
+    {
+      id: 'hash_antigravity_matrix',
+      api_key_hash: 'hash_antigravity_matrix',
+      account_snapshot: 'AG Pro Matrix',
+      auth_label_snapshot: 'Antigravity Pro Matrix',
+      auth_provider_snapshot: 'antigravity',
+      auth_indices: ['antigravity-pro-matrix-04'],
+      sources: ['matrix-stress'],
+      source_hashes: ['src_antigravity_matrix'],
+      calls: 720,
+      failure_calls: 22,
+      total_tokens: 690_000,
+      cost: 12.8,
+      average_latency_ms: 1290,
+      last_seen_ms: analyticsNow - 9 * minute,
+      models: getAccountModels('acct_ag_pro_matrix'),
+    },
+    {
+      id: 'hash_kimi_explore',
+      api_key_hash: 'hash_kimi_explore',
+      account_snapshot: 'Kimi Explore',
+      auth_label_snapshot: 'Kimi Explore',
+      auth_provider_snapshot: 'kimi',
+      auth_indices: ['kimi-healthy-02'],
+      sources: ['explore'],
+      source_hashes: ['src_kimi_explore'],
+      calls: 700,
+      failure_calls: 8,
+      total_tokens: 520_000,
+      cost: 7.4,
+      average_latency_ms: 1560,
+      last_seen_ms: analyticsNow - 26 * minute,
+      models: getAccountModels('acct_kimi_explore'),
+    },
+    {
+      id: 'hash_kimi_daily_cap',
+      api_key_hash: 'hash_kimi_daily_cap',
+      account_snapshot: 'Kimi 5h Cap',
+      auth_label_snapshot: 'Kimi 5h Cap',
+      auth_provider_snapshot: 'kimi',
+      auth_indices: ['kimi-exhausted-03'],
+      sources: ['daily-cap'],
+      source_hashes: ['src_kimi_daily_cap'],
+      calls: 180,
+      failure_calls: 34,
+      total_tokens: 140_000,
+      cost: 2.1,
+      average_latency_ms: 2210,
+      last_seen_ms: analyticsNow - 11 * minute,
+      models: getAccountModels('acct_kimi_daily_cap'),
+    },
+    {
+      id: 'hash_xai_payg_buffer',
+      api_key_hash: 'hash_xai_payg_buffer',
+      account_snapshot: 'xAI PAYG Buffer',
+      auth_label_snapshot: 'xAI PAYG Buffer',
+      auth_provider_snapshot: 'xai',
+      auth_indices: ['xai-payg-buffer-02'],
+      sources: ['payg-buffer'],
+      source_hashes: ['src_xai_payg_buffer'],
+      calls: 620,
+      failure_calls: 10,
+      total_tokens: 510_000,
+      cost: 9.8,
+      average_latency_ms: 1430,
+      last_seen_ms: analyticsNow - 17 * minute,
+      models: getAccountModels('acct_xai_payg_buffer'),
+    },
+    {
+      id: 'hash_xai_payg_cap',
+      api_key_hash: 'hash_xai_payg_cap',
+      account_snapshot: 'xAI Cap Reached',
+      auth_label_snapshot: 'xAI Cap Reached',
+      auth_provider_snapshot: 'xai',
+      auth_indices: ['xai-payg-cap-03'],
+      sources: ['payg-cap'],
+      source_hashes: ['src_xai_payg_cap'],
+      calls: 260,
+      failure_calls: 48,
+      total_tokens: 210_000,
+      cost: 4.9,
+      average_latency_ms: 2340,
+      last_seen_ms: analyticsNow - 7 * minute,
+      models: getAccountModels('acct_xai_cap_reached'),
+    },
+    {
+      id: 'hash_codex_upgrade',
+      api_key_hash: 'hash_codex_upgrade',
+      account_snapshot: 'Upgrade Demo',
+      auth_label_snapshot: 'Codex Upgrade Demo',
+      auth_provider_snapshot: 'codex',
+      auth_indices: ['codex-upgrade-demo-01'],
+      sources: ['upgrade'],
+      source_hashes: ['src_codex_upgrade'],
+      calls: 318,
+      failure_calls: 2,
+      total_tokens: 250_000,
+      cost: 4.8,
+      average_latency_ms: 1100,
+      last_seen_ms: analyticsNow - 4 * hour,
+      models: [],
+    },
+    {
+      id: 'hash_xai_expired',
+      api_key_hash: 'hash_xai_expired',
+      account_snapshot: 'expired.demo@example.com',
+      auth_label_snapshot: 'xAI',
+      auth_provider_snapshot: 'xai',
+      auth_indices: ['xai-expired-01'],
+      sources: ['expired'],
+      source_hashes: ['src_xai_expired'],
+      calls: 82,
+      failure_calls: 12,
+      total_tokens: 96_000,
+      cost: 1.7,
+      average_latency_ms: 1820,
+      last_seen_ms: analyticsNow - 8 * hour,
+      models: [],
+    },
+  ]
+    .filter(
+      (row) =>
+        isDemoOAuthAccountProvider(row.auth_provider_snapshot) ||
+        row.auth_indices.includes('openai-support-02')
+    )
+    .map((row) => {
+      const tokenSplit = splitTokens(row.total_tokens);
+      const successCalls = row.calls - row.failure_calls;
+      return {
+        ...row,
+        success_calls: successCalls,
+        success_rate: safeRate(successCalls, row.calls),
+        input_tokens: tokenSplit.input_tokens,
+        output_tokens: tokenSplit.output_tokens,
+        cached_tokens: tokenSplit.cached_tokens,
+        cache_read_tokens: tokenSplit.cache_read_tokens,
+        cache_creation_tokens: tokenSplit.cache_creation_tokens,
+        contexts: row.auth_indices.map((authIndex, index) => {
+          const calls = Math.round(row.calls / row.auth_indices.length);
+          const failureCalls = Math.max(0, Math.round(row.failure_calls / row.auth_indices.length));
+          return {
+            id: `${row.id}-${authIndex}`,
+            account_snapshot: row.account_snapshot,
+            auth_label_snapshot: row.auth_label_snapshot,
+            auth_provider_snapshot: row.auth_provider_snapshot,
+            auth_index: authIndex,
+            source: row.sources[index] ?? row.sources[0],
+            source_hash: row.source_hashes[index] ?? row.source_hashes[0],
+            calls,
+            success_calls: calls - failureCalls,
+            failure_calls: failureCalls,
+            success_rate: safeRate(calls - failureCalls, calls),
+            failure_rate: safeRate(failureCalls, calls),
+            total_tokens: Math.round(row.total_tokens / row.auth_indices.length),
+            cost: round2(row.cost / row.auth_indices.length),
+            average_latency_ms: row.average_latency_ms,
+            last_seen_ms: row.last_seen_ms,
+          };
+        }),
+      };
+    });
 
   const requestedAPIKeyTimelineHashes = new Set(
     (request?.filters?.api_key_hashes ?? [])
@@ -2510,6 +3903,32 @@ const buildMonitoringAnalytics = (
       executor: 'coding',
     },
     {
+      model: 'gemini-2.5-flash',
+      apiKeyHash: 'hash_builder_lab',
+      authIndex: 'antigravity-builder-01',
+      authFile: 'antigravity-builder.json',
+      account: 'Builder Lab',
+      label: 'Antigravity Builder',
+      provider: 'antigravity',
+      source: 'builder',
+      sourceHash: 'src_antigravity_builder',
+      endpoint: '/v1/chat/completions',
+      executor: 'builder',
+    },
+    {
+      model: 'gemini-2.5-flash',
+      apiKeyHash: 'hash_antigravity_free',
+      authIndex: 'antigravity-free-weekly-05',
+      authFile: 'antigravity-free-weekly.json',
+      account: 'AG Free Seat',
+      label: 'Antigravity Free Weekly',
+      provider: 'antigravity',
+      source: 'free-weekly',
+      sourceHash: 'src_antigravity_free',
+      endpoint: '/v1/chat/completions',
+      executor: 'builder',
+    },
+    {
       model: 'grok-4-fast',
       apiKeyHash: 'hash_xai_ops',
       authIndex: 'xai-ops-01',
@@ -2519,6 +3938,97 @@ const buildMonitoringAnalytics = (
       provider: 'xai',
       source: 'ops',
       sourceHash: 'src_xai_ops',
+      endpoint: '/v1/chat/completions',
+      executor: 'ops',
+    },
+    {
+      model: 'claude-sonnet-4-5',
+      apiKeyHash: 'hash_claude_overage',
+      authIndex: 'claude-extra-usage-03',
+      authFile: 'claude-extra-usage-03.json',
+      account: 'Overage Research',
+      label: 'Claude Extra Usage',
+      provider: 'claude',
+      source: 'overage',
+      sourceHash: 'src_claude_overage',
+      endpoint: '/v1/messages',
+      executor: 'interactive',
+    },
+    {
+      model: 'gemini-2.5-flash',
+      apiKeyHash: 'hash_antigravity_daily',
+      authIndex: 'antigravity-daily-02',
+      authFile: 'antigravity-daily-exhausted.json',
+      account: 'AG Gemini Pool',
+      label: 'Antigravity Gemini Pool',
+      provider: 'antigravity',
+      source: 'daily-cap',
+      sourceHash: 'src_antigravity_daily',
+      endpoint: '/v1/chat/completions',
+      executor: 'builder',
+    },
+    {
+      model: 'gemini-2.5-pro',
+      apiKeyHash: 'hash_antigravity_monthly',
+      authIndex: 'antigravity-monthly-03',
+      authFile: 'antigravity-monthly-low.json',
+      account: 'AG Claude Pool',
+      label: 'Antigravity Claude Pool',
+      provider: 'antigravity',
+      source: 'month-end',
+      sourceHash: 'src_antigravity_monthly',
+      endpoint: '/v1/chat/completions',
+      executor: 'builder',
+    },
+    {
+      model: 'claude-sonnet-4-5',
+      apiKeyHash: 'hash_antigravity_matrix',
+      authIndex: 'antigravity-pro-matrix-04',
+      authFile: 'antigravity-pro-matrix.json',
+      account: 'AG Pro Matrix',
+      label: 'Antigravity Pro Matrix',
+      provider: 'antigravity',
+      source: 'matrix-stress',
+      sourceHash: 'src_antigravity_matrix',
+      endpoint: '/v1/chat/completions',
+      executor: 'builder',
+    },
+    {
+      model: 'qwen-plus',
+      apiKeyHash: 'hash_kimi_explore',
+      authIndex: 'kimi-healthy-02',
+      authFile: 'kimi-healthy.json',
+      account: 'Kimi Explore',
+      label: 'Kimi Explore',
+      provider: 'kimi',
+      source: 'explore',
+      sourceHash: 'src_kimi_explore',
+      endpoint: '/v1/chat/completions',
+      executor: 'coding',
+    },
+    {
+      model: 'qwen-plus',
+      apiKeyHash: 'hash_kimi_daily_cap',
+      authIndex: 'kimi-exhausted-03',
+      authFile: 'kimi-exhausted.json',
+      account: 'Kimi 5h Cap',
+      label: 'Kimi 5h Cap',
+      provider: 'kimi',
+      source: 'daily-cap',
+      sourceHash: 'src_kimi_daily_cap',
+      endpoint: '/v1/chat/completions',
+      executor: 'coding',
+    },
+    {
+      model: 'grok-4-fast',
+      apiKeyHash: 'hash_xai_payg_buffer',
+      authIndex: 'xai-payg-buffer-02',
+      authFile: 'xai-payg-buffer.json',
+      account: 'xAI PAYG Buffer',
+      label: 'xAI PAYG Buffer',
+      provider: 'xai',
+      source: 'payg-buffer',
+      sourceHash: 'src_xai_payg_buffer',
       endpoint: '/v1/chat/completions',
       executor: 'ops',
     },
@@ -2536,6 +4046,19 @@ const buildMonitoringAnalytics = (
       executor: 'ops',
     },
     {
+      model: 'grok-4-fast',
+      apiKeyHash: 'hash_xai_payg_cap',
+      authIndex: 'xai-payg-cap-03',
+      authFile: 'xai-payg-cap.json',
+      account: 'xAI Cap Reached',
+      label: 'xAI Cap Reached',
+      provider: 'xai',
+      source: 'payg-cap',
+      sourceHash: 'src_xai_payg_cap',
+      endpoint: '/v1/chat/completions',
+      executor: 'ops',
+    },
+    {
       model: 'gpt-4.1-mini',
       apiKeyHash: 'hash_codex_email_user',
       authIndex: 'codex-email-user-01',
@@ -2546,6 +4069,19 @@ const buildMonitoringAnalytics = (
       source: 'team',
       sourceHash: 'src_codex_email_user',
       endpoint: '/v1/chat/completions',
+      executor: 'team',
+    },
+    {
+      model: 'gpt-4.1',
+      apiKeyHash: 'hash_codex_pro_20x',
+      authIndex: 'codex-pro-20x-01',
+      authFile: 'codex-pro-20x-01.json',
+      account: 'Pro 20x Workspace',
+      label: 'Codex Pro 20x',
+      provider: 'codex',
+      source: 'team',
+      sourceHash: 'src_codex_pro_20x',
+      endpoint: '/v1/responses',
       executor: 'team',
     },
     {
@@ -2600,7 +4136,20 @@ const buildMonitoringAnalytics = (
       endpoint: '/v1/chat/completions',
       executor: 'ops',
     },
-  ];
+    {
+      model: 'gpt-4.1',
+      apiKeyHash: 'hash_codex_design',
+      authIndex: 'codex-expired-oauth-03',
+      authFile: 'codex-expired-oauth-03.json',
+      account: 'Design Tools Seat',
+      label: 'Codex Design Seat',
+      provider: 'codex',
+      source: 'design',
+      sourceHash: 'src_codex_design',
+      endpoint: '/v1/responses',
+      executor: 'interactive',
+    },
+  ].filter((profile) => isDemoOAuthAccountProvider(profile.provider));
 
   const xaiFreeUsageRecoverAtMs = analyticsNow + day;
   const xaiFreeUsageEvent: DemoMonitoringEventRow = {
@@ -2739,7 +4288,148 @@ const buildMonitoringAnalytics = (
       },
     },
   };
+  const gptModelMatchedEvent: DemoMonitoringEventRow = {
+    request_id: 'demo-gpt-model-matched',
+    event_hash: 'demo-event-gpt-model-matched',
+    timestamp_ms: analyticsNow - minute / 4,
+    model: 'gpt-5.6-sol',
+    analytics_model: 'gpt-5.6',
+    requested_model: 'gpt-5.6-sol',
+    resolved_model: 'gpt-5.6-terra',
+    response_model: 'gpt-5.6-terra',
+    endpoint: '/v1/chat/completions',
+    method: 'POST',
+    path: '/v1/chat/completions',
+    auth_index: 'openai-primary',
+    auth_file_snapshot: 'openai-primary.json',
+    source: 'gateway',
+    source_hash: 'src_openai_primary',
+    api_key_hash: 'hash_openai_primary',
+    account_snapshot: 'OpenAI Compatible',
+    auth_label_snapshot: 'OpenAI Primary',
+    auth_provider_snapshot: 'openai',
+    service_tier: 'standard',
+    executor_type: 'dashboard',
+    input_tokens: 1_420,
+    output_tokens: 512,
+    cached_tokens: 0,
+    cache_read_tokens: 280,
+    cache_creation_tokens: 40,
+    reasoning_tokens: 0,
+    total_tokens: 1_932,
+    latency_ms: 920,
+    ttft_ms: 180,
+    failed: false,
+  };
+  const reasoningSuffixEvents: DemoMonitoringEventRow[] = [
+    {
+      request_id: 'demo-deepseek-reasoning-max',
+      event_hash: 'demo-event-deepseek-reasoning-max',
+      timestamp_ms: analyticsNow - minute / 2,
+      model: 'deepseek-chat(max)',
+      analytics_model: 'deepseek-chat',
+      requested_model: 'deepseek-chat(max)',
+      resolved_model: 'deepseek-chat-202608',
+      response_model: 'deepseek-v4-flash',
+      session_id: 'demo-session-model-mismatch',
+      parent_session_id: 'demo-parent-session',
+      access_token_sha256: 'demo-access-token-sha256',
+      generate: true,
+      stream: false,
+      endpoint: '/v1/chat/completions',
+      method: 'POST',
+      path: '/v1/chat/completions',
+      auth_index: 'deepseek-ops-01',
+      auth_file_snapshot: 'deepseek-ops-01.json',
+      source: 'ops',
+      source_hash: 'src_deepseek_ops',
+      api_key_hash: 'hash_deepseek_ops',
+      account_snapshot: 'Edge Experiments',
+      auth_label_snapshot: 'DeepSeek Ops',
+      auth_provider_snapshot: 'deepseek',
+      reasoning_effort: 'max',
+      service_tier: 'standard',
+      executor_type: 'ops',
+      input_tokens: 1_860,
+      output_tokens: 624,
+      cached_tokens: 0,
+      cache_read_tokens: 420,
+      cache_creation_tokens: 80,
+      reasoning_tokens: 512,
+      total_tokens: 2_996,
+      latency_ms: 1_486,
+      ttft_ms: 264,
+      failed: false,
+    },
+    {
+      request_id: 'demo-deepseek-reasoning-low',
+      event_hash: 'demo-event-deepseek-reasoning-low',
+      timestamp_ms: analyticsNow - minute - minute / 2,
+      model: 'deepseek-chat(low)',
+      analytics_model: 'deepseek-chat',
+      requested_model: 'deepseek-chat(low)',
+      resolved_model: 'deepseek-chat-202608',
+      endpoint: '/v1/chat/completions',
+      method: 'POST',
+      path: '/v1/chat/completions',
+      auth_index: 'kuai-auth-1',
+      auth_file_snapshot: 'kuai-auth-1.json',
+      source: 'k:sk-kuai-demo-key-1111aaaa',
+      source_hash: 'src_kuai_key_1',
+      api_key_hash: 'hash_kuai_key_1',
+      account_snapshot: 'kuaileshifu',
+      auth_label_snapshot: 'kuaileshifu',
+      auth_provider_snapshot: 'openai',
+      reasoning_effort: 'low',
+      service_tier: 'standard',
+      executor_type: 'compat',
+      input_tokens: 1_240,
+      output_tokens: 438,
+      cached_tokens: 0,
+      cache_read_tokens: 240,
+      cache_creation_tokens: 60,
+      reasoning_tokens: 128,
+      total_tokens: 1_806,
+      latency_ms: 1_032,
+      ttft_ms: 198,
+      failed: false,
+    },
+    {
+      request_id: 'demo-deepseek-region-alias',
+      event_hash: 'demo-event-deepseek-region-alias',
+      timestamp_ms: analyticsNow - 2 * minute - minute / 2,
+      model: 'deepseek-chat(region-us)',
+      analytics_model: 'deepseek-chat(region-us)',
+      requested_model: 'deepseek-chat(region-us)',
+      resolved_model: 'deepseek-chat(region-us)',
+      endpoint: '/v1/chat/completions',
+      method: 'POST',
+      path: '/v1/chat/completions',
+      auth_index: 'anyrouter-auth-1',
+      auth_file_snapshot: 'anyrouter-auth-1.json',
+      source: 'k:sk-anyrouter-demo-key',
+      source_hash: 'src_anyrouter_top',
+      api_key_hash: 'hash_anyrouter_top',
+      account_snapshot: 'anyrouter.top #1',
+      auth_label_snapshot: 'anyrouter.top #1',
+      auth_provider_snapshot: 'openai',
+      service_tier: 'standard',
+      executor_type: 'compat',
+      input_tokens: 980,
+      output_tokens: 352,
+      cached_tokens: 0,
+      cache_read_tokens: 180,
+      cache_creation_tokens: 40,
+      reasoning_tokens: 0,
+      total_tokens: 1_332,
+      latency_ms: 884,
+      ttft_ms: 172,
+      failed: false,
+    },
+  ];
   const events: DemoMonitoringEventRow[] = [
+    gptModelMatchedEvent,
+    ...reasoningSuffixEvents,
     xaiFreeUsageEvent,
     xaiSuccessfulRateLimitEvent,
     ...Array.from({ length: 72 }, (_, index) => {
@@ -2821,9 +4511,18 @@ const buildMonitoringAnalytics = (
     }),
   ];
 
-  const recentFailures = events
+  const credentialFilters = buildDemoCredentialFilters(request);
+  const scopedEvents = credentialFilters
+    ? events.filter((event) => matchesDemoCredentialFilters(event, credentialFilters))
+    : events;
+
+  const recentFailureLimit =
+    typeof request?.include?.recent_failures === 'number'
+      ? Math.max(0, Math.floor(request.include.recent_failures))
+      : 8;
+  const recentFailures = scopedEvents
     .filter((event) => event.failed)
-    .slice(0, 8)
+    .slice(0, recentFailureLimit)
     .map((event) => ({
       timestamp_ms: event.timestamp_ms,
       model: event.model,
@@ -2888,8 +4587,8 @@ const buildMonitoringAnalytics = (
           share: 0.58,
         },
         {
-          key: hourIndex % 3 === 0 ? 'gemini-2.5-pro' : 'gpt-4.1',
-          label: hourIndex % 3 === 0 ? 'gemini-2.5-pro' : 'gpt-4.1',
+          key: hourIndex % 3 === 0 ? 'grok-4-fast' : 'gpt-4.1',
+          label: hourIndex % 3 === 0 ? 'grok-4-fast' : 'gpt-4.1',
           calls: modelSecondaryCalls,
           success: modelSecondaryCalls - secondaryFailure,
           failure: secondaryFailure,
@@ -2901,8 +4600,8 @@ const buildMonitoringAnalytics = (
       ],
       api_key_contributors: [
         {
-          key: hourIndex % 2 === 0 ? 'hash_openai_primary' : 'hash_codex_team',
-          label: hourIndex % 2 === 0 ? 'OpenAI Primary' : 'Codex Team',
+          key: hourIndex % 2 === 0 ? 'hash_codex_team' : 'hash_automation_pool',
+          label: hourIndex % 2 === 0 ? 'Codex Team' : 'Automation Pool',
           calls: modelPrimaryCalls,
           success: modelPrimaryCalls - primaryFailure,
           failure: primaryFailure,
@@ -2912,8 +4611,8 @@ const buildMonitoringAnalytics = (
           share: 0.58,
         },
         {
-          key: hourIndex % 3 === 0 ? 'hash_gemini_prod' : 'hash_research_shared',
-          label: hourIndex % 3 === 0 ? 'Gemini Production' : 'Research Shared',
+          key: hourIndex % 3 === 0 ? 'hash_xai_ops' : 'hash_research_shared',
+          label: hourIndex % 3 === 0 ? 'xAI Ops' : 'Research Shared',
           calls: modelSecondaryCalls,
           success: modelSecondaryCalls - secondaryFailure,
           failure: secondaryFailure,
@@ -2925,8 +4624,8 @@ const buildMonitoringAnalytics = (
       ],
       provider_contributors: [
         {
-          key: hourIndex % 2 === 0 ? 'openai' : 'codex',
-          label: hourIndex % 2 === 0 ? 'openai' : 'codex',
+          key: hourIndex % 2 === 0 ? 'codex' : 'xai',
+          label: hourIndex % 2 === 0 ? 'codex' : 'xai',
           calls: modelPrimaryCalls,
           success: modelPrimaryCalls - primaryFailure,
           failure: primaryFailure,
@@ -2936,8 +4635,8 @@ const buildMonitoringAnalytics = (
           share: 0.58,
         },
         {
-          key: hourIndex % 3 === 0 ? 'gemini' : 'claude',
-          label: hourIndex % 3 === 0 ? 'gemini' : 'claude',
+          key: hourIndex % 3 === 0 ? 'kimi' : 'claude',
+          label: hourIndex % 3 === 0 ? 'kimi' : 'claude',
           calls: modelSecondaryCalls,
           success: modelSecondaryCalls - secondaryFailure,
           failure: secondaryFailure,
@@ -2984,12 +4683,12 @@ const buildMonitoringAnalytics = (
 
   const eventsPageRequest = request?.include?.events_page;
   const eventsPage = paginateDemoEvents(
-    events,
-    eventsPageRequest?.limit ?? events.length,
+    scopedEvents,
+    eventsPageRequest?.limit ?? scopedEvents.length,
     eventsPageRequest?.before_ms
   );
   const drilldownRequest = request?.include?.drilldown_preview;
-  const drilldownPreview = paginateDemoEvents(events, drilldownRequest?.limit ?? 12, null);
+  const drilldownPreview = paginateDemoEvents(scopedEvents, drilldownRequest?.limit ?? 12, null);
 
   return {
     generated_at_ms: analyticsNow,
@@ -3099,16 +4798,16 @@ const buildMonitoringAnalytics = (
         average_latency_ms: 2140,
       },
       {
-        source: 'regional',
-        source_hash: 'src_vertex_regional',
-        auth_index: 'vertex-regional-01',
-        account_snapshot: 'Gemini Production',
-        auth_label_snapshot: 'Vertex Regional',
-        auth_provider_snapshot: 'vertex',
-        calls: 2140,
-        failure: 24,
-        last_seen_ms: analyticsNow - 6 * minute,
-        average_latency_ms: 1040,
+        source: 'design',
+        source_hash: 'src_codex_design',
+        auth_index: 'codex-expired-oauth-03',
+        account_snapshot: 'Design Tools Seat',
+        auth_label_snapshot: 'Codex Design Seat',
+        auth_provider_snapshot: 'codex',
+        calls: 320,
+        failure: 38,
+        last_seen_ms: analyticsNow - 37 * minute,
+        average_latency_ms: 1980,
       },
       {
         source: 'research',
@@ -3135,19 +4834,15 @@ const buildMonitoringAnalytics = (
       api_key_stats: apiKeyStats,
       channel_share: channelShare,
       model_stats: modelStats,
-      providers: [
-        'codex',
-        'claude',
-        'gemini',
-        'openai',
-        'vertex',
-        'kimi',
-        'antigravity',
-        'xai',
-        'deepseek',
-      ],
-      auth_files: demoAuthFiles.files.map((file) => file.name),
-      project_ids: ['demo-gemini-prod', 'demo-vertex-regional', 'demo-gemini-batch'],
+      providers: Array.from(
+        new Set(
+          accountStats
+            .map((row) => row.auth_provider_snapshot)
+            .filter((provider): provider is string => Boolean(provider))
+        )
+      ).sort(),
+      auth_files: getDemoAuthFileItems().map((file) => file.name),
+      project_ids: ['demo-antigravity-project'],
       request_types: ['chat', 'responses', 'models'],
       header_error_kinds: ['quota', 'upstream'],
       header_error_codes: ['rate_limit', 'timeout'],
@@ -3212,7 +4907,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     runId: 1001,
     accountKey: 'codex-upgrade-demo-01',
     fileName: 'codex-upgrade-demo.json',
-    displayAccount: 'codex-upgrade-demo.json',
+    displayAccount: 'Upgrade Demo',
     authIndex: 'codex-upgrade-demo-01',
     accountId: 'acct_codex_upgrade_demo',
     provider: 'codex',
@@ -3256,7 +4951,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     runId: 1001,
     accountKey: 'codex-team-01',
     fileName: 'codex-team-01.json',
-    displayAccount: 'codex-team-01.json',
+    displayAccount: 'Platform Team',
     authIndex: 'codex-team-01',
     accountId: 'acct_codex_team',
     provider: 'codex',
@@ -3267,21 +4962,21 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     actionReason: 'monitoring.codex_inspection_reason_healthy',
     actionStatus: 'none',
     statusCode: 200,
-    usedPercent: 42,
+    usedPercent: 9,
     isQuota: false,
     planType: 'team',
     quotaWindows: [
       {
         id: 'five-hour',
         labelKey: 'codex_quota.primary_window',
-        usedPercent: 63,
+        usedPercent: 55,
         resetLabel: '2h 18m',
         limitWindowSeconds: 18000,
       },
       {
         id: 'weekly',
         labelKey: 'codex_quota.secondary_window',
-        usedPercent: 42,
+        usedPercent: 9,
         resetLabel: '2d 20h',
         limitWindowSeconds: 604800,
       },
@@ -3322,7 +5017,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     runId: 1001,
     accountKey: 'codex-pro-20x-01',
     fileName: 'codex-pro-20x-01.json',
-    displayAccount: 'codex-pro-20x-01.json',
+    displayAccount: 'Pro 20x Workspace',
     authIndex: 'codex-pro-20x-01',
     accountId: 'acct_codex_pro_20x',
     provider: 'codex',
@@ -3366,7 +5061,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     runId: 1001,
     accountKey: 'codex-fallback-02',
     fileName: 'codex-fallback-02.json',
-    displayAccount: 'codex-fallback-02.json',
+    displayAccount: 'Automation Pool',
     authIndex: 'codex-fallback-02',
     accountId: 'acct_codex_auto',
     provider: 'codex',
@@ -3409,6 +5104,50 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
   {
     id: 505,
     runId: 1001,
+    accountKey: 'codex-expired-oauth-03',
+    fileName: 'codex-expired-oauth-03.json',
+    displayAccount: 'Design Tools Seat',
+    authIndex: 'codex-expired-oauth-03',
+    accountId: 'acct_codex_design',
+    provider: 'codex',
+    disabled: false,
+    status: 'auth_error',
+    state: '',
+    action: 'keep',
+    actionReason: 'monitoring.codex_inspection_reason_healthy',
+    actionStatus: 'none',
+    statusCode: 200,
+    usedPercent: 42,
+    isQuota: false,
+    planType: 'team',
+    quotaWindows: [
+      {
+        id: 'five-hour',
+        labelKey: 'codex_quota.primary_window',
+        usedPercent: 63,
+        resetLabel: '2h 18m',
+        limitWindowSeconds: 18000,
+      },
+      {
+        id: 'weekly',
+        labelKey: 'codex_quota.secondary_window',
+        usedPercent: 42,
+        resetLabel: '2d 20h',
+        limitWindowSeconds: 604800,
+      },
+      {
+        id: 'code-review-five-hour',
+        labelKey: 'codex_quota.code_review_primary_window',
+        usedPercent: 38,
+        resetLabel: '2h',
+        limitWindowSeconds: 18000,
+      },
+    ],
+    createdAtMs: baseNow - 40 * minute,
+  },
+  {
+    id: 506,
+    runId: 1001,
     accountKey: 'xai-ops-01',
     fileName: 'xai-ops.json',
     displayAccount: 'oc0demo01@yijihwjw.com',
@@ -3421,7 +5160,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     actionReason: 'monitoring.xai_inspection_reason_inference_manual_disable',
     actionStatus: 'none',
     statusCode: 200,
-    usedPercent: 22,
+    usedPercent: 3,
     isQuota: false,
     planType: null,
     quotaWindows: [
@@ -3430,13 +5169,6 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
         labelKey: 'xai_quota.weekly_limit',
         usedPercent: 3,
         resetLabel: new Date(baseNow + 6 * day).toISOString(),
-        limitWindowSeconds: null,
-      },
-      {
-        id: 'xai-monthly',
-        labelKey: 'xai_quota.monthly_limit',
-        usedPercent: 22,
-        resetLabel: new Date(baseNow + 19 * day).toISOString(),
         limitWindowSeconds: null,
       },
       {
@@ -3452,7 +5184,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     createdAtMs: baseNow - 39 * minute,
   },
   {
-    id: 506,
+    id: 507,
     runId: 1001,
     accountKey: 'xai-email-user-01',
     fileName: 'xai-email-user.json',
@@ -3478,13 +5210,6 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
         limitWindowSeconds: null,
       },
       {
-        id: 'xai-monthly',
-        labelKey: 'xai_quota.monthly_limit',
-        usedPercent: 100,
-        resetLabel: new Date(baseNow + 19 * day).toISOString(),
-        limitWindowSeconds: null,
-      },
-      {
         id: 'xai-product-0',
         labelKey: 'xai_quota.product_usage',
         labelParams: { product: 'Grok Build' },
@@ -3499,7 +5224,7 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     createdAtMs: baseNow - 39 * minute,
   },
   {
-    id: 507,
+    id: 508,
     runId: 1001,
     accountKey: 'xai-expired-01',
     fileName: 'xai-expired.json',
@@ -3525,13 +5250,6 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
         limitWindowSeconds: null,
       },
       {
-        id: 'xai-monthly',
-        labelKey: 'xai_quota.monthly_limit',
-        usedPercent: 12,
-        resetLabel: new Date(baseNow + 19 * day).toISOString(),
-        limitWindowSeconds: null,
-      },
-      {
         id: 'xai-product-0',
         labelKey: 'xai_quota.product_usage',
         labelParams: { product: 'Grok Build' },
@@ -3542,6 +5260,110 @@ const buildDemoInspectionResults = (baseNow: number): CodexInspectionResult[] =>
     ],
     errorKind: 'auth_invalid',
     errorDetail: 'invalid_token · The xAI OAuth credential has expired.',
+    createdAtMs: baseNow - 39 * minute,
+  },
+  {
+    id: 509,
+    runId: 1001,
+    accountKey: 'xai-payg-buffer-02',
+    fileName: 'xai-payg-buffer.json',
+    displayAccount: 'xAI PAYG Buffer',
+    authIndex: 'xai-payg-buffer-02',
+    provider: 'xai',
+    disabled: false,
+    status: 'healthy',
+    state: '',
+    action: 'keep',
+    actionReason: 'monitoring.xai_inspection_reason_inference_healthy',
+    actionStatus: 'none',
+    statusCode: 200,
+    usedPercent: 100,
+    isQuota: false,
+    planType: null,
+    quotaWindows: [
+      {
+        id: 'xai-weekly',
+        labelKey: 'xai_quota.weekly_limit',
+        usedPercent: 3,
+        resetLabel: new Date(baseNow + 6 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+      {
+        id: 'xai-monthly',
+        labelKey: 'xai_quota.monthly_limit',
+        usedPercent: 100,
+        resetLabel: new Date(baseNow + 19 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+      {
+        id: 'xai-on-demand',
+        labelKey: 'xai_quota.on_demand_cap',
+        usedPercent: 26,
+        resetLabel: new Date(baseNow + 19 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+      {
+        id: 'xai-product-0',
+        labelKey: 'xai_quota.product_usage',
+        labelParams: { product: 'Grok Build' },
+        usedPercent: 3,
+        resetLabel: new Date(baseNow + 6 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+    ],
+    errorKind: 'inference_healthy',
+    createdAtMs: baseNow - 39 * minute,
+  },
+  {
+    id: 510,
+    runId: 1001,
+    accountKey: 'xai-payg-cap-03',
+    fileName: 'xai-payg-cap.json',
+    displayAccount: 'xAI Cap Reached',
+    authIndex: 'xai-payg-cap-03',
+    provider: 'xai',
+    disabled: false,
+    status: 'cooldown',
+    state: '',
+    action: 'keep',
+    actionReason: 'monitoring.xai_inspection_reason_inference_healthy',
+    actionStatus: 'none',
+    statusCode: 200,
+    usedPercent: 100,
+    isQuota: false,
+    planType: null,
+    quotaWindows: [
+      {
+        id: 'xai-weekly',
+        labelKey: 'xai_quota.weekly_limit',
+        usedPercent: 3,
+        resetLabel: new Date(baseNow + 6 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+      {
+        id: 'xai-monthly',
+        labelKey: 'xai_quota.monthly_limit',
+        usedPercent: 100,
+        resetLabel: new Date(baseNow + 19 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+      {
+        id: 'xai-on-demand',
+        labelKey: 'xai_quota.on_demand_cap',
+        usedPercent: 100,
+        resetLabel: new Date(baseNow + 19 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+      {
+        id: 'xai-product-0',
+        labelKey: 'xai_quota.product_usage',
+        labelParams: { product: 'Grok Build' },
+        usedPercent: 3,
+        resetLabel: new Date(baseNow + 6 * day).toISOString(),
+        limitWindowSeconds: null,
+      },
+    ],
+    errorKind: 'inference_healthy',
     createdAtMs: baseNow - 39 * minute,
   },
 ];
@@ -3764,6 +5586,7 @@ const demoAccountCandidates: AccountActionCandidate[] = [
     accountSnapshot: 'Automation Pool',
     accountIdSnapshot: 'acct_codex_auto',
     authLabel: 'Fallback Pool',
+    reasonCode: 'authentication_review',
     reason: 'Repeated quota and authentication warnings',
     firstSeenAtMs: now() - 2 * day,
     lastSeenAtMs: now() - 18 * 60 * 1000,
@@ -3787,32 +5610,485 @@ const demoAccountCandidates: AccountActionCandidate[] = [
     createdAtMs: now() - day,
     updatedAtMs: now() - 3 * hour,
   },
+  {
+    id: 203,
+    actionType: 'reauth',
+    status: 'pending',
+    provider: 'codex',
+    authFileName: 'codex-expired-oauth-03.json',
+    authIndex: 'codex-expired-oauth-03',
+    accountSnapshot: 'Design Tools Seat',
+    accountIdSnapshot: 'acct_codex_design',
+    authLabel: 'Codex Design Seat',
+    reasonCode: 'token_revoked',
+    reason: 'Quota refresh returned HTTP 401 after token invalidation',
+    firstSeenAtMs: now() - 6 * hour,
+    lastSeenAtMs: now() - 37 * minute,
+    hitCount: 4,
+    createdAtMs: now() - 6 * hour,
+    updatedAtMs: now() - 37 * minute,
+  },
 ];
+
+type DemoAccountHistoryTarget = MonitoringAccountHistoryRequest['accounts'][number];
+type DemoAccountHistoryItem = MonitoringAccountHistoryResponse['items'][number];
+type DemoAccountHistoryRecord = Omit<DemoAccountHistoryItem, 'row_key'>;
+type DemoAccountLatestRequest = NonNullable<DemoAccountHistoryItem['latest_request']>;
+type DemoAccountWindowUsageTarget = MonitoringAccountWindowUsageRequest['windows'][number];
+
+const readDemoAccountHistoryKey = (value: unknown): string => {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return '';
+};
+
+const demoAccountHistoryTargetKey = (
+  target: DemoAccountHistoryTarget | DemoAccountWindowUsageTarget
+): { key: string; valid: boolean } => {
+  const record = target as unknown as Record<string, unknown>;
+  const explicitKey = readDemoAccountHistoryKey(record.account_key);
+  const provider = readDemoAccountHistoryKey(record.auth_provider_snapshot)
+    .toLowerCase()
+    .replace(/_/g, '-')
+    .replace(/^(x-ai|grok)$/, 'xai');
+  const account = readDemoAccountHistoryKey(record.account_snapshot);
+  const label = readDemoAccountHistoryKey(record.auth_label_snapshot);
+  const source = readDemoAccountHistoryKey(record.source);
+  const authFileSnapshot = readDemoAccountHistoryKey(record.auth_file_snapshot);
+  const authFile =
+    authFileSnapshot || (source && source !== account && source !== label ? source : '');
+  const authIndex = readDemoAccountHistoryKey(record.auth_index);
+  const projectId = readDemoAccountHistoryKey(record.auth_project_id_snapshot);
+  let key = '';
+  if (authFile && authIndex) key = `file-index:${authFile}:${authIndex}`;
+  else if (authFile && projectId) key = `file-project:${authFile}:${provider}:${projectId}`;
+  else if (authFile && account) key = `file-account:${authFile}:${provider}:${account}`;
+  else if (authFile && label) key = `file-label:${authFile}:${provider}:${label}`;
+  else if (authFile) key = `file:${authFile}:${provider}`;
+  else if (authIndex) key = `auth-index:${provider}:${authIndex}`;
+  else if (projectId) key = `project:${provider}:${projectId}`;
+  else if (account) key = `account:${provider}:${account}`;
+  else if (label) key = `label:${provider}:${label}`;
+  else key = explicitKey;
+
+  return { key, valid: Boolean(key) };
+};
+
+const demoAccountHistoryRowKey = (row: {
+  auth_file_snapshot?: string;
+  auth_provider_snapshot?: string;
+  auth_project_id_snapshot?: string;
+  account_snapshot?: string;
+  auth_label_snapshot?: string;
+  source?: string;
+  auth_index?: string;
+}) => demoAccountHistoryTargetKey(row as DemoAccountHistoryTarget).key;
+
+const demoAccountHistoryFileKey = (file: AuthFileItem) =>
+  demoAccountHistoryTargetKey({
+    row_key: file.name,
+    auth_file_snapshot: file.name,
+    auth_provider_snapshot:
+      readDemoAccountHistoryKey(file.provider) || readDemoAccountHistoryKey(file.type),
+    auth_project_id_snapshot:
+      readDemoAccountHistoryKey(file.project_id) || readDemoAccountHistoryKey(file.projectId),
+    account_snapshot:
+      readDemoAccountHistoryKey(file.account_snapshot) ||
+      readDemoAccountHistoryKey(file.account) ||
+      readDemoAccountHistoryKey(file.email),
+    auth_label_snapshot:
+      readDemoAccountHistoryKey(file.label) || readDemoAccountHistoryKey(file.note),
+    auth_index: readDemoAccountHistoryKey(file.authIndex),
+    source: file.name,
+  }).key;
+
+const readDemoRequestCount = (value: unknown): number => {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : 0;
+};
+
+const DEMO_RECENT_REQUEST_SCENARIOS = [
+  { count: 1, failedIndexes: [] },
+  { count: 2, failedIndexes: [0] },
+  { count: 3, failedIndexes: [1] },
+  { count: 5, failedIndexes: [0, 2] },
+  { count: 5, failedIndexes: [0, 1, 2, 3, 4] },
+  { count: 10, failedIndexes: [2, 7] },
+] as const;
+
+const DEMO_FAILURE_PROFILES = [
+  {
+    statusCode: 401,
+    summary: 'Access token expired for the recent request.',
+    kind: 'authentication',
+    code: 'invalid_token',
+  },
+  {
+    statusCode: 429,
+    summary: 'Rate limit exceeded for the recent request.',
+    kind: 'rate_limit',
+    code: 'quota_exceeded',
+  },
+  {
+    statusCode: 500,
+    summary: 'The upstream provider returned an internal error.',
+    kind: 'upstream',
+    code: 'internal_error',
+  },
+  {
+    statusCode: 503,
+    summary: 'The upstream provider is temporarily unavailable.',
+    kind: 'upstream',
+    code: 'service_unavailable',
+  },
+] as const;
+
+const buildDemoRecentAccountRequests = (
+  timestampMS: number,
+  totalRequests: number,
+  scenarioIndex: number,
+  tracePrefix: string
+): { latestRequest: DemoAccountLatestRequest; recentRequests: DemoAccountLatestRequest[] } => {
+  const availableRequests = readDemoRequestCount(totalRequests);
+  if (availableRequests <= 0) {
+    const emptyRequest = { timestamp_ms: timestampMS, failed: false };
+    return { latestRequest: emptyRequest, recentRequests: [] };
+  }
+
+  const scenario =
+    DEMO_RECENT_REQUEST_SCENARIOS[scenarioIndex % DEMO_RECENT_REQUEST_SCENARIOS.length];
+  const requestCount = Math.min(10, availableRequests, scenario.count);
+  const failedIndexes = new Set<number>(
+    scenario.failedIndexes.filter((index) => index < requestCount)
+  );
+  const recentRequests = Array.from({ length: requestCount }, (_, index) => {
+    const requestTimestamp = timestampMS - index * minute;
+    if (!failedIndexes.has(index)) {
+      return { timestamp_ms: requestTimestamp, failed: false };
+    }
+
+    const profile = DEMO_FAILURE_PROFILES[(scenarioIndex + index) % DEMO_FAILURE_PROFILES.length];
+    return {
+      timestamp_ms: requestTimestamp,
+      failed: true,
+      fail_status_code: profile.statusCode,
+      fail_summary: profile.summary,
+      header_error_kind: profile.kind,
+      header_error_code: profile.code,
+      header_trace_id: `${tracePrefix}-${index}`,
+    };
+  });
+
+  return {
+    latestRequest: recentRequests[0]!,
+    recentRequests,
+  };
+};
+
+const buildDemoAccountHistoryIndex = (baseNow = now()): Map<string, DemoAccountHistoryRecord> => {
+  const analytics = buildMonitoringAnalytics(baseNow);
+  const rows = analytics.credential_stats ?? [];
+  const result = new Map<string, DemoAccountHistoryRecord>();
+
+  rows.forEach((row, index) => {
+    const accountKey = demoAccountHistoryRowKey(row);
+    if (!accountKey) return;
+    const totalRequests = row.calls;
+    const successCalls = row.success_calls;
+    const failureCalls = row.failure_calls;
+    const recentRequestData = buildDemoRecentAccountRequests(
+      row.last_seen_ms,
+      totalRequests,
+      index,
+      `demo-${row.id}`
+    );
+
+    result.set(accountKey, {
+      account_key: accountKey,
+      matched: true,
+      total_requests: totalRequests,
+      success_calls: successCalls,
+      failure_calls: failureCalls,
+      total_tokens: row.total_tokens,
+      total_cost: row.cost,
+      success_rate: totalRequests > 0 ? successCalls / totalRequests : null,
+      first_seen_ms: baseNow - 30 * day,
+      last_seen_ms: row.last_seen_ms,
+      latest_request: recentRequestData.latestRequest,
+      recent_requests: recentRequestData.recentRequests,
+      sync_status: 'ready',
+    });
+  });
+
+  getDemoAuthFileItems().forEach((file, index) => {
+    const accountKey = demoAccountHistoryFileKey(file);
+    if (!accountKey || result.has(accountKey)) return;
+    const successCalls = readDemoRequestCount(file.success);
+    const failureCalls = readDemoRequestCount(file.failed);
+    const totalRequests = successCalls + failureCalls;
+    if (totalRequests <= 0) return;
+    const recentRequestData = buildDemoRecentAccountRequests(
+      file.modified ?? baseNow,
+      totalRequests,
+      100 + index,
+      `demo-${file.name}`
+    );
+
+    result.set(accountKey, {
+      account_key: accountKey,
+      matched: true,
+      total_requests: totalRequests,
+      success_calls: successCalls,
+      failure_calls: failureCalls,
+      total_tokens: totalRequests * 1200,
+      total_cost: round2(totalRequests * 0.018),
+      success_rate: successCalls / totalRequests,
+      first_seen_ms: baseNow - 7 * day,
+      last_seen_ms: file.modified ?? baseNow,
+      latest_request: recentRequestData.latestRequest,
+      recent_requests: recentRequestData.recentRequests,
+      sync_status: 'ready',
+    });
+  });
+
+  return result;
+};
 
 export const getDemoRawConfig = () => clone(initialRawConfig);
 export const getDemoProviderModels = () => clone(demoProviderModels);
 export const getDemoAuthFiles = (): AuthFilesResponse => {
   const response = clone(demoAuthFiles);
+  response.total = response.files.length;
   if (!demoCodexUpgradeCompletedAt) return response;
+  const upgradeCompletedAtMs = Date.parse(demoCodexUpgradeCompletedAt);
+  if (!Number.isFinite(upgradeCompletedAtMs)) return response;
 
   const target = response.files.find((file) => file.id === DEMO_CODEX_UPGRADE_AUTH_ID);
   if (!target) return response;
 
   target.plan_type = 'plus';
-  target.id_token = { plan_type: 'plus' };
+  target.id_token = {
+    plan_type: 'plus',
+    chatgpt_subscription_active_until: new Date(upgradeCompletedAtMs + 30 * day).toISOString(),
+  };
   target.last_refresh = demoCodexUpgradeCompletedAt;
-  target.modified = Date.parse(demoCodexUpgradeCompletedAt);
-  target.statusMessage = 'Ready';
+  target.modified = upgradeCompletedAtMs;
+  delete target.statusMessage;
   return response;
 };
 export const getDemoPlugins = () => clone(demoPlugins);
 export const getDemoPluginStore = () => clone(demoPluginStore);
 export const getDemoManagerConfig = () => clone(demoManagerConfig);
 export const getDemoDashboardSummary = () => clone(dashboardBase());
+
+const filterDemoMonitoringAnalyticsByCredential = (
+  response: MonitoringAnalyticsResponse,
+  request?: MonitoringAnalyticsRequest
+): MonitoringAnalyticsResponse => {
+  const filters = buildDemoCredentialFilters(request);
+  if (!filters) return response;
+
+  const credentialStats = (response.credential_stats ?? []).filter((row) =>
+    matchesDemoCredentialFilters(row, filters)
+  );
+  const accountStats = buildDemoScopedAccountStats(credentialStats);
+  const credentialTimeline = (response.credential_timeline ?? []).filter((row) =>
+    matchesDemoCredentialFilters(row, filters)
+  );
+
+  const totalCalls = credentialStats.reduce((sum, row) => sum + row.calls, 0);
+  const successCalls = credentialStats.reduce((sum, row) => sum + row.success_calls, 0);
+  const failureCalls = credentialStats.reduce((sum, row) => sum + row.failure_calls, 0);
+  const inputTokens = credentialStats.reduce((sum, row) => sum + row.input_tokens, 0);
+  const outputTokens = credentialStats.reduce((sum, row) => sum + row.output_tokens, 0);
+  const cachedTokens = credentialStats.reduce((sum, row) => sum + row.cached_tokens, 0);
+  const cacheReadTokens = credentialStats.reduce((sum, row) => sum + row.cache_read_tokens, 0);
+  const cacheCreationTokens = credentialStats.reduce(
+    (sum, row) => sum + row.cache_creation_tokens,
+    0
+  );
+  const totalTokens = credentialStats.reduce((sum, row) => sum + row.total_tokens, 0);
+  const totalCost = round2(credentialStats.reduce((sum, row) => sum + row.cost, 0));
+  const latencyCallCount = credentialStats.reduce(
+    (sum, row) => sum + (row.average_latency_ms === null ? 0 : row.calls),
+    0
+  );
+  const averageLatencyMs =
+    latencyCallCount > 0
+      ? Math.round(
+          credentialStats.reduce((sum, row) => sum + (row.average_latency_ms ?? 0) * row.calls, 0) /
+            latencyCallCount
+        )
+      : null;
+  const rangeDays = Math.max(
+    1,
+    Math.ceil(Math.max(0, (request?.to_ms ?? 0) - (request?.from_ms ?? 0)) / day)
+  );
+  const summary = response.summary
+    ? {
+        ...response.summary,
+        total_calls: totalCalls,
+        success_calls: successCalls,
+        failure_calls: failureCalls,
+        success_rate: safeRate(successCalls, totalCalls),
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cached_tokens: cachedTokens,
+        cache_read_tokens: cacheReadTokens,
+        cache_creation_tokens: cacheCreationTokens,
+        reasoning_tokens: Math.max(0, totalTokens - inputTokens - outputTokens - cachedTokens),
+        total_tokens: totalTokens,
+        total_cost: totalCost,
+        average_cost_per_call: safeRate(totalCost, totalCalls),
+        average_latency_ms: averageLatencyMs,
+        p95_latency_ms: averageLatencyMs,
+        p95_ttft_ms: null,
+        zero_token_calls: 0,
+        rpm_30m: 0,
+        tpm_30m: 0,
+        avg_daily_requests: Math.round(totalCalls / rangeDays),
+        avg_daily_tokens: Math.round(totalTokens / rangeDays),
+        approx_tasks: totalCalls,
+        approx_task_failures: failureCalls,
+        approx_task_success_rate: safeRate(successCalls, totalCalls),
+        zero_token_models: [],
+      }
+    : undefined;
+
+  return {
+    ...response,
+    summary,
+    account_stats: accountStats,
+    credential_stats: credentialStats,
+    credential_timeline: credentialTimeline,
+  };
+};
+
 export const getDemoMonitoringAnalytics = (request?: MonitoringAnalyticsRequest) =>
-  clone(buildMonitoringAnalytics(undefined, request));
+  clone(
+    filterDemoMonitoringAnalyticsByCredential(buildMonitoringAnalytics(undefined, request), request)
+  );
+export const getDemoAccountHistory = (
+  request: MonitoringAccountHistoryRequest
+): MonitoringAccountHistoryResponse => {
+  const generatedAtMS = getDemoEvidenceEpochMs();
+  const historyByKey = buildDemoAccountHistoryIndex(generatedAtMS);
+  const latestID = 184_260;
+
+  return clone({
+    generated_at_ms: generatedAtMS,
+    checkpoint: {
+      last_event_id: latestID,
+      latest_id: latestID,
+      pending: false,
+      processed: 0,
+    },
+    items: request.accounts.map((account) => {
+      const { key, valid } = demoAccountHistoryTargetKey(account);
+      const history = historyByKey.get(key);
+      if (valid && history) return { ...history, row_key: account.row_key };
+
+      return {
+        row_key: account.row_key,
+        account_key: key,
+        matched: false,
+        total_requests: 0,
+        success_calls: 0,
+        failure_calls: 0,
+        total_tokens: 0,
+        total_cost: 0,
+        success_rate: null,
+        first_seen_ms: null,
+        last_seen_ms: null,
+        sync_status: 'empty',
+      };
+    }),
+  });
+};
+export const getDemoAccountWindowUsage = (
+  request: MonitoringAccountWindowUsageRequest
+): MonitoringAccountWindowUsageResponse => {
+  const generatedAtMS = getDemoEvidenceEpochMs();
+  const historyByKey = buildDemoAccountHistoryIndex(generatedAtMS);
+
+  return clone({
+    generated_at_ms: generatedAtMS,
+    items: request.windows.map((window) => {
+      const { key, valid } = demoAccountHistoryTargetKey(window);
+      const history = historyByKey.get(key);
+      if (!valid || !history) {
+        return {
+          request_key: window.request_key,
+          row_key: window.row_key,
+          window_key: window.window_key,
+          provider_window_id: window.provider_window_id,
+          period: window.period,
+          from_ms: window.from_ms,
+          to_ms: window.to_ms,
+          matched: false,
+          total_requests: 0,
+          success_calls: 0,
+          failure_calls: 0,
+          total_tokens: 0,
+          total_cost: 0,
+          success_rate: null,
+          last_seen_ms: null,
+          sync_status: 'empty',
+          scope_match_status: window.model_scope?.complete === false ? 'unmatched' : 'complete',
+          unmatched_requests: 0,
+        };
+      }
+
+      const windowHours = Math.max(1, (window.to_ms - window.from_ms) / hour);
+      const ratio = Math.min(0.4, Math.max(0.035, windowHours / (30 * 24) / 2));
+      const totalRequests = Math.max(1, Math.round(history.total_requests * ratio));
+      const failureCalls = Math.min(
+        totalRequests,
+        Math.max(0, Math.round(history.failure_calls * ratio))
+      );
+      const successCalls = Math.max(0, totalRequests - failureCalls);
+
+      const resolvedLastSeenMs =
+        window.period === 'previous' || window.period === 'previous_equal_range'
+          ? Math.min(generatedAtMS, window.to_ms)
+          : typeof history.last_seen_ms === 'number' && Number.isFinite(history.last_seen_ms)
+            ? Math.min(history.last_seen_ms, window.to_ms)
+            : Math.min(generatedAtMS - 15 * minute, window.to_ms);
+
+      return {
+        request_key: window.request_key,
+        row_key: window.row_key,
+        window_key: window.window_key,
+        provider_window_id: window.provider_window_id,
+        period: window.period,
+        from_ms: window.from_ms,
+        to_ms: window.to_ms,
+        matched: true,
+        total_requests: totalRequests,
+        success_calls: successCalls,
+        failure_calls: failureCalls,
+        total_tokens: Math.max(1, Math.round(history.total_tokens * ratio)),
+        total_cost: round2((history.total_cost ?? 0) * ratio),
+        success_rate: totalRequests > 0 ? successCalls / totalRequests : null,
+        last_seen_ms: resolvedLastSeenMs,
+        sync_status: 'ready',
+        scope_match_status: 'complete',
+        unmatched_requests: 0,
+      };
+    }),
+  });
+};
 export const getDemoModelPrices = () => clone(demoModelPrices);
 export const getDemoModelPriceUsageSummary = () => clone(demoModelPriceUsageSummary);
+export const getDemoRuntimeModelPricingStatus = (): RuntimeModelPricingStatusResponse => {
+  const models = Object.keys(demoModelPrices.prices).sort();
+  return {
+    models,
+    unpricedModels: [],
+    count: models.length,
+    unpricedCount: 0,
+  };
+};
 export const getDemoUsagePayload = () => {
   const dashboard = dashboardBase();
   return {
@@ -3862,6 +6138,29 @@ export const getDemoUsageServiceInfo = (): UsageServiceInfo => ({
   hasHistoricalData: true,
 });
 
+const getDemoDatabaseMaintenanceStatus = (): NonNullable<
+  UsageServiceStatus['databaseMaintenance']
+> => {
+  if (getDemoMaintenanceScenario() !== 'degraded') {
+    return {
+      required: false,
+      performanceDegraded: false,
+      deferredIndexes: 0,
+      offlineJobs: 0,
+      reasons: [],
+    };
+  }
+
+  return {
+    required: true,
+    performanceDegraded: true,
+    deferredIndexes: 10,
+    offlineJobs: 1,
+    reasons: ['deferred_indexes', 'offline_derived_cleanup', 'legacy_index_replacement'],
+    command: 'cleanup-derived',
+  };
+};
+
 export const getDemoUsageServiceStatus = (): UsageServiceStatus => ({
   service: 'cpa-manager-plus',
   dbPath: '/data/demo-usage.sqlite',
@@ -3879,7 +6178,746 @@ export const getDemoUsageServiceStatus = (): UsageServiceStatus => ({
     totalSkipped: 124,
     deadLetters: 3,
   },
+  database: {
+    databaseBytes: 2_684_354_560,
+    walBytes: 67_108_864,
+    shmBytes: 32_768,
+    totalBytes: 2_751_496_192,
+    journalSizeLimitBytes: 268_435_456,
+    checkpoint: {
+      mode: 'passive',
+      busy: 0,
+      logFrames: 16_384,
+      checkpointedFrames: 16_384,
+      executedAtMs: now() - 20_000,
+      durationMs: 112,
+      lastTruncateAttemptAtMs: now() - 42 * minute,
+    },
+  },
+  databaseMaintenance: getDemoDatabaseMaintenanceStatus(),
 });
+
+const getDemoQuotaStoreStateByFileName = (
+  baseNow = getDemoEvidenceEpochMs()
+): DemoQuotaStoreState => ({
+  metaQuota: {},
+  codexQuota: {
+    'codex-team-01.json': {
+      status: 'success',
+      planType: 'team',
+      authFileKey: 'codex-team-01.json::codex-team-01',
+      authFileName: 'codex-team-01.json',
+      authIndex: 'codex-team-01',
+      fetchedAtMs: baseNow - 5 * minute,
+      resetCreditsEvidenceAtMs: baseNow - 5 * minute,
+      subscriptionActiveUntil: demoResetIso(23 * day, baseNow),
+      creditsHasCredits: false,
+      creditsUnlimited: false,
+      creditsOverageLimitReached: false,
+      spendControlReached: true,
+      spendControlIndividualLimit: {
+        source: 'workspace_spend_controls',
+        unit: 'credit',
+        limit: '0',
+        used: '0.0',
+        remaining: '0.0',
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetAfterSeconds: (22 * day) / 1000,
+        resetAtMs: baseNow + 22 * day,
+      },
+      rateLimitResetCreditsAvailableCount: 2,
+      rateLimitResetCredits: [
+        {
+          id: 'demo-credit-1',
+          status: 'available',
+          grantedAt: demoResetIso(-day, baseNow),
+          expiresAt: demoResetIso(6 * day, baseNow),
+        },
+        {
+          id: 'demo-credit-2',
+          status: 'available',
+          grantedAt: demoResetIso(-12 * hour, baseNow),
+          expiresAt: demoResetIso(14 * day, baseNow),
+        },
+      ],
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5 小时限额',
+          usedPercent: 55,
+          ...demoQuotaReset(2 * hour + 18 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'weekly',
+          label: '周限额',
+          usedPercent: 9,
+          ...demoQuotaReset(3 * day + 8 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+      ],
+    },
+    'codex-email-user.json': {
+      status: 'success',
+      planType: 'plus',
+      authFileKey: 'codex-email-user.json::codex-email-user-01',
+      authFileName: 'codex-email-user.json',
+      authIndex: 'codex-email-user-01',
+      fetchedAtMs: baseNow - 4 * minute,
+      resetCreditsEvidenceAtMs: baseNow - 4 * minute,
+      subscriptionActiveUntil: demoResetIso(5 * day, baseNow),
+      rateLimitResetCreditsAvailableCount: 0,
+      rateLimitResetCredits: [],
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5 小时限额',
+          usedPercent: 48,
+          ...demoQuotaReset(3 * hour + 15 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'weekly',
+          label: '周限额',
+          usedPercent: 56,
+          ...demoQuotaReset(4 * day + 12 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+      ],
+    },
+    'codex-pro-20x-01.json': {
+      status: 'success',
+      planType: 'pro',
+      authFileKey: 'codex-pro-20x-01.json::codex-pro-20x-01',
+      authFileName: 'codex-pro-20x-01.json',
+      authIndex: 'codex-pro-20x-01',
+      fetchedAtMs: baseNow - 4 * minute,
+      resetCreditsEvidenceAtMs: baseNow - 4 * minute,
+      subscriptionActiveUntil: demoResetIso(2 * day, baseNow),
+      rateLimitResetCreditsAvailableCount: 3,
+      rateLimitResetCredits: [
+        {
+          id: 'demo-pro-credit-1',
+          status: 'available',
+          grantedAt: demoResetIso(-2 * day, baseNow),
+          expiresAt: demoResetIso(3 * day + 4 * hour, baseNow),
+        },
+        {
+          id: 'demo-pro-credit-2',
+          status: 'available',
+          grantedAt: demoResetIso(-day, baseNow),
+          expiresAt: demoResetIso(9 * day, baseNow),
+        },
+        {
+          id: 'demo-pro-credit-3',
+          status: 'available',
+          grantedAt: demoResetIso(-6 * hour, baseNow),
+          expiresAt: demoResetIso(18 * day, baseNow),
+        },
+      ],
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5 小时限额',
+          usedPercent: 88,
+          ...demoQuotaReset(2 * hour + 45 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'weekly',
+          label: '周限额',
+          usedPercent: 68,
+          ...demoQuotaReset(5 * day + 6 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+        {
+          id: 'monthly',
+          label: '月限额',
+          usedPercent: 35,
+          ...demoQuotaReset(24 * day + 6 * hour, baseNow),
+          limitWindowSeconds: 2_592_000,
+        },
+      ],
+    },
+    'codex-fallback-02.json': {
+      status: 'success',
+      planType: 'team',
+      authFileKey: 'codex-fallback-02.json::codex-fallback-02',
+      authFileName: 'codex-fallback-02.json',
+      authIndex: 'codex-fallback-02',
+      fetchedAtMs: baseNow - 15 * minute,
+      resetCreditsEvidenceAtMs: baseNow - 15 * minute,
+      rateLimitResetCreditsAvailableCount: 1,
+      rateLimitResetCredits: [
+        {
+          id: 'demo-fallback-credit-1',
+          status: 'available',
+          grantedAt: demoResetIso(-day, baseNow),
+          expiresAt: demoResetIso(2 * day, baseNow),
+        },
+      ],
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5 小时限额',
+          usedPercent: 100,
+          ...demoQuotaReset(68 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'weekly',
+          label: '周限额',
+          usedPercent: 72,
+          ...demoQuotaReset(2 * day + 4 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+      ],
+    },
+    'codex-expired-oauth-03.json': {
+      status: 'error',
+      planType: 'free',
+      authFileKey: 'codex-expired-oauth-03.json::codex-expired-oauth-03',
+      authFileName: 'codex-expired-oauth-03.json',
+      authIndex: 'codex-expired-oauth-03',
+      failedAtMs: baseNow - 3 * minute,
+      errorStatus: 401,
+      error:
+        '额度获取失败：401 Your authentication token has been invalidated. Please try signing in again.',
+      windows: [],
+    },
+  },
+  claudeQuota: {
+    'claude-team-01.json': {
+      status: 'success',
+      planType: 'pro',
+      fetchedAtMs: baseNow - 8 * minute,
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5-hour limit',
+          labelKey: 'claude_quota.five_hour',
+          usedPercent: 44,
+          resetLabel: '2h',
+          ...demoQuotaResetMetadata(2 * hour, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'seven-day',
+          label: 'Weekly limit',
+          labelKey: 'claude_quota.seven_day',
+          usedPercent: 31,
+          resetLabel: '3d',
+          ...demoQuotaResetMetadata(3 * day, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+      ],
+    },
+    'claude-research-02.json': {
+      status: 'success',
+      planType: 'pro',
+      fetchedAtMs: baseNow - 15 * minute,
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5-hour limit',
+          labelKey: 'claude_quota.five_hour',
+          usedPercent: 88,
+          resetLabel: '1h 12m',
+          ...demoQuotaResetMetadata(hour + 12 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'seven-day',
+          label: 'Weekly limit',
+          labelKey: 'claude_quota.seven_day',
+          usedPercent: 48,
+          resetLabel: '3d 04h',
+          ...demoQuotaResetMetadata(3 * day + 4 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+        {
+          id: 'seven-day-sonnet',
+          label: 'Sonnet weekly limit',
+          labelKey: 'claude_quota.seven_day_sonnet',
+          usedPercent: 74,
+          resetLabel: '2d 09h',
+          ...demoQuotaResetMetadata(2 * day + 9 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+      ],
+    },
+    'claude-extra-usage-03.json': {
+      status: 'success',
+      planType: 'pro',
+      fetchedAtMs: baseNow - 18 * minute,
+      windows: [
+        {
+          id: 'five-hour',
+          label: '5-hour limit',
+          labelKey: 'claude_quota.five_hour',
+          usedPercent: 62,
+          resetLabel: '2h 35m',
+          ...demoQuotaResetMetadata(2 * hour + 35 * minute),
+          limitWindowSeconds: 18_000,
+        },
+        {
+          id: 'seven-day',
+          label: 'Weekly limit',
+          labelKey: 'claude_quota.seven_day',
+          usedPercent: 58,
+          resetLabel: '4d 06h',
+          ...demoQuotaResetMetadata(4 * day + 6 * hour),
+          limitWindowSeconds: 604_800,
+        },
+        {
+          id: 'seven-day-opus',
+          label: 'Opus weekly limit',
+          labelKey: 'claude_quota.seven_day_opus',
+          usedPercent: 91,
+          resetLabel: '1d 12h',
+          ...demoQuotaResetMetadata(day + 12 * hour),
+          limitWindowSeconds: 604_800,
+        },
+      ],
+      extraUsage: {
+        is_enabled: true,
+        monthly_limit: 20_000,
+        used_credits: 18_200,
+        utilization: 91,
+      },
+    },
+  },
+  antigravityQuota: {
+    'antigravity-builder.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 6 * minute,
+      subscription: { plan: 'pro', tierName: 'Pro', tierId: 'g1-pro' },
+      groups: [
+        {
+          id: 'gemini-models',
+          label: 'Gemini Models',
+          description: 'Models within this group: Gemini Flash, Gemini Pro',
+          models: ['gemini-2.5-flash', 'gemini-2.5-pro'],
+          buckets: [
+            {
+              id: 'gemini-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.64,
+              resetTime: demoResetIso(4 * hour),
+            },
+            {
+              id: 'gemini-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.38,
+              resetTime: demoResetIso(2 * day),
+            },
+          ],
+        },
+        {
+          id: 'claude-gpt-models',
+          label: 'Claude and GPT models',
+          description: 'Models within this group: Claude Opus, Claude Sonnet, GPT-OSS',
+          models: ['claude-sonnet-4-5', 'gpt-oss-120b-medium'],
+          buckets: [
+            {
+              id: '3p-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.72,
+              resetTime: demoResetIso(3 * hour + 20 * minute),
+            },
+            {
+              id: '3p-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.58,
+              resetTime: demoResetIso(4 * day),
+            },
+          ],
+        },
+      ],
+    },
+    'antigravity-daily-exhausted.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 20 * minute,
+      subscription: { plan: 'pro', tierName: 'Pro', tierId: 'g1-pro' },
+      groups: [
+        {
+          id: 'gemini-models',
+          label: 'Gemini Models',
+          description: 'Models within this group: gemini-2.5-pro, gemini-2.5-flash',
+          models: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+          buckets: [
+            {
+              id: 'gemini-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0,
+              resetTime: demoResetIso(2 * hour + 45 * minute),
+              description: 'You have used all of your 5-hour Gemini pool.',
+            },
+            {
+              id: 'gemini-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.44,
+              resetTime: demoResetIso(3 * day),
+            },
+          ],
+        },
+        {
+          id: 'claude-gpt-models',
+          label: 'Claude and GPT models',
+          description: 'Models within this group: Claude Opus, Claude Sonnet, GPT-OSS',
+          models: ['claude-sonnet-4-5', 'gpt-oss-120b-medium'],
+          buckets: [
+            {
+              id: '3p-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.82,
+              resetTime: demoResetIso(4 * hour),
+            },
+            {
+              id: '3p-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.66,
+              resetTime: demoResetIso(5 * day),
+            },
+          ],
+        },
+      ],
+    },
+    'antigravity-monthly-low.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 15 * minute,
+      subscription: { plan: 'pro', tierName: 'Pro', tierId: 'g1-pro' },
+      groups: [
+        {
+          id: 'gemini-models',
+          label: 'Gemini Models',
+          description: 'Models within this group: Gemini Flash, Gemini Pro',
+          models: ['gemini-2.5-flash', 'gemini-2.5-pro'],
+          buckets: [
+            {
+              id: 'gemini-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.69,
+              resetTime: demoResetIso(2 * hour + 10 * minute),
+            },
+            {
+              id: 'gemini-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.72,
+              resetTime: demoResetIso(5 * day),
+            },
+          ],
+        },
+        {
+          id: 'claude-gpt-models',
+          label: 'Claude and GPT Models',
+          description: 'Models within this group: claude-sonnet-4-5, gpt-4.1-mini',
+          models: ['claude-sonnet-4-5', 'gpt-4.1-mini'],
+          buckets: [
+            {
+              id: '3p-5h',
+              label: '5 Hour Limit',
+              window: '5h',
+              remainingFraction: 0.52,
+              resetTime: demoResetIso(2 * hour + 40 * minute),
+            },
+            {
+              id: '3p-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.08,
+              resetTime: demoResetIso(5 * day),
+              description: 'Weekly Claude pool is close to the low-quota threshold',
+            },
+          ],
+        },
+      ],
+    },
+    'antigravity-free-weekly.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 8 * minute,
+      subscription: { plan: 'free', tierName: 'Free', tierId: 'g1-free' },
+      groups: [
+        {
+          id: 'gemini-models',
+          label: 'Gemini Models',
+          description: 'Models within this group: Gemini Flash, Gemini Pro',
+          models: ['gemini-2.5-flash', 'gemini-2.5-pro'],
+          buckets: [
+            {
+              id: 'gemini-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.76,
+              resetTime: demoResetIso(5 * day + 9 * hour),
+            },
+          ],
+        },
+        {
+          id: 'claude-gpt-models',
+          label: 'Claude and GPT models',
+          description: 'Models within this group: Claude Sonnet, GPT-OSS',
+          models: ['claude-sonnet-4-5', 'gpt-oss-120b-medium'],
+          buckets: [
+            {
+              id: '3p-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.31,
+              resetTime: demoResetIso(3 * day + 18 * hour),
+            },
+          ],
+        },
+      ],
+    },
+    'antigravity-pro-matrix.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 25 * minute,
+      subscription: { plan: 'pro', tierName: 'Pro', tierId: 'g1-pro' },
+      groups: [
+        {
+          id: 'gemini-models',
+          label: 'Gemini Models',
+          description: 'Models within this group: Gemini Flash, Gemini Pro',
+          models: ['gemini-2.5-flash', 'gemini-2.5-pro'],
+          buckets: [
+            {
+              id: 'gemini-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.96,
+              resetTime: demoResetIso(4 * hour + 18 * minute),
+            },
+            {
+              id: 'gemini-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.04,
+              resetTime: demoResetIso(6 * day + 8 * hour),
+              description: 'Weekly Gemini pool is almost exhausted.',
+            },
+          ],
+        },
+        {
+          id: 'claude-gpt-models',
+          label: 'Claude and GPT models',
+          description: 'Models within this group: Claude Sonnet, Claude Opus, GPT-OSS',
+          models: ['claude-sonnet-4-5', 'claude-opus-4-1', 'gpt-oss-120b-medium'],
+          buckets: [
+            {
+              id: '3p-5h',
+              label: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.11,
+              resetTime: demoResetIso(52 * minute),
+              description: '5-hour Claude pool is below the low-quota threshold.',
+            },
+            {
+              id: '3p-weekly',
+              label: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.19,
+              resetTime: demoResetIso(2 * day + 14 * hour),
+            },
+          ],
+        },
+      ],
+    },
+  },
+  kimiQuota: {
+    'kimi-coding.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 10 * minute,
+      rows: [
+        {
+          id: 'summary',
+          labelKey: 'kimi_quota.weekly_limit',
+          used: 214,
+          limit: 2048,
+          resetHint: '6d 4h',
+          ...demoQuotaResetMetadata(6 * day + 4 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+        {
+          id: 'limit-0',
+          labelKey: 'kimi_quota.limit_window',
+          labelParams: { duration: '5h' },
+          used: 139,
+          limit: 200,
+          resetHint: '3h 12m',
+          ...demoQuotaResetMetadata(3 * hour + 12 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+      ],
+    },
+    'kimi-healthy.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 8 * minute,
+      rows: [
+        {
+          id: 'summary',
+          labelKey: 'kimi_quota.weekly_limit',
+          used: 320,
+          limit: 7168,
+          resetHint: '5d 18h',
+          ...demoQuotaResetMetadata(5 * day + 18 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+        {
+          id: 'limit-0',
+          labelKey: 'kimi_quota.limit_window',
+          labelParams: { duration: '5h' },
+          used: 18,
+          limit: 200,
+          resetHint: '4h 26m',
+          ...demoQuotaResetMetadata(4 * hour + 26 * minute, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+      ],
+    },
+    'kimi-exhausted.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 5 * minute,
+      rows: [
+        {
+          id: 'summary',
+          labelKey: 'kimi_quota.weekly_limit',
+          used: 1810,
+          limit: 2048,
+          resetHint: '2d 03h',
+          ...demoQuotaResetMetadata(2 * day + 3 * hour, baseNow),
+          limitWindowSeconds: 604_800,
+        },
+        {
+          id: 'limit-0',
+          labelKey: 'kimi_quota.limit_window',
+          labelParams: { duration: '5h' },
+          used: 200,
+          limit: 200,
+          resetHint: '2h',
+          ...demoQuotaResetMetadata(2 * hour, baseNow),
+          limitWindowSeconds: 18_000,
+        },
+      ],
+    },
+  },
+  xaiQuota: {
+    'xai-ops.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 10 * minute,
+      billing: {
+        periodType: 'weekly',
+        usagePercent: 42,
+        periodStart: demoResetIso(-2 * day, baseNow),
+        periodEnd: demoResetIso(5 * day, baseNow),
+        productUsage: [
+          { product: 'Grok Code Fast', usagePercent: 37 },
+          { product: 'Grok Code Thinking', usagePercent: 52 },
+        ],
+        monthlyLimitCents: null,
+        usedCents: null,
+        includedUsedCents: null,
+        onDemandCapCents: null,
+        onDemandUsedCents: null,
+        onDemandUsedPercent: null,
+        usedPercent: null,
+      },
+    },
+    'xai-payg-buffer.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 12 * minute,
+      billing: {
+        periodType: 'monthly',
+        usagePercent: 100,
+        periodStart: demoResetIso(-18 * day, baseNow),
+        periodEnd: demoResetIso(12 * day, baseNow),
+        productUsage: [],
+        monthlyLimitCents: 100_000,
+        usedCents: 126_000,
+        includedUsedCents: 100_000,
+        onDemandCapCents: 100_000,
+        onDemandUsedCents: 26_000,
+        onDemandUsedPercent: 26,
+        billingPeriodStart: demoResetIso(-18 * day, baseNow),
+        billingPeriodEnd: demoResetIso(12 * day, baseNow),
+        usedPercent: 100,
+      },
+    },
+    'xai-payg-cap.json': {
+      status: 'success',
+      fetchedAtMs: baseNow - 15 * minute,
+      billing: {
+        periodType: 'monthly',
+        usagePercent: 100,
+        periodStart: demoResetIso(-20 * day, baseNow),
+        periodEnd: demoResetIso(10 * day, baseNow),
+        productUsage: [],
+        monthlyLimitCents: 100_000,
+        usedCents: 150_000,
+        includedUsedCents: 100_000,
+        onDemandCapCents: 50_000,
+        onDemandUsedCents: 50_000,
+        onDemandUsedPercent: 100,
+        billingPeriodStart: demoResetIso(-20 * day, baseNow),
+        billingPeriodEnd: demoResetIso(10 * day, baseNow),
+        usedPercent: 100,
+      },
+    },
+  },
+  devinQuota: {},
+});
+
+const scopeDemoQuotaRecord = <TState extends CredentialScopedQuotaState>(
+  record: Record<string, TState>,
+  filesByName: ReadonlyMap<string, AuthFileItem[]>
+): Record<string, TState> => {
+  const scoped: Record<string, TState> = {};
+  Object.entries(record).forEach(([fileName, state]) => {
+    const candidates = filesByName.get(fileName) ?? [];
+    const stateAuthIndex = String(state.authIndex ?? '').trim();
+    const file =
+      candidates.find(
+        (candidate) =>
+          stateAuthIndex &&
+          String(candidate.authIndex ?? candidate['auth_index'] ?? '').trim() === stateAuthIndex
+      ) ?? (candidates.length === 1 ? candidates[0] : undefined);
+    if (!file) return;
+    const identity = buildQuotaCredentialIdentity(file);
+    const storeKey = identity.authFileKey ?? fileName;
+    scoped[storeKey] = { ...state, ...identity };
+  });
+  return scoped;
+};
+
+export const getDemoQuotaStoreState = (baseNow = getDemoEvidenceEpochMs()): DemoQuotaStoreState => {
+  const raw = getDemoQuotaStoreStateByFileName(baseNow);
+  const filesByName = new Map<string, AuthFileItem[]>();
+  getDemoAuthFiles().files.forEach((file) => {
+    const candidates = filesByName.get(file.name) ?? [];
+    candidates.push(file);
+    filesByName.set(file.name, candidates);
+  });
+  return {
+    antigravityQuota: scopeDemoQuotaRecord(raw.antigravityQuota, filesByName),
+    claudeQuota: scopeDemoQuotaRecord(raw.claudeQuota, filesByName),
+    codexQuota: scopeDemoQuotaRecord(raw.codexQuota, filesByName),
+    devinQuota: scopeDemoQuotaRecord(raw.devinQuota, filesByName),
+    kimiQuota: scopeDemoQuotaRecord(raw.kimiQuota, filesByName),
+    metaQuota: scopeDemoQuotaRecord(raw.metaQuota, filesByName),
+    xaiQuota: scopeDemoQuotaRecord(raw.xaiQuota, filesByName),
+  };
+};
 
 export const getDemoAccountProcessingPolicy = (): AccountProcessingPolicy => ({
   source: 'db',
@@ -4138,7 +7176,11 @@ export const getDemoCodexInspectionLocalRun = (baseNow = now()): CodexInspection
         labelParams: window.labelParams,
         usedPercent: window.usedPercent ?? null,
         resetLabel: window.resetLabel ?? '',
+        resetAtMs: window.resetAtMs ?? null,
+        resetAccuracy: window.resetAccuracy,
         limitWindowSeconds: window.limitWindowSeconds ?? null,
+        modelScope: window.modelScope,
+        providerWindowAliases: window.providerWindowAliases,
       })),
       errorKind: item.errorKind,
       errorDetail: item.errorDetail,
@@ -4383,6 +7425,7 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
   const requestUrl = String(payload.url || '');
   const authIndex = String(payload.authIndex || '');
   const isCodexUpgrade = authIndex === 'codex-upgrade-demo-01';
+  const isCodexTeamZeroBudget = authIndex === 'codex-team-01';
   const isCodexPro20x = authIndex === 'codex-pro-20x-01';
   const isCodexRecovered = authIndex === 'codex-fallback-02';
   const isCodexExpired = authIndex === 'codex-email-user-01';
@@ -4463,8 +7506,45 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
         },
       };
     } else {
-      const primaryUsedPercent = isCodexPro20x ? 84 : isCodexRecovered ? 24 : 63;
-      const secondaryUsedPercent = isCodexPro20x ? 96 : isCodexRecovered ? 18 : 42;
+      const shouldUseMatchedAuthFile = isCodexUpgrade || isCodexPro20x || isCodexRecovered;
+      const matchedAuthFile = shouldUseMatchedAuthFile
+        ? getDemoAuthFiles().files.find(
+            (file) => String(file.authIndex ?? file['auth_index'] ?? '') === authIndex
+          )
+        : undefined;
+      const idToken =
+        matchedAuthFile?.id_token &&
+        typeof matchedAuthFile.id_token === 'object' &&
+        !Array.isArray(matchedAuthFile.id_token)
+          ? (matchedAuthFile.id_token as Record<string, unknown>)
+          : null;
+      const rawPlanType = matchedAuthFile?.plan_type ?? idToken?.plan_type;
+      const matchedPlanType =
+        typeof rawPlanType === 'string' && rawPlanType.trim()
+          ? rawPlanType.trim().toLowerCase()
+          : null;
+      const rawSubscriptionActiveUntil =
+        idToken?.chatgpt_subscription_active_until ?? idToken?.chatgptSubscriptionActiveUntil;
+      const matchedSubscriptionActiveUntil =
+        typeof rawSubscriptionActiveUntil === 'string' ||
+        (typeof rawSubscriptionActiveUntil === 'number' &&
+          Number.isFinite(rawSubscriptionActiveUntil))
+          ? rawSubscriptionActiveUntil
+          : null;
+      const primaryUsedPercent = isCodexPro20x
+        ? 84
+        : isCodexRecovered
+          ? 24
+          : isCodexTeamZeroBudget
+            ? 55
+            : 63;
+      const secondaryUsedPercent = isCodexPro20x
+        ? 96
+        : isCodexRecovered
+          ? 18
+          : isCodexTeamZeroBudget
+            ? 9
+            : 42;
       const accountId = isCodexPro20x
         ? 'acct_codex_pro_20x'
         : isCodexRecovered
@@ -4483,9 +7563,10 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
         user_id: isCodexPro20x ? 'demo-pro-user' : 'demo-user',
         account_id: accountId,
         email,
-        plan_type: isCodexPro20x ? 'pro' : isCodexUpgrade ? 'free' : 'team',
+        plan_type: matchedPlanType ?? (isCodexPro20x ? 'pro' : isCodexUpgrade ? 'free' : 'team'),
         rate_limit: {
           allowed: true,
+          limit_reached: false,
           primary_window: {
             used_percent: primaryUsedPercent,
             limit_window_seconds: 18000,
@@ -4506,19 +7587,42 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
           },
         },
         credits: {
-          has_credits: true,
+          has_credits: isCodexTeamZeroBudget ? false : true,
           unlimited: false,
-          balance: isCodexPro20x ? 42.6 : 18.4,
+          balance: isCodexTeamZeroBudget ? null : isCodexPro20x ? 42.6 : 18.4,
+          overage_limit_reached: false,
         },
+        spend_control: isCodexTeamZeroBudget
+          ? {
+              reached: true,
+              individual_limit: {
+                source: 'workspace_spend_controls',
+                unit: 'credit',
+                limit: '0',
+                used: '0.0',
+                remaining: '0.0',
+                used_percent: 100,
+                remaining_percent: 0,
+                reset_after_seconds: (22 * day) / 1000,
+                reset_at: Math.floor((now() + 22 * day) / 1000),
+              },
+            }
+          : {
+              reached: false,
+              individual_limit: null,
+            },
+        rate_limit_reached_type: null,
         rate_limit_reset_credits: {
-          available_count: isCodexPro20x ? 3 : 2,
+          available_count: isCodexPro20x ? 3 : isCodexRecovered ? 1 : 2,
         },
-        subscription_active_until: new Date(now() + 23 * day).toISOString(),
+        subscription_active_until: matchedAuthFile
+          ? matchedSubscriptionActiveUntil
+          : new Date(now() + 23 * day).toISOString(),
       };
     }
   } else if (requestUrl.includes('/rate-limit-reset-credits')) {
     body = {
-      available_count: isCodexPro20x ? 3 : 2,
+      available_count: isCodexPro20x ? 3 : isCodexRecovered ? 1 : 2,
       credits: isCodexPro20x
         ? [
             {
@@ -4543,22 +7647,32 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
               expires_at: new Date(now() + 18 * day).toISOString(),
             },
           ]
-        : [
-            {
-              id: 'demo-credit-1',
-              reset_type: 'codex_rate_limits',
-              status: 'available',
-              granted_at: new Date(now() - day).toISOString(),
-              expires_at: new Date(now() + 6 * day).toISOString(),
-            },
-            {
-              id: 'demo-credit-2',
-              reset_type: 'codex_rate_limits',
-              status: 'available',
-              granted_at: new Date(now() - 12 * hour).toISOString(),
-              expires_at: new Date(now() + 14 * day).toISOString(),
-            },
-          ],
+        : isCodexRecovered
+          ? [
+              {
+                id: 'demo-fallback-credit-1',
+                reset_type: 'codex_rate_limits',
+                status: 'available',
+                granted_at: new Date(now() - day).toISOString(),
+                expires_at: new Date(now() + 2 * day).toISOString(),
+              },
+            ]
+          : [
+              {
+                id: 'demo-credit-1',
+                reset_type: 'codex_rate_limits',
+                status: 'available',
+                granted_at: new Date(now() - day).toISOString(),
+                expires_at: new Date(now() + 6 * day).toISOString(),
+              },
+              {
+                id: 'demo-credit-2',
+                reset_type: 'codex_rate_limits',
+                status: 'available',
+                granted_at: new Date(now() - 12 * hour).toISOString(),
+                expires_at: new Date(now() + 14 * day).toISOString(),
+              },
+            ],
     };
   } else if (requestUrl.includes('anthropic.com/api/oauth/profile')) {
     body =
@@ -4622,15 +7736,50 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
               },
             ],
           }
-        : {
-            five_hour: fiveHour,
-            seven_day: sevenDay,
-          };
+        : authIndex === 'claude-research-02'
+          ? {
+              five_hour: fiveHour,
+              seven_day: sevenDay,
+              seven_day_sonnet: {
+                utilization: 74,
+                resets_at: new Date(now() + 2 * day + 9 * hour).toISOString(),
+              },
+            }
+          : authIndex === 'claude-extra-usage-03'
+            ? {
+                five_hour: fiveHour,
+                seven_day: sevenDay,
+                extra_usage: {
+                  is_enabled: true,
+                  monthly_limit: 20_000,
+                  used_credits: 4_200,
+                  utilization: 21,
+                },
+              }
+            : {
+                five_hour: fiveHour,
+                seven_day: sevenDay,
+              };
   } else if (requestUrl.includes('api.kimi.com')) {
     body = {
-      items: [
-        { model: 'kimi-k2', used: 62, total: 100, reset_time: new Date(now() + day).toISOString() },
+      usage: {
+        limit: '2048',
+        used: '214',
+        remaining: '1834',
+        resetTime: new Date(now() + 6 * day + 4 * hour).toISOString(),
+      },
+      limits: [
+        {
+          window: { duration: 300, timeUnit: 'TIME_UNIT_MINUTE' },
+          detail: {
+            limit: '200',
+            used: '139',
+            remaining: '61',
+            resetTime: new Date(now() + 3 * hour + 12 * minute).toISOString(),
+          },
+        },
       ],
+      user: { membership: { level: 'LEVEL_MODERATO' } },
     };
   } else if (requestUrl.includes('/responses') && requestUrl.includes('grok.com')) {
     if (isXaiSpendingLimited) {
@@ -4663,6 +7812,22 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
         ],
       };
     }
+  } else if (requestUrl.includes('cli-chat-proxy.grok.com/v1/user?include=subscription')) {
+    if (isXaiExpired) {
+      statusCode = 401;
+      body = { error: 'Expired demo credential' };
+    } else {
+      body = { subscriptionTier: authIndex === 'xai-ops-01' ? 'Free' : 'SuperGrokPro' };
+    }
+  } else if (requestUrl.includes('cli-chat-proxy.grok.com/v1/settings')) {
+    if (isXaiExpired) {
+      statusCode = 401;
+      body = { error: 'Expired demo credential' };
+    } else {
+      body = {
+        subscription_tier_display: authIndex === 'xai-ops-01' ? 'Free' : 'SuperGrok Heavy',
+      };
+    }
   } else if (requestUrl.includes('/billing?format=credits')) {
     body = {
       config: {
@@ -4681,21 +7846,24 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
       },
     };
   } else if (requestUrl.includes('/billing') && requestUrl.includes('grok.com')) {
-    body = {
-      config: {
-        currentPeriod: {
-          type: 'USAGE_PERIOD_TYPE_MONTHLY',
-          start: new Date(now() - 11 * day).toISOString(),
-          end: new Date(now() + 19 * day).toISOString(),
-        },
-        monthlyLimit: { val: 10000 },
-        used: { val: isXaiSpendingLimited ? 10000 : isXaiExpired ? 1200 : 2200 },
-        onDemandCap: { val: 0 },
-        onDemandUsed: { val: 0 },
-        billingPeriodStart: new Date(now() - 11 * day).toISOString(),
-        billingPeriodEnd: new Date(now() + 19 * day).toISOString(),
-      },
-    };
+    const usesLegacyBilling = ['xai-payg-buffer-02', 'xai-payg-cap-03'].includes(authIndex);
+    body = usesLegacyBilling
+      ? {
+          config: {
+            currentPeriod: {
+              type: 'USAGE_PERIOD_TYPE_MONTHLY',
+              start: new Date(now() - 11 * day).toISOString(),
+              end: new Date(now() + 19 * day).toISOString(),
+            },
+            monthlyLimit: { val: 10000 },
+            used: { val: authIndex === 'xai-payg-cap-03' ? 15000 : 12600 },
+            onDemandCap: { val: authIndex === 'xai-payg-cap-03' ? 5000 : 10000 },
+            onDemandUsed: { val: authIndex === 'xai-payg-cap-03' ? 5000 : 2600 },
+            billingPeriodStart: new Date(now() - 11 * day).toISOString(),
+            billingPeriodEnd: new Date(now() + 19 * day).toISOString(),
+          },
+        }
+      : { config: {} };
   } else if (requestUrl.includes('api.x.ai/v1/me')) {
     if (isXaiExpired) {
       statusCode = 401;
@@ -4707,13 +7875,44 @@ export const getDemoApiCallResult = (payload: DemoApiCallPayload = {}) => {
     body = {
       groups: [
         {
-          displayName: 'Gemini 2.5 Flash',
+          displayName: 'Gemini Models',
+          description: 'Models within this group: Gemini Flash, Gemini Pro',
           buckets: [
             {
-              bucketId: 'gemini-2.5-flash',
-              displayName: 'Gemini 2.5 Flash',
+              bucketId: 'gemini-weekly',
+              displayName: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.74,
+              resetTime: new Date(now() + 6 * day).toISOString(),
+              description: 'You have used some of your weekly limit.',
+            },
+            {
+              bucketId: 'gemini-5h',
+              displayName: 'Five Hour Limit',
+              window: '5h',
+              remainingFraction: 0.64,
+              resetTime: new Date(now() + 4 * hour).toISOString(),
+              description: 'You have used some of your 5-hour limit.',
+            },
+          ],
+        },
+        {
+          displayName: 'Claude models',
+          description: 'Models within this group: Claude Opus, Claude Sonnet, GPT-OSS',
+          buckets: [
+            {
+              bucketId: '3p-weekly',
+              displayName: 'Weekly Limit',
+              window: 'weekly',
+              remainingFraction: 0.58,
+              resetTime: new Date(now() + 4 * day).toISOString(),
+            },
+            {
+              bucketId: '3p-5h',
+              displayName: 'Five Hour Limit',
+              window: '5h',
               remainingFraction: 0.72,
-              resetTime: new Date(now() + 5 * hour).toISOString(),
+              resetTime: new Date(now() + 3 * hour + 20 * minute).toISOString(),
             },
           ],
         },

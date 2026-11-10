@@ -6,6 +6,7 @@ import type {
   CodexInspectionResultItem,
   CodexInspectionRunResult,
 } from '@/features/monitoring/codexInspection';
+import { Button } from '@/components/ui/Button';
 import inspectionStyles from '@/features/monitoring/CodexInspectionPage.module.scss';
 import tooltipStyles from './FailureDetailsTooltip.module.scss';
 import { CodexInspectionResultsPanel } from './CodexInspectionResultsPanel';
@@ -124,6 +125,41 @@ describe('CodexInspectionResultsPanel', () => {
     expect(renderer.root.findAllByType('article')).toHaveLength(1);
   });
 
+  it('opens the credential represented by a result card', () => {
+    const item = createItem({ authIndex: 'auth-1' });
+    const onOpenCredential = vi.fn();
+    const renderer = renderPanel(item, { onOpenCredential });
+    const openButton = renderer.root
+      .findAllByType(Button)
+      .find((node) => node.props.children === 'monitoring.codex_inspection_view_credential');
+
+    expect(openButton).toBeDefined();
+
+    act(() => {
+      openButton?.props.onClick();
+    });
+
+    expect(onOpenCredential).toHaveBeenCalledWith(item);
+  });
+
+  it('keeps credential navigation next to a custom server operation', () => {
+    const renderer = renderPanel(
+      createItem({ action: 'delete', actionReason: 'invalid account' }),
+      {
+        pendingActionCount: 1,
+        onOpenCredential: vi.fn(),
+        renderOperation: () => <button data-testid="custom-operation">execute</button>,
+      }
+    );
+
+    expect(renderer.root.findByProps({ 'data-testid': 'custom-operation' })).toBeDefined();
+    expect(
+      renderer.root
+        .findAllByType(Button)
+        .some((node) => node.props.children === 'monitoring.codex_inspection_view_credential')
+    ).toBe(true);
+  });
+
   it('renders the xAI probe HTTP status when billing health returns one', () => {
     const renderer = renderPanel(
       createItem({
@@ -157,7 +193,9 @@ describe('CodexInspectionResultsPanel', () => {
   });
 
   it('keeps all action filters visible and renders the plan without a label prefix', () => {
-    const renderer = renderPanel(createItem({ planType: 'free' }));
+    const renderer = renderPanel(
+      createItem({ planType: 'self_serve_business_prolite', provider: 'codex' })
+    );
     const text = collectText(renderer);
 
     expect(text).toEqual(
@@ -170,7 +208,8 @@ describe('CodexInspectionResultsPanel', () => {
     ).toHaveLength(1);
     expect(text).not.toContain('monitoring.codex_inspection_action_filter_label');
     expect(text).not.toEqual(expect.arrayContaining(['pending', 'no_action']));
-    expect(text).toContain('codex_quota.plan_free');
+    expect(text).toContain('Business 5x');
+    expect(text).not.toContain('self_serve_business_prolite');
     expect(text).not.toContain('codex_quota.plan_label');
   });
 

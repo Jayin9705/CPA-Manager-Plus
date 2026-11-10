@@ -13,7 +13,11 @@ work is integrated through `dev` before it is promoted to `main`.
 5. A maintainer promotes the tested repository `dev` branch to `main`.
 
 Do not open a feature or fix pull request directly to `main`. `main` accepts
-only a pull request from this repository's `dev` branch.
+only a pull request from this repository's `dev` branch. If a community or
+maintenance pull request targets another branch, repository automation changes
+its base to `dev`. Changing the base can alter the displayed diff and make
+existing review comments outdated, so select `dev` when opening the pull
+request instead of relying on the correction.
 
 ```bash
 git remote add upstream https://github.com/seakee/CPA-Manager-Plus.git
@@ -37,6 +41,9 @@ git rebase upstream/dev
   runtime files, or local configuration.
 
 ## Local Verification
+
+Frontend work follows the [Data Loading & Refresh Interaction](docs/development/data-loading-and-refresh.md)
+contract. It is the default for v2 and later development, and for v1 refresh fixes.
 
 Use the narrowest checks that cover your change, then run broader checks when
 the change crosses frontend, Manager Server, packaging, or runtime boundaries.

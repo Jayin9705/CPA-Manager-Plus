@@ -5,18 +5,25 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageaggregate"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 )
 
-const UsageCacheAccountingMigrationName = "usage_cache_accounting_v2"
+const (
+	UsageCacheAccountingMigrationName            = "usage_cache_accounting_v2"
+	UsageCacheAccountingSemanticsRevisionKey     = "usage_cache_accounting_semantics_revision"
+	CurrentUsageCacheAccountingSemanticsRevision = 3
+)
 
 const usageCacheAccountingCandidatePredicate = `(coalesce(cached_tokens, 0) != 0
 	or coalesce(cache_tokens, 0) != 0
 	or coalesce(cache_read_tokens, 0) != 0
 	or coalesce(cache_creation_tokens, 0) != 0
-	or lower(trim(coalesce(cache_input_mode, ''))) not in ('included_in_input', 'separate_from_input')
+	or lower(trim(coalesce(cache_input_mode, ''))) not in ('included_in_input', 'separate_from_input', 'read_included_creation_separate')
 	or normalized_uncached_input_tokens is null
 	or normalized_total_input_tokens is null
 	or normalized_cache_read_tokens is null
@@ -26,6 +33,8 @@ const (
 	StatusDiscovering = "discovering"
 	StatusPending     = "pending"
 	StatusRunning     = "running"
+	StatusApplying    = "applying"
+	StatusClearing    = "clearing"
 	StatusCompleted   = "completed"
 	StatusFailed      = "failed"
 )
@@ -37,6 +46,7 @@ type State struct {
 	TargetEventID int64  `json:"targetEventId"`
 	ProcessedRows int64  `json:"processedRows"`
 	ChangedRows   int64  `json:"changedRows"`
+	AppliedRows   int64  `json:"appliedRows"`
 	StartedAtMS   int64  `json:"startedAtMs,omitempty"`
 	UpdatedAtMS   int64  `json:"updatedAtMs"`
 	FinishedAtMS  int64  `json:"finishedAtMs,omitempty"`
@@ -90,7 +100,7 @@ func New(db *sql.DB) Repository {
 
 func (r *repository) UsageCacheAccountingState(ctx context.Context) (State, bool, error) {
 	state, err := readState(r.db.QueryRowContext(ctx, `select
-		name, status, last_event_id, target_event_id, processed_rows, changed_rows,
+		name, status, last_event_id, target_event_id, processed_rows, changed_rows, applied_rows,
 		started_at_ms, updated_at_ms, finished_at_ms, last_error
 	from usage_data_migrations
 	where name = ?`, UsageCacheAccountingMigrationName))
@@ -114,11 +124,21 @@ func (r *repository) DiscoverUsageCacheAccounting(ctx context.Context) (State, e
 	if err != nil {
 		return State{}, err
 	}
+	semanticsChanged, err := reconcileSemanticsRevisionInTx(ctx, tx, &state)
+	if err != nil {
+		return State{}, err
+	}
 	if state.Status == StatusFailed {
 		nowMS := time.Now().UnixMilli()
 		resumeStatus := StatusPending
 		if state.TargetEventID == 0 && state.LastEventID == 0 && state.ProcessedRows == 0 && state.ChangedRows == 0 {
 			resumeStatus = StatusDiscovering
+		} else if state.AppliedRows < state.ChangedRows {
+			resumeStatus = StatusApplying
+		} else if state.LastEventID < state.TargetEventID {
+			resumeStatus = StatusRunning
+		} else if state.ChangedRows > 0 {
+			resumeStatus = StatusClearing
 		}
 		if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
 			status = ?, updated_at_ms = ?, last_error = null
@@ -128,14 +148,29 @@ func (r *repository) DiscoverUsageCacheAccounting(ctx context.Context) (State, e
 		state.Status = resumeStatus
 		state.UpdatedAtMS = nowMS
 		state.LastError = ""
-		if resumeStatus == StatusPending {
+		if resumeStatus != StatusDiscovering {
 			if err := tx.Commit(); err != nil {
 				return State{}, err
 			}
 			return state, nil
 		}
 	}
-	if state.Status == StatusCompleted || state.Status == StatusPending || state.Status == StatusRunning {
+	if state.Status == StatusCompleted {
+		if _, err := tx.ExecContext(ctx, `delete from usage_rollup_rebuild_state where target_event_id <= 0`); err != nil {
+			return State{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return State{}, err
+		}
+		return state, nil
+	}
+	if state.Status == StatusPending || state.Status == StatusRunning ||
+		state.Status == StatusApplying || state.Status == StatusClearing {
+		if semanticsChanged {
+			if err := tx.Commit(); err != nil {
+				return State{}, err
+			}
+		}
 		return state, nil
 	}
 	if state.Status != StatusDiscovering {
@@ -153,8 +188,11 @@ func (r *repository) DiscoverUsageCacheAccounting(ctx context.Context) (State, e
 	}
 	nowMS := time.Now().UnixMilli()
 	if targetEventID == 0 {
+		if _, err := tx.ExecContext(ctx, `delete from usage_rollup_rebuild_state where target_event_id <= 0`); err != nil {
+			return State{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
-			status = ?, last_event_id = 0, target_event_id = 0, processed_rows = 0, changed_rows = 0,
+			status = ?, last_event_id = 0, target_event_id = 0, processed_rows = 0, changed_rows = 0, applied_rows = 0,
 			started_at_ms = null, updated_at_ms = ?, finished_at_ms = ?, last_error = null
 		where name = ?`, StatusCompleted, nowMS, nowMS, UsageCacheAccountingMigrationName); err != nil {
 			return State{}, err
@@ -166,7 +204,7 @@ func (r *repository) DiscoverUsageCacheAccounting(ctx context.Context) (State, e
 	}
 
 	if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
-		status = ?, last_event_id = 0, target_event_id = ?, processed_rows = 0, changed_rows = 0,
+		status = ?, last_event_id = 0, target_event_id = ?, processed_rows = 0, changed_rows = 0, applied_rows = 0,
 		started_at_ms = ?, updated_at_ms = ?, finished_at_ms = null, last_error = null
 	where name = ?`, StatusPending, targetEventID, nowMS, nowMS, UsageCacheAccountingMigrationName); err != nil {
 		return State{}, err
@@ -204,20 +242,38 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 		return BatchResult{}, errors.New("usage cache accounting migration has not been discovered")
 	case StatusFailed:
 		return BatchResult{}, errors.New("usage cache accounting migration failure must be resumed before running a batch")
-	case StatusPending, StatusRunning:
-		// Continue below.
-	default:
-		return BatchResult{}, fmt.Errorf("invalid usage cache accounting migration status %q", state.Status)
-	}
-	if state.TargetEventID <= state.LastEventID {
-		completed, err := completeInTx(ctx, tx, state)
+	case StatusApplying:
+		result, err := applyChangesBatchInTx(ctx, tx, state, batchSize)
 		if err != nil {
 			return BatchResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return BatchResult{}, err
 		}
-		return BatchResult{State: completed, Completed: true}, nil
+		return result, nil
+	case StatusClearing:
+		result, err := clearDerivedBatchInTx(ctx, tx, state, batchSize)
+		if err != nil {
+			return BatchResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return BatchResult{}, err
+		}
+		return result, nil
+	case StatusPending, StatusRunning:
+		// Continue below.
+	default:
+		return BatchResult{}, fmt.Errorf("invalid usage cache accounting migration status %q", state.Status)
+	}
+	if state.TargetEventID <= state.LastEventID {
+		result, err := finishScanInTx(ctx, tx, state)
+		if err != nil {
+			return BatchResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return BatchResult{}, err
+		}
+		return result, nil
 	}
 
 	rows, err := readCacheAccountingBatch(ctx, tx, state.LastEventID, state.TargetEventID, batchSize)
@@ -225,14 +281,15 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 		return BatchResult{}, err
 	}
 	if len(rows) == 0 {
-		completed, err := completeInTx(ctx, tx, state)
+		state.LastEventID = state.TargetEventID
+		result, err := finishScanInTx(ctx, tx, state)
 		if err != nil {
 			return BatchResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return BatchResult{}, err
 		}
-		return BatchResult{State: completed, Completed: true}, nil
+		return result, nil
 	}
 
 	changedRows := int64(0)
@@ -255,14 +312,15 @@ func (r *repository) RunUsageCacheAccountingBatch(ctx context.Context, batchSize
 	state.UpdatedAtMS = nowMS
 	state.LastError = ""
 	if state.LastEventID >= state.TargetEventID {
-		completed, err := completeInTx(ctx, tx, state)
+		result, err := finishScanInTx(ctx, tx, state)
 		if err != nil {
 			return BatchResult{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return BatchResult{}, err
 		}
-		return BatchResult{State: completed, Processed: processed, Completed: true}, nil
+		result.Processed = processed
+		return result, nil
 	}
 	if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
 		status = ?, last_event_id = ?, processed_rows = ?, changed_rows = ?, updated_at_ms = ?, last_error = null
@@ -282,7 +340,7 @@ func (r *repository) RecordUsageCacheAccountingFailure(ctx context.Context, migr
 	}
 	_, err := r.db.ExecContext(ctx, `update usage_data_migrations set
 		status = ?, updated_at_ms = ?, last_error = ?
-	where name = ? and status in (?, ?, ?, ?)`,
+	where name = ? and status in (?, ?, ?, ?, ?, ?)`,
 		StatusFailed,
 		time.Now().UnixMilli(),
 		message,
@@ -290,6 +348,8 @@ func (r *repository) RecordUsageCacheAccountingFailure(ctx context.Context, migr
 		StatusDiscovering,
 		StatusPending,
 		StatusRunning,
+		StatusApplying,
+		StatusClearing,
 		StatusFailed,
 	)
 	return err
@@ -364,9 +424,13 @@ func stageCacheAccountingRow(ctx context.Context, tx *sql.Tx, row cacheAccountin
 		RequestedModel:   row.RequestedModel,
 		DisplayModel:     row.DisplayModel,
 	}
-	accounting := usage.NormalizeCacheAccounting(
+	accounting := usage.NormalizeCacheAccountingWithRawJSON(
 		context,
+		row.RawJSON,
 		row.InputTokens,
+		row.OutputTokens,
+		row.ReasoningTokens,
+		row.TotalTokens,
 		row.CachedTokens,
 		row.CacheTokens,
 		row.CacheReadTokens,
@@ -437,8 +501,8 @@ func equalNullableInt(value sql.NullInt64, want int64) bool {
 
 func stateInTx(ctx context.Context, tx *sql.Tx) (State, error) {
 	return readState(tx.QueryRowContext(ctx, `select
-		name, status, last_event_id, target_event_id, processed_rows, changed_rows,
-		started_at_ms, updated_at_ms, finished_at_ms, last_error
+			name, status, last_event_id, target_event_id, processed_rows, changed_rows, applied_rows,
+			started_at_ms, updated_at_ms, finished_at_ms, last_error
 	from usage_data_migrations
 	where name = ?`, UsageCacheAccountingMigrationName))
 }
@@ -458,6 +522,7 @@ func readState(row rowScanner) (State, error) {
 		&state.TargetEventID,
 		&state.ProcessedRows,
 		&state.ChangedRows,
+		&state.AppliedRows,
 		&startedAtMS,
 		&state.UpdatedAtMS,
 		&finishedAtMS,
@@ -471,69 +536,316 @@ func readState(row rowScanner) (State, error) {
 	return state, nil
 }
 
-func completeInTx(ctx context.Context, tx *sql.Tx, state State) (State, error) {
-	if state.ChangedRows > 0 {
-		for _, statement := range []string{
-			`update usage_events set
-				cache_input_mode = (select cache_input_mode from usage_cache_accounting_v2_changes where event_id = usage_events.id),
-				normalized_uncached_input_tokens = (select normalized_uncached_input_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
-				normalized_total_input_tokens = (select normalized_total_input_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
-				normalized_cache_read_tokens = (select normalized_cache_read_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
-				normalized_cache_creation_tokens = (select normalized_cache_creation_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
-				total_tokens = (select total_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id)
-			where id in (select event_id from usage_cache_accounting_v2_changes)`,
-			`delete from usage_account_model_rollups`,
-			`delete from usage_dashboard_hourly_rollups`,
-			`update usage_rollup_checkpoints set last_event_id = 0, updated_at_ms = 0, last_error = null
-					where name in ('account_history', 'dashboard_hourly')`,
-			`delete from usage_hourly_aggregate_v1`,
-			`update usage_event_identity_ledger set aggregate_schema_version = 0
-					where aggregate_schema_version = 1`,
-			`update usage_hourly_aggregate_state set
-					status = case when exists (select 1 from usage_events limit 1) then 'pending' else 'ready' end,
-					backfill_last_event_id = 0,
-					coverage_event_id = 0,
-					target_event_id = coalesce((select max(id) from usage_events), 0),
-					processed_events = 0,
-					min_bucket_ms = null,
-					max_bucket_ms = null,
-					last_run_started_at_ms = null,
-					updated_at_ms = 0,
-					finished_at_ms = null,
-					last_error = null
-				where aggregate_name = 'hourly_core' and schema_version = 1`,
-			`delete from usage_pricing_hourly_rollups_v1`,
-			`delete from usage_pricing_account_rollups_v1`,
-			`update usage_pricing_rollup_state set
-					status = case when exists (select 1 from usage_events limit 1) then 'pending' else 'ready' end,
-					backfill_last_event_id = 0,
-					coverage_event_id = 0,
-					target_event_id = coalesce((select max(id) from usage_events), 0),
-					processed_events = 0,
-					min_bucket_ms = null,
-					max_bucket_ms = null,
-					last_run_started_at_ms = null,
-					updated_at_ms = 0,
-					finished_at_ms = null,
-					last_error = null
-				where rollup_name = 'pricing_v1' and schema_version = 1`,
-		} {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return State{}, err
-			}
+func finishScanInTx(ctx context.Context, tx *sql.Tx, state State) (BatchResult, error) {
+	state.LastEventID = state.TargetEventID
+	if state.ChangedRows == 0 {
+		completed, err := completeWithoutChangesInTx(ctx, tx, state)
+		if err != nil {
+			return BatchResult{}, err
 		}
+		return BatchResult{State: completed, Completed: true}, nil
+	}
+
+	nowMS := time.Now().UnixMilli()
+	state.Status = StatusApplying
+	state.UpdatedAtMS = nowMS
+	state.LastError = ""
+	if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
+		status = ?, last_event_id = ?, processed_rows = ?, changed_rows = ?,
+		applied_rows = ?, updated_at_ms = ?, finished_at_ms = null, last_error = null
+	where name = ?`,
+		state.Status,
+		state.LastEventID,
+		state.ProcessedRows,
+		state.ChangedRows,
+		state.AppliedRows,
+		nowMS,
+		UsageCacheAccountingMigrationName,
+	); err != nil {
+		return BatchResult{}, err
+	}
+	return BatchResult{State: state}, nil
+}
+
+func applyChangesBatchInTx(ctx context.Context, tx *sql.Tx, state State, batchSize int) (BatchResult, error) {
+	if state.ChangedRows <= 0 {
+		return BatchResult{}, errors.New("usage cache accounting apply phase has no changed rows")
+	}
+	var applyRows, throughEventID int64
+	if err := tx.QueryRowContext(ctx, `select count(*), coalesce(max(event_id), 0)
+		from (
+			select event_id from usage_cache_accounting_v2_changes
+			order by event_id limit ?
+		)`, batchSize).Scan(&applyRows, &throughEventID); err != nil {
+		return BatchResult{}, err
+	}
+	if applyRows == 0 {
+		if state.AppliedRows != state.ChangedRows {
+			return BatchResult{}, fmt.Errorf(
+				"usage cache accounting staged changes missing: applied=%d changed=%d",
+				state.AppliedRows,
+				state.ChangedRows,
+			)
+		}
+		nowMS := time.Now().UnixMilli()
+		state.Status = StatusClearing
+		if state.LastEventID < state.TargetEventID {
+			state.Status = StatusRunning
+		}
+		state.UpdatedAtMS = nowMS
+		if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
+			status = ?, updated_at_ms = ?, last_error = null where name = ?`,
+			state.Status, nowMS, UsageCacheAccountingMigrationName); err != nil {
+			return BatchResult{}, err
+		}
+		return BatchResult{State: state}, nil
+	}
+	if state.AppliedRows == 0 {
+		if err := invalidateDerivedDataInTx(ctx, tx, state); err != nil {
+			return BatchResult{}, err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `update usage_events set
+		cache_input_mode = (select cache_input_mode from usage_cache_accounting_v2_changes where event_id = usage_events.id),
+		normalized_uncached_input_tokens = (select normalized_uncached_input_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
+		normalized_total_input_tokens = (select normalized_total_input_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
+		normalized_cache_read_tokens = (select normalized_cache_read_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
+		normalized_cache_creation_tokens = (select normalized_cache_creation_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id),
+		total_tokens = (select total_tokens from usage_cache_accounting_v2_changes where event_id = usage_events.id)
+	where id in (
+		select event_id from usage_cache_accounting_v2_changes where event_id <= ?
+	)`, throughEventID); err != nil {
+		return BatchResult{}, err
+	}
+	nowMS := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx, `update usage_monitoring_event_projection_v1 set
+		normalized_total_input_tokens = coalesce(
+			(select normalized_total_input_tokens from usage_events
+				where id = usage_monitoring_event_projection_v1.event_id),
+			(select input_tokens from usage_events
+				where id = usage_monitoring_event_projection_v1.event_id),
+			0
+		),
+		total_tokens = coalesce(
+			(select total_tokens from usage_events
+				where id = usage_monitoring_event_projection_v1.event_id),
+			0
+		),
+		updated_at_ms = ?
+	where event_id in (
+		select event_id from usage_cache_accounting_v2_changes where event_id <= ?
+	)`, nowMS, throughEventID); err != nil {
+		return BatchResult{}, err
+	}
+	deleted, err := tx.ExecContext(ctx, `delete from usage_cache_accounting_v2_changes where event_id <= ?`, throughEventID)
+	if err != nil {
+		return BatchResult{}, err
+	}
+	deletedRows, err := deleted.RowsAffected()
+	if err != nil {
+		return BatchResult{}, err
+	}
+	if deletedRows != applyRows {
+		return BatchResult{}, fmt.Errorf("usage cache accounting applied %d rows but removed %d staged rows", applyRows, deletedRows)
+	}
+
+	state.AppliedRows += applyRows
+	if state.AppliedRows > state.ChangedRows {
+		return BatchResult{}, fmt.Errorf(
+			"usage cache accounting applied rows exceed changed rows: applied=%d changed=%d",
+			state.AppliedRows,
+			state.ChangedRows,
+		)
+	}
+	state.Status = StatusApplying
+	if state.AppliedRows == state.ChangedRows {
+		if state.LastEventID >= state.TargetEventID {
+			state.Status = StatusClearing
+		} else {
+			state.Status = StatusRunning
+		}
+	}
+	state.UpdatedAtMS = nowMS
+	state.LastError = ""
+	if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
+		status = ?, applied_rows = ?, updated_at_ms = ?, last_error = null
+	where name = ?`, state.Status, state.AppliedRows, nowMS, UsageCacheAccountingMigrationName); err != nil {
+		return BatchResult{}, err
+	}
+	return BatchResult{State: state, Processed: applyRows}, nil
+}
+
+func invalidateDerivedDataInTx(ctx context.Context, tx *sql.Tx, state State) error {
+	var latestEventID int64
+	if err := tx.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&latestEventID); err != nil {
+		return err
+	}
+	var aggregateRevision string
+	if err := tx.QueryRowContext(ctx, `select structure_revision
+		from usage_hourly_aggregate_state
+		where aggregate_name = ? and schema_version = ?`,
+		usageaggregate.AggregateName,
+		usageaggregate.SchemaVersion,
+	).Scan(&aggregateRevision); err != nil {
+		return err
+	}
+	marker := fmt.Sprintf(":cache-accounting-v2-%d-%d", state.StartedAtMS, state.TargetEventID)
+	if !strings.HasSuffix(aggregateRevision, marker) {
+		aggregateRevision += marker
+	}
+	if _, err := tx.ExecContext(ctx, `update usage_hourly_aggregate_state set
+		structure_revision = ?, status = 'clearing',
+		backfill_last_event_id = 0, coverage_event_id = 0, target_event_id = ?,
+		processed_events = 0, min_bucket_ms = null, max_bucket_ms = null,
+		last_run_started_at_ms = null, updated_at_ms = 0,
+		finished_at_ms = null, last_error = null
+	where aggregate_name = ? and schema_version = ?`,
+		aggregateRevision,
+		latestEventID,
+		usageaggregate.AggregateName,
+		usageaggregate.SchemaVersion,
+	); err != nil {
+		return err
+	}
+	status := derivedRebuildStatus(latestEventID)
+	if _, err := tx.ExecContext(ctx, `update usage_pricing_rollup_state set
+		structure_revision = '', status = ?,
+		backfill_last_event_id = 0, coverage_event_id = 0, target_event_id = ?,
+		processed_events = 0, min_bucket_ms = null, max_bucket_ms = null,
+		last_run_started_at_ms = null, updated_at_ms = 0,
+		finished_at_ms = null, last_error = null
+	where rollup_name = 'pricing_v1' and schema_version = 1`, status, latestEventID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `update usage_monitoring_rollup_state set
+		structure_revision = '', status = ?,
+		backfill_last_event_id = 0, coverage_event_id = 0, target_event_id = ?,
+		processed_events = 0, last_run_started_at_ms = null, updated_at_ms = 0,
+		finished_at_ms = null, last_error = null
+	where rollup_name = 'stats_v1' and schema_version = 1`, status, latestEventID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func clearDerivedBatchInTx(ctx context.Context, tx *sql.Tx, state State, batchSize int) (BatchResult, error) {
+	remaining := batchSize
+	clearedRows := int64(0)
+	for _, tableName := range []string{
+		"usage_account_model_rollups",
+		"usage_dashboard_hourly_rollups",
+		"usage_hourly_aggregate_v1",
+	} {
+		if remaining > 0 {
+			deleted, err := deleteDerivedRowsBatch(ctx, tx, tableName, remaining)
+			if err != nil {
+				return BatchResult{}, err
+			}
+			remaining -= int(deleted)
+			clearedRows += deleted
+		}
+		var pending int
+		if err := tx.QueryRowContext(ctx, `select exists(select 1 from `+tableName+` limit 1)`).Scan(&pending); err != nil {
+			return BatchResult{}, err
+		}
+		if pending != 0 {
+			nowMS := time.Now().UnixMilli()
+			state.Status = StatusClearing
+			state.UpdatedAtMS = nowMS
+			if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
+				status = ?, updated_at_ms = ?, last_error = null where name = ?`,
+				state.Status, nowMS, UsageCacheAccountingMigrationName); err != nil {
+				return BatchResult{}, err
+			}
+			return BatchResult{State: state, Processed: clearedRows}, nil
+		}
+	}
+	completed, err := finishClearingInTx(ctx, tx, state)
+	if err != nil {
+		return BatchResult{}, err
+	}
+	return BatchResult{State: completed, Processed: clearedRows, Completed: true}, nil
+}
+
+func deleteDerivedRowsBatch(ctx context.Context, tx *sql.Tx, tableName string, limit int) (int64, error) {
+	result, err := tx.ExecContext(ctx, `delete from `+tableName+` where rowid in (
+		select rowid from `+tableName+` limit ?
+	)`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("clear derived rows from %s: %w", tableName, err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count cleared derived rows from %s: %w", tableName, err)
+	}
+	return deleted, nil
+}
+
+func finishClearingInTx(ctx context.Context, tx *sql.Tx, state State) (State, error) {
+	var latestEventID int64
+	if err := tx.QueryRowContext(ctx, `select coalesce(max(id), 0) from usage_events`).Scan(&latestEventID); err != nil {
+		return State{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from usage_rollup_rebuild_state
+		where name in ('account_history', 'dashboard_hourly')`); err != nil {
+		return State{}, err
+	}
+	if latestEventID > 0 {
+		if _, err := tx.ExecContext(ctx, `insert into usage_rollup_rebuild_state (name, target_event_id, updated_at_ms)
+			values ('account_history', ?, 0), ('dashboard_hourly', ?, 0)
+			on conflict(name) do update set
+			target_event_id = excluded.target_event_id,
+			updated_at_ms = excluded.updated_at_ms`, latestEventID, latestEventID); err != nil {
+			return State{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `update usage_rollup_checkpoints set
+		last_event_id = 0, updated_at_ms = 0, last_error = null
+	where name in ('account_history', 'dashboard_hourly')`); err != nil {
+		return State{}, err
+	}
+	status := derivedRebuildStatus(latestEventID)
+	if _, err := tx.ExecContext(ctx, `update usage_hourly_aggregate_state set
+		status = ?, backfill_last_event_id = 0, coverage_event_id = 0,
+		target_event_id = ?, processed_events = 0,
+		min_bucket_ms = null, max_bucket_ms = null,
+		last_run_started_at_ms = null, updated_at_ms = 0,
+		finished_at_ms = null, last_error = null
+	where aggregate_name = ? and schema_version = ?`,
+		status, latestEventID, usageaggregate.AggregateName, usageaggregate.SchemaVersion); err != nil {
+		return State{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `update usage_pricing_rollup_state set
+		status = ?, backfill_last_event_id = 0, coverage_event_id = 0,
+		target_event_id = ?, processed_events = 0,
+		min_bucket_ms = null, max_bucket_ms = null,
+		last_run_started_at_ms = null, updated_at_ms = 0,
+		finished_at_ms = null, last_error = null
+	where rollup_name = 'pricing_v1' and schema_version = 1`, status, latestEventID); err != nil {
+		return State{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `update usage_monitoring_rollup_state set
+		status = ?, backfill_last_event_id = 0, coverage_event_id = 0,
+		target_event_id = ?, processed_events = 0,
+		last_run_started_at_ms = null, updated_at_ms = 0,
+		finished_at_ms = null, last_error = null
+	where rollup_name = 'stats_v1' and schema_version = 1`, status, latestEventID); err != nil {
+		return State{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `delete from usage_cache_accounting_v2_changes`); err != nil {
 		return State{}, err
 	}
+
 	nowMS := time.Now().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
-		status = ?, last_event_id = ?, processed_rows = ?, changed_rows = ?,
+		status = ?, last_event_id = ?, processed_rows = ?, changed_rows = ?, applied_rows = ?,
 		updated_at_ms = ?, finished_at_ms = ?, last_error = null
 	where name = ?`,
 		StatusCompleted,
 		state.TargetEventID,
 		state.ProcessedRows,
+		state.ChangedRows,
 		state.ChangedRows,
 		nowMS,
 		nowMS,
@@ -543,8 +855,186 @@ func completeInTx(ctx context.Context, tx *sql.Tx, state State) (State, error) {
 	}
 	state.Status = StatusCompleted
 	state.LastEventID = state.TargetEventID
+	state.AppliedRows = state.ChangedRows
 	state.UpdatedAtMS = nowMS
 	state.FinishedAtMS = nowMS
 	state.LastError = ""
 	return state, nil
+}
+
+func completeWithoutChangesInTx(ctx context.Context, tx *sql.Tx, state State) (State, error) {
+	if _, err := tx.ExecContext(ctx, `delete from usage_cache_accounting_v2_changes`); err != nil {
+		return State{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from usage_rollup_rebuild_state where target_event_id <= 0`); err != nil {
+		return State{}, err
+	}
+	nowMS := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
+		status = ?, last_event_id = ?, processed_rows = ?, changed_rows = 0, applied_rows = 0,
+		updated_at_ms = ?, finished_at_ms = ?, last_error = null
+	where name = ?`,
+		StatusCompleted,
+		state.TargetEventID,
+		state.ProcessedRows,
+		nowMS,
+		nowMS,
+		UsageCacheAccountingMigrationName,
+	); err != nil {
+		return State{}, err
+	}
+	state.Status = StatusCompleted
+	state.LastEventID = state.TargetEventID
+	state.ChangedRows = 0
+	state.AppliedRows = 0
+	state.UpdatedAtMS = nowMS
+	state.FinishedAtMS = nowMS
+	state.LastError = ""
+	return state, nil
+}
+
+func derivedRebuildStatus(latestEventID int64) string {
+	if latestEventID == 0 {
+		return "ready"
+	}
+	return "pending"
+}
+
+func reconcileSemanticsRevisionInTx(ctx context.Context, tx *sql.Tx, state *State) (bool, error) {
+	var revisionStr string
+	var currentRevision int
+	err := tx.QueryRowContext(ctx, `select value from settings where key = ?`, UsageCacheAccountingSemanticsRevisionKey).Scan(&revisionStr)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if err == nil {
+		currentRevision, _ = strconv.Atoi(strings.TrimSpace(revisionStr))
+	}
+	if currentRevision >= CurrentUsageCacheAccountingSemanticsRevision {
+		return false, nil
+	}
+
+	needsRediscovery, err := usageCacheAccountingSemanticsNeedRediscoveryInTx(ctx, tx, currentRevision)
+	if err != nil {
+		return false, err
+	}
+
+	nowMS := time.Now().UnixMilli()
+	if !needsRediscovery {
+		if err := writeUsageCacheAccountingSemanticsRevisionInTx(ctx, tx, nowMS); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	if state.Status == StatusCompleted || (state.AppliedRows == 0 && state.Status != StatusClearing) {
+		if _, err := tx.ExecContext(ctx, `delete from usage_cache_accounting_v2_changes`); err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `update usage_data_migrations set
+			status = ?, last_event_id = 0, target_event_id = 0, processed_rows = 0, changed_rows = 0, applied_rows = 0,
+			started_at_ms = null, updated_at_ms = ?, finished_at_ms = null, last_error = null
+		where name = ?`, StatusDiscovering, nowMS, UsageCacheAccountingMigrationName); err != nil {
+			return false, err
+		}
+		if err := writeUsageCacheAccountingSemanticsRevisionInTx(ctx, tx, nowMS); err != nil {
+			return false, err
+		}
+		state.Status = StatusDiscovering
+		state.LastEventID = 0
+		state.TargetEventID = 0
+		state.ProcessedRows = 0
+		state.ChangedRows = 0
+		state.AppliedRows = 0
+		state.StartedAtMS = 0
+		state.FinishedAtMS = 0
+		state.LastError = ""
+		state.UpdatedAtMS = nowMS
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func usageCacheAccountingSemanticsNeedRediscoveryInTx(ctx context.Context, tx *sql.Tx, currentRevision int) (bool, error) {
+	if currentRevision < 2 {
+		var hasAffectedDevinRow bool
+		query := `select exists(
+			select 1 from usage_events
+			where (
+				coalesce(cached_tokens, 0) != 0
+				or coalesce(cache_tokens, 0) != 0
+				or coalesce(cache_read_tokens, 0) != 0
+				or coalesce(cache_creation_tokens, 0) != 0
+			) and (
+				lower(trim(coalesce(executor_type, ''))) = 'devinexecutor'
+				or lower(trim(coalesce(provider, ''))) = 'devin'
+				or lower(trim(coalesce(provider, ''))) like 'devin/%'
+				or lower(trim(coalesce(auth_provider_snapshot, ''))) = 'devin'
+				or lower(trim(coalesce(auth_provider_snapshot, ''))) like 'devin/%'
+				or lower(trim(coalesce(resolved_model, ''))) = 'devin'
+				or lower(trim(coalesce(resolved_model, ''))) like 'devin/%'
+				or lower(trim(coalesce(requested_model, ''))) = 'devin'
+				or lower(trim(coalesce(requested_model, ''))) like 'devin/%'
+				or lower(trim(coalesce(model, ''))) = 'devin'
+				or lower(trim(coalesce(model, ''))) like 'devin/%'
+			)
+			limit 1
+		)`
+		if err := tx.QueryRowContext(ctx, query).Scan(&hasAffectedDevinRow); err != nil {
+			return false, err
+		}
+		if hasAffectedDevinRow {
+			return true, nil
+		}
+	}
+
+	if currentRevision < 3 {
+		var hasCanonicalV2Candidate bool
+		query := `select exists(
+			select 1 from usage_events
+			where (
+				coalesce(cached_tokens, 0) != 0
+				or coalesce(cache_tokens, 0) != 0
+				or coalesce(cache_read_tokens, 0) != 0
+				or coalesce(cache_creation_tokens, 0) != 0
+			)
+			and lower(trim(coalesce(cache_input_mode, ''))) not in (
+				'included_in_input',
+				'read_included_creation_separate'
+			)
+			and json_valid(raw_json)
+			and json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.accounting_version') = 2
+			and json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.schema_version') = 2
+			and json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.quality') = 'complete'
+			and (
+				json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.input.total_tokens') = input_tokens
+				or (
+					json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.input.cache_read_tokens') > 0
+					and json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.input.cache_write_tokens') > 0
+					and json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.input.uncached_tokens')
+						+ json_extract(case when json_valid(raw_json) then raw_json else '{}' end, '$.token_breakdown.input.cache_read_tokens') = input_tokens
+				)
+			)
+			limit 1
+		)`
+		if err := tx.QueryRowContext(ctx, query).Scan(&hasCanonicalV2Candidate); err != nil {
+			return false, err
+		}
+		if hasCanonicalV2Candidate {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func writeUsageCacheAccountingSemanticsRevisionInTx(ctx context.Context, tx *sql.Tx, nowMS int64) error {
+	_, err := tx.ExecContext(ctx, `insert into settings(key, value, updated_at_ms) values (?, ?, ?)
+		on conflict(key) do update set value = excluded.value, updated_at_ms = excluded.updated_at_ms`,
+		UsageCacheAccountingSemanticsRevisionKey,
+		strconv.Itoa(CurrentUsageCacheAccountingSemanticsRevision),
+		nowMS,
+	)
+	return err
 }

@@ -7,15 +7,22 @@ commit="${COMMIT:-$(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || 
 build_date="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 out_dir="${OUT_DIR:-"${repo_root}/dist/native"}"
 web_html="${WEB_HTML:-"${repo_root}/apps/web/dist/index.html"}"
+<<<<<<< HEAD
 web_assets="${WEB_ASSETS:-"${repo_root}/apps/web/dist/assets"}"
+=======
+web_favicon="${WEB_FAVICON:-"${repo_root}/apps/web/dist/favicon.ico"}"
+web_apple_touch_icon="${WEB_APPLE_TOUCH_ICON:-"${repo_root}/apps/web/dist/apple-touch-icon.png"}"
+>>>>>>> upstream/main
 binary_name="cpa-manager-plus"
 server_src="${repo_root}/apps/manager-server"
 native_script_src="${repo_root}/bin/native"
 
-if [ ! -f "${web_html}" ]; then
-  echo "missing ${web_html}; run npm run build first" >&2
-  exit 1
-fi
+for web_asset in "${web_html}" "${web_favicon}" "${web_apple_touch_icon}"; do
+  if [ ! -f "${web_asset}" ]; then
+    echo "missing ${web_asset}; run npm run build first" >&2
+    exit 1
+  fi
+done
 
 if [ ! -d "${web_assets}" ]; then
   echo "missing ${web_assets}; run the split web build first" >&2
@@ -31,8 +38,13 @@ mkdir -p "${out_dir}"
 
 cp -R "${server_src}" "${work_dir}/manager-server"
 cp "${web_html}" "${work_dir}/manager-server/internal/httpapi/web/management.html"
+<<<<<<< HEAD
 mkdir -p "${work_dir}/manager-server/internal/httpapi/web/management-assets"
 cp -R "${web_assets}/." "${work_dir}/manager-server/internal/httpapi/web/management-assets/"
+=======
+cp "${web_favicon}" "${work_dir}/manager-server/internal/httpapi/web/favicon.ico"
+cp "${web_apple_touch_icon}" "${work_dir}/manager-server/internal/httpapi/web/apple-touch-icon.png"
+>>>>>>> upstream/main
 
 targets=(
   "linux amd64"
@@ -56,9 +68,13 @@ for target in "${targets[@]}"; do
   mkdir -p "${package_dir}"
   (
     cd "${work_dir}/manager-server"
+<<<<<<< HEAD
     CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
       -ldflags "-s -w -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.Version=${version} -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.Commit=${commit} -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.BuildDate=${build_date}" \
       -o "${package_dir}/${exe_name}" ./cmd/cpa-manager-plus
+=======
+    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -ldflags "-s -w -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.Version=${version} -X github.com/seakee/cpa-manager-plus/apps/manager-server/internal/buildinfo.SourceCommit=$(git rev-parse HEAD)" -o "${package_dir}/${exe_name}" ./cmd/cpa-manager-plus
+>>>>>>> upstream/main
   )
 
   cp "${repo_root}/README.md" "${package_dir}/README.md"

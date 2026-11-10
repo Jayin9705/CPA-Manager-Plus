@@ -531,6 +531,7 @@
 
 .cardBranding {
   display: flex;
+<<<<<<< HEAD
   flex-direction: column;
   align-items: flex-start;
 
@@ -569,6 +570,30 @@
     content: '';
     opacity: 0.32;
     animation: signalFlicker 3.8s steps(2, end) infinite;
+=======
+  align-items: center;
+  justify-content: center;
+}
+
+.brandLogo {
+  width: 240px;
+  max-width: 80%;
+  height: auto;
+  display: block;
+}
+
+.brandLogoDark {
+  display: none;
+}
+
+[data-theme='dark'] {
+  .brandLogoLight {
+    display: none;
+  }
+
+  .brandLogoDark {
+    display: block;
+>>>>>>> upstream/main
   }
 }
 
@@ -1193,6 +1218,18 @@
   }
 }
 
+<<<<<<< HEAD
+=======
+@keyframes splashEnter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+>>>>>>> upstream/main
 @keyframes splashLoading {
   0% {
     transform: scaleX(0);
@@ -1219,6 +1256,32 @@
   width: 112px;
   flex-direction: column;
   align-items: center;
+<<<<<<< HEAD
+=======
+  gap: $spacing-md;
+  animation: splashEnter 0.6s ease-out;
+}
+
+.splashLogo {
+  width: 100px;
+  height: 102px;
+  display: block;
+  object-fit: contain;
+}
+
+.splashLogoDark {
+  display: none;
+}
+
+[data-theme='dark'] {
+  .splashLogoLight {
+    display: none;
+  }
+
+  .splashLogoDark {
+    display: block;
+  }
+>>>>>>> upstream/main
 }
 
 .splashLoader {

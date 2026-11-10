@@ -5,6 +5,11 @@ on:
     branches:
       - main
       - dev
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
   push:
     branches:
       - main
@@ -18,6 +23,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  security:
+    name: Dependency Security
+    uses: ./.github/workflows/security.yml
+
   changes:
     name: Scope
     runs-on: ubuntu-latest
@@ -79,7 +88,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.22.1'
           cache: npm
 
       - name: Install dependencies
@@ -107,6 +116,9 @@ jobs:
       - name: Check demo isolation
         run: npm run check:demo-isolation
 
+      - name: Check web icon artifact
+        run: npm run check:web-icons
+
   manager-server:
     name: Manager Server
     needs: changes
@@ -120,7 +132,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24.x'
+          go-version-file: apps/manager-server/go.mod
           cache-dependency-path: apps/manager-server/go.sum
 
       - name: Test
@@ -148,7 +160,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24.x'
+          go-version-file: apps/manager-server/go.mod
           cache-dependency-path: apps/manager-server/go.sum
 
       - name: Test SQLite repository
@@ -175,7 +187,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.22.1'
           cache: npm
 
       - name: Install dependencies
@@ -207,7 +219,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Validate Docker Compose configuration
         run: docker compose -f docker-compose.manager.yml config
@@ -259,7 +271,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.22.1'
           cache: npm
 
       - name: Install dependencies
@@ -278,31 +290,38 @@ jobs:
     needs: changes
     if: needs.changes.outputs.release_content == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.22.1'
           cache: npm
 
       - name: Validate changed release content
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
           CURRENT_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
           changed_files="${RUNNER_TEMP}/release-content-changed-files.bin"
+          validation_json="${RUNNER_TEMP}/release-content-validation.json"
           if [ "${EVENT_NAME}" = "pull_request" ]; then
             git diff --name-only --no-renames --diff-filter=A -z "${PR_BASE_SHA}...${PR_HEAD_SHA}" > "${changed_files}"
           elif [ -z "${PUSH_BEFORE_SHA}" ] || [[ "${PUSH_BEFORE_SHA}" =~ ^0+$ ]]; then
@@ -311,11 +330,24 @@ jobs:
             git diff --name-only --no-renames --diff-filter=A -z "${PUSH_BEFORE_SHA}..${CURRENT_SHA}" > "${changed_files}"
           fi
 
-          npm run --silent release:validate -- --changed-content --null < "${changed_files}"
+          npm run --silent release:validate -- --changed-content --null < "${changed_files}" > "${validation_json}"
+          cat "${validation_json}"
+
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${PR_BASE_REF}" = "dev" ]; then
+            while IFS= read -r release_tag; do
+              if [ -z "${release_tag}" ]; then
+                continue
+              fi
+              node bin/release/validate-release-contributors.mjs \
+                --tag "${release_tag}" \
+                --source-sha "${PR_BASE_SHA}"
+            done < <(jq -r '.tags[]' "${validation_json}")
+          fi
 
   required:
     name: Required checks
     needs:
+      - security
       - changes
       - frontend
       - manager-server
@@ -330,6 +362,7 @@ jobs:
     steps:
       - name: Verify applicable checks
         env:
+          SECURITY_RESULT: ${{ needs.security.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
           MANAGER_SERVER_RESULT: ${{ needs['manager-server'].result }}
@@ -341,6 +374,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          if [ "${SECURITY_RESULT}" != "success" ]; then
+            echo "Dependency Security did not complete successfully: ${SECURITY_RESULT:-missing}" >&2
+            exit 1
+          fi
+          echo "Dependency Security: ${SECURITY_RESULT}"
 
           results=(
             "Scope:${CHANGES_RESULT}"

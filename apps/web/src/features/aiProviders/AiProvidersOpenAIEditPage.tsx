@@ -6,15 +6,21 @@ import { Card } from '@/components/ui/Card';
 import { HeaderInputList } from '@/components/ui/HeaderInputList';
 import { Input } from '@/components/ui/Input';
 import { ModelInputList } from '@/components/ui/ModelInputList';
+import { InfoTooltip } from '@/components/ui/InfoTooltip';
+import { hasInvalidThinkingLevels } from '@/components/ui/modelInputListUtils';
 import { Select } from '@/components/ui/Select';
-import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
+import { CoolingPolicySelect } from '@/components/providers/CoolingPolicySelect';
 import { SecondaryScreenShell } from '@/components/common/SecondaryScreenShell';
-import { OpenAIKeyTestStatusIndicator } from '@/components/providers';
+import { OpenAIKeyTestStatusIndicator, type OpenAIFormApiKeyEntry } from '@/components/providers';
 import { useEdgeSwipeBack } from '@/hooks/useEdgeSwipeBack';
 import { useNotificationStore } from '@/stores';
 import { apiCallApi, getApiCallErrorDetails } from '@/services/api';
-import type { ApiKeyEntry } from '@/types';
 import { normalizeAuthIndex } from '@/utils/authIndex';
+import {
+  getOpenAIKeyCount,
+  getOpenAITestableKeyIndexes,
+  updateOpenAIApiKey,
+} from '@/utils/openAIKeyEntries';
 import { buildHeaderObject, hasHeader } from '@/utils/headers';
 import { buildApiKeyEntry, buildOpenAIChatCompletionsEndpoint } from '@/components/providers/utils';
 import {
@@ -23,6 +29,11 @@ import {
 } from '@/features/aiProviders/model/keyTestStatuses';
 import type { OpenAIEditOutletContext } from './AiProvidersOpenAIEditLayout';
 import type { KeyTestStatus } from '@/stores/useOpenAIEditDraftStore';
+import {
+  MAX_CREDENTIAL_WEIGHT,
+  getCredentialWeightError,
+  toCredentialWeightInputValue,
+} from '@/utils/credentialWeight';
 import styles from './AiProvidersPage.module.scss';
 import layoutStyles from './AiProvidersEditLayout.module.scss';
 
@@ -79,11 +90,20 @@ export function AiProvidersOpenAIEditPage() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleBack]);
 
-  const canSave = !disableControls && !loading && !saving && !invalidIndexParam && !invalidIndex && !isTestingKeys;
-  const hasConfiguredModels = form.modelEntries.some((entry) => entry.name.trim());
-  const hasTestableKeys = form.apiKeyEntries.some(
-    (entry) => entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex)
+  const hasInvalidWeight = form.apiKeyEntries.some((entry) =>
+    getCredentialWeightError(entry.weight)
   );
+  const canSave =
+    !disableControls &&
+    !loading &&
+    !saving &&
+    !invalidIndexParam &&
+    !invalidIndex &&
+    !isTestingKeys &&
+    !hasInvalidWeight &&
+    !hasInvalidThinkingLevels(form.modelEntries);
+  const hasConfiguredModels = form.modelEntries.some((entry) => entry.name.trim());
+  const hasTestableKeys = form.apiKeyEntries.length > 0;
   const modelSelectOptions = useMemo(() => {
     const seen = new Set<string>();
     return form.modelEntries.reduce<Array<{ value: string; label: string }>>((acc, entry) => {
@@ -141,11 +161,8 @@ export function AiProvidersOpenAIEditPage() {
       }
 
       const keyEntry = form.apiKeyEntries[keyIndex];
-      const keyAuthIndex = normalizeAuthIndex(keyEntry?.authIndex) ?? undefined;
-      if (!keyEntry?.apiKey?.trim() && !keyAuthIndex) {
-        setDraftKeyTestStatus(keyIndex, { status: 'error', message: t('notification.openai_test_key_required') });
-        return false;
-      }
+      if (!keyEntry) return false;
+      const keyAuthIndex = normalizeAuthIndex(keyEntry.authIndex) ?? undefined;
 
       const modelName = testModel.trim() || availableModels[0] || '';
       if (!modelName) {
@@ -159,7 +176,11 @@ export function AiProvidersOpenAIEditPage() {
         ...customHeaders,
       };
       if (!hasHeader(headers, 'authorization')) {
-        headers.Authorization = keyAuthIndex ? 'Bearer $TOKEN$' : `Bearer ${keyEntry.apiKey.trim()}`;
+        if (keyEntry.apiKey.trim()) {
+          headers.Authorization = keyAuthIndex
+            ? 'Bearer $TOKEN$'
+            : `Bearer ${keyEntry.apiKey.trim()}`;
+        }
       }
 
       // Set loading state for this key
@@ -169,6 +190,7 @@ export function AiProvidersOpenAIEditPage() {
         const result = await apiCallApi.request(
           {
             authIndex: keyAuthIndex,
+            proxyUrl: keyEntry.proxyUrl?.trim() || undefined,
             method: 'POST',
             url: endpoint,
             header: Object.keys(headers).length ? headers : undefined,
@@ -202,7 +224,16 @@ export function AiProvidersOpenAIEditPage() {
         return false;
       }
     },
-    [form.baseUrl, form.apiKeyEntries, form.headers, testModel, availableModels, t, setDraftKeyTestStatus, showNotification]
+    [
+      form.baseUrl,
+      form.apiKeyEntries,
+      form.headers,
+      testModel,
+      availableModels,
+      t,
+      setDraftKeyTestStatus,
+      showNotification,
+    ]
   );
 
   const testSingleKey = useCallback(
@@ -249,16 +280,7 @@ export function AiProvidersOpenAIEditPage() {
       return;
     }
 
-    const validKeyIndexes = form.apiKeyEntries
-      .map((entry, index) => (entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex) ? index : -1))
-      .filter((index) => index >= 0);
-    if (validKeyIndexes.length === 0) {
-      const message = t('notification.openai_test_key_required');
-      setTestStatus('error');
-      setTestMessage(message);
-      showNotification(message, 'error');
-      return;
-    }
+    const validKeyIndexes = getOpenAITestableKeyIndexes(form.apiKeyEntries);
 
     setIsTestingKeys(true);
     setTestStatus('loading');
@@ -282,7 +304,10 @@ export function AiProvidersOpenAIEditPage() {
         setTestMessage(message);
         showNotification(message, 'error');
       } else {
-        const message = t('ai_providers.openai_test_all_partial', { success: successCount, failed: failCount });
+        const message = t('ai_providers.openai_test_all_partial', {
+          success: successCount,
+          failed: failCount,
+        });
         setTestStatus('error');
         setTestMessage(message);
         showNotification(message, 'warning');
@@ -313,15 +338,27 @@ export function AiProvidersOpenAIEditPage() {
     navigate('models');
   };
 
-  const renderKeyEntries = (entries: ApiKeyEntry[]) => {
+  const renderKeyEntries = (entries: OpenAIFormApiKeyEntry[]) => {
     const list = entries.length ? entries : [buildApiKeyEntry()];
 
-    const updateEntry = (idx: number, field: keyof ApiKeyEntry, value: string) => {
-      const next = list.map((entry, i) => (i === idx ? { ...entry, [field]: value } : entry));
+    const updateEntry = (idx: number, field: keyof OpenAIFormApiKeyEntry, value: string) => {
+      const next = list.map((entry, i) =>
+        i === idx
+          ? field === 'apiKey'
+            ? updateOpenAIApiKey(entry, value)
+            : { ...entry, [field]: value }
+          : entry
+      );
       setForm((prev) => ({ ...prev, apiKeyEntries: next }));
       setDraftKeyTestStatus(idx, { status: 'idle', message: '' });
       setTestStatus('idle');
       setTestMessage('');
+    };
+
+    const updateEntryWeight = (idx: number, raw: string) => {
+      const weight = toCredentialWeightInputValue(raw);
+      const next = list.map((entry, i) => (i === idx ? { ...entry, weight } : entry));
+      setForm((prev) => ({ ...prev, apiKeyEntries: next }));
     };
 
     const removeEntry = (idx: number) => {
@@ -346,7 +383,7 @@ export function AiProvidersOpenAIEditPage() {
       <div className={styles.keyEntriesList}>
         <div className={styles.keyEntriesToolbar}>
           <span className={styles.keyEntriesCount}>
-            {t('ai_providers.openai_keys_count')}: {list.length}
+            {t('ai_providers.openai_keys_count')}: {getOpenAIKeyCount(list)}
           </span>
           <Button
             variant="secondary"
@@ -364,16 +401,16 @@ export function AiProvidersOpenAIEditPage() {
             <div className={styles.keyTableColIndex}>#</div>
             <div className={styles.keyTableColStatus}>{t('common.status')}</div>
             <div className={styles.keyTableColKey}>{t('common.api_key')}</div>
+            <div className={styles.keyTableColWeight}>{t('ai_providers.weight_label')}</div>
             <div className={styles.keyTableColProxy}>{t('common.proxy_url')}</div>
             <div className={styles.keyTableColAction}>{t('common.action')}</div>
           </div>
-
           {/* 数据行 */}
           {list.map((entry, index) => {
             const keyStatus = keyTestStatuses[index]?.status ?? 'idle';
+            const weightError = getCredentialWeightError(entry.weight);
             const canTestKey =
-              Boolean(entry.apiKey?.trim() || normalizeAuthIndex(entry.authIndex)) &&
-              hasConfiguredModels;
+              hasConfiguredModels && getOpenAITestableKeyIndexes(form.apiKeyEntries).includes(index);
 
             return (
               <div key={index} className={styles.keyTableRow}>
@@ -398,6 +435,32 @@ export function AiProvidersOpenAIEditPage() {
                     className={`input ${styles.keyTableInput}`}
                     placeholder={t('ai_providers.openai_key_placeholder')}
                   />
+                </div>
+
+                <div className={styles.keyTableColWeight}>
+                  <div className={styles.keyTableWeightField}>
+                    <input
+                      type="text"
+                      inputMode="text"
+                      value={entry.weight ?? ''}
+                      onChange={(e) => updateEntryWeight(index, e.target.value)}
+                      disabled={saving || disableControls || isTestingKeys}
+                      className={`input ${styles.keyTableInput}`}
+                      placeholder="1"
+                      aria-invalid={Boolean(weightError)}
+                      aria-label={`${t('ai_providers.weight_label')} ${index + 1}`}
+                    />
+                    {weightError && (
+                      <span className={styles.keyTableWeightError}>
+                        {t(
+                          weightError === 'maximum'
+                            ? 'ai_providers.weight_error_maximum'
+                            : 'ai_providers.weight_error_integer',
+                          { max: MAX_CREDENTIAL_WEIGHT.toLocaleString() }
+                        )}
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* Proxy 输入框 */}
@@ -526,16 +589,12 @@ export function AiProvidersOpenAIEditPage() {
               removeButtonAriaLabel={t('common.delete')}
               disabled={saving || disableControls || isTestingKeys}
             />
-            <div className="form-group">
-              <label>{t('ai_providers.disable_cooling_label')}</label>
-              <ToggleSwitch
-                checked={Boolean(form.disableCooling)}
-                onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
-                disabled={saving || disableControls || isTestingKeys}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
-              />
-              <div className="hint">{t('ai_providers.disable_cooling_hint')}</div>
-            </div>
+            <CoolingPolicySelect
+              value={form.disableCooling}
+              onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
+              disabled={saving || disableControls || isTestingKeys}
+              id="openai-page-cooling-policy"
+            />
 
             {/* 模型配置区域 - 统一布局 */}
             <div className={styles.modelConfigSection}>
@@ -550,10 +609,12 @@ export function AiProvidersOpenAIEditPage() {
                   <Button
                     variant="secondary"
                     size="sm"
-                    onClick={() => setForm((prev) => ({
-                      ...prev,
-                      modelEntries: [...prev.modelEntries, { name: '', alias: '' }]
-                    }))}
+                    onClick={() =>
+                      setForm((prev) => ({
+                        ...prev,
+                        modelEntries: [...prev.modelEntries, { name: '', alias: '' }],
+                      }))
+                    }
                     disabled={saving || disableControls || isTestingKeys}
                   >
                     {t('ai_providers.openai_models_add_btn')}
@@ -566,6 +627,10 @@ export function AiProvidersOpenAIEditPage() {
                   >
                     {t('ai_providers.openai_models_fetch_button')}
                   </Button>
+                  <InfoTooltip
+                    content={t('ai_providers.openai_model_discovery_proxy_version_hint')}
+                    ariaLabel={t('ai_providers.model_discovery_proxy_version_info_label')}
+                  />
                 </div>
               </div>
 
@@ -580,23 +645,39 @@ export function AiProvidersOpenAIEditPage() {
                 aliasPlaceholder={t('common.model_alias_placeholder')}
                 disabled={saving || disableControls || isTestingKeys}
                 hideAddButton
-                className={styles.modelInputList}
+                className={styles.openaiModelInputList}
                 rowClassName={styles.modelInputRow}
                 inputClassName={styles.modelInputField}
+                itemClassName={styles.openaiModelInputItem}
                 removeButtonClassName={styles.modelRowRemoveButton}
                 removeButtonTitle={t('common.delete')}
                 removeButtonAriaLabel={t('common.delete')}
                 showForceMapping
                 showModalities
+                showThinkingLevels
                 forceMappingLabel={t('ai_providers.force_mapping_label')}
                 inputModalitiesPlaceholder={t('ai_providers.input_modalities_placeholder')}
                 outputModalitiesPlaceholder={t('ai_providers.output_modalities_placeholder')}
+                modelFallbackLabel={t('ai_providers.thinking_model_fallback_label')}
+                thinkingLabel={t('ai_providers.thinking_levels_label')}
+                thinkingTooltip={t('ai_providers.thinking_levels_tooltip')}
+                thinkingTooltipAriaLabel={t('ai_providers.thinking_levels_tooltip_aria_label')}
+                thinkingDefaultLabel={t('ai_providers.thinking_default_label')}
+                thinkingCustomLabel={t('ai_providers.thinking_custom_label')}
+                thinkingAllowedLevelsLabel={t('ai_providers.thinking_allowed_levels_label')}
+                thinkingSelectAllLabel={t('ai_providers.thinking_select_all_label')}
+                thinkingClearLabel={t('ai_providers.thinking_clear_label')}
+                thinkingRequiredError={t('ai_providers.thinking_required_error')}
+                thinkingUnknownLevelsLabel={t('ai_providers.thinking_unknown_levels_label')}
+                thinkingUnknownLevelsHint={t('ai_providers.thinking_unknown_levels_hint')}
               />
 
               {/* 测试区域 */}
               <div className={styles.modelTestPanel}>
                 <div className={styles.modelTestMeta}>
-                  <label className={styles.modelTestLabel}>{t('ai_providers.openai_test_title')}</label>
+                  <label className={styles.modelTestLabel}>
+                    {t('ai_providers.openai_test_title')}
+                  </label>
                   <span className={styles.modelTestHint}>{t('ai_providers.openai_test_hint')}</span>
                 </div>
                 <div className={styles.modelTestControls}>
@@ -615,14 +696,27 @@ export function AiProvidersOpenAIEditPage() {
                     }
                     className={styles.openaiTestSelect}
                     ariaLabel={t('ai_providers.openai_test_title')}
-                    disabled={saving || disableControls || isTestingKeys || testStatus === 'loading' || availableModels.length === 0}
+                    disabled={
+                      saving ||
+                      disableControls ||
+                      isTestingKeys ||
+                      testStatus === 'loading' ||
+                      availableModels.length === 0
+                    }
                   />
                   <Button
                     variant={testStatus === 'error' ? 'danger' : 'secondary'}
                     size="sm"
                     onClick={() => void testAllKeys()}
                     loading={testStatus === 'loading'}
-                    disabled={saving || disableControls || isTestingKeys || testStatus === 'loading' || !hasConfiguredModels || !hasTestableKeys}
+                    disabled={
+                      saving ||
+                      disableControls ||
+                      isTestingKeys ||
+                      testStatus === 'loading' ||
+                      !hasConfiguredModels ||
+                      !hasTestableKeys
+                    }
                     title={t('ai_providers.openai_test_all_hint')}
                     className={styles.modelTestAllButton}
                   >
@@ -647,7 +741,9 @@ export function AiProvidersOpenAIEditPage() {
 
             <div className={styles.keyEntriesSection}>
               <div className={styles.keyEntriesHeader}>
-                <label className={styles.keyEntriesTitle}>{t('ai_providers.openai_add_modal_keys_label')}</label>
+                <label className={styles.keyEntriesTitle}>
+                  {t('ai_providers.openai_add_modal_keys_label')}
+                </label>
                 <span className={styles.keyEntriesHint}>{t('ai_providers.openai_keys_hint')}</span>
               </div>
               {renderKeyEntries(form.apiKeyEntries)}

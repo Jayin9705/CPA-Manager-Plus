@@ -21,8 +21,10 @@ import (
 	panelcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/panel"
 	proxycontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/proxy"
 	quotacooldowncontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/quotacooldown"
+	quotasnapshotcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/quotasnapshot"
 	setupcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/setup"
 	systemcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/system"
+	updatecheckcontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/updatecheck"
 	usagecontroller "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/controller/usage"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/http/middleware"
 	proxysvc "github.com/seakee/cpa-manager-plus/apps/manager-server/internal/service/proxy"
@@ -54,12 +56,16 @@ func newRouter(appCtx *app.Context, includePanel bool) http.Handler {
 	codexInspectionHandler := &codexinspectioncontroller.Handler{App: appCtx}
 	dashboardHandler := &dashboardcontroller.Handler{App: appCtx}
 	monitoringHandler := &monitoringcontroller.Handler{App: appCtx}
+	quotaSnapshotHandler := &quotasnapshotcontroller.Handler{App: appCtx}
 	operationsHandler := operationscontroller.New(appCtx)
 	proxyHandler := &proxycontroller.Handler{App: appCtx}
 	panelHandler := &panelcontroller.Handler{App: appCtx}
 	metaHandler := &metacontroller.Handler{App: appCtx}
 
 	mux := http.NewServeMux()
+	updates := &updatecheckcontroller.Handler{App: appCtx}
+	mux.HandleFunc("/usage-service/updates", middleware.WithCORS(appCtx.Config, updates.Handle))
+	mux.HandleFunc("/usage-service/updates/", middleware.WithCORS(appCtx.Config, updates.Handle))
 	mux.HandleFunc("/health", middleware.WithCORS(appCtx.Config, healthHandler.Health))
 	mux.HandleFunc("/healthz", middleware.WithCORS(appCtx.Config, healthHandler.Health))
 	mux.HandleFunc("/readyz", middleware.WithCORS(appCtx.Config, healthHandler.Ready))
@@ -82,12 +88,15 @@ func newRouter(appCtx *app.Context, includePanel bool) http.Handler {
 	mux.HandleFunc("/usage-service/config", middleware.WithCORS(appCtx.Config, managerConfigHandler.Handle))
 	mux.HandleFunc("/usage-service/account-processing-policy", middleware.WithCORS(appCtx.Config, automationHandler.Handle))
 	mux.HandleFunc("/usage-service/quota-cooldowns", middleware.WithCORS(appCtx.Config, quotaCooldownHandler.Handle))
+	mux.HandleFunc("/usage-service/quota-cooldowns/", middleware.WithCORS(appCtx.Config, quotaCooldownHandler.Handle))
 	mux.HandleFunc("/setup", middleware.WithCORS(appCtx.Config, setupHandler.Setup))
+	mux.HandleFunc("/favicon.ico", panelHandler.Favicon)
+	mux.HandleFunc("/apple-touch-icon.png", panelHandler.AppleTouchIcon)
+	mux.HandleFunc("/", rootHandler(appCtx, usageHandler, modelPriceHandler, apiKeyAliasHandler, accountActionHandler, codexInspectionHandler, dashboardHandler, monitoringHandler, quotaSnapshotHandler, managerConfigHandler, proxyHandler, includePanel))
 	if includePanel {
 		mux.HandleFunc("/management.html", panelHandler.ManagementHTML)
 		mux.HandleFunc("/management-assets/", panelHandler.ManagementAssets)
 	}
-	mux.HandleFunc("/", rootHandler(appCtx, usageHandler, modelPriceHandler, apiKeyAliasHandler, accountActionHandler, codexInspectionHandler, dashboardHandler, monitoringHandler, proxyHandler, includePanel))
 
 	return serverMetadata(middleware.Security(appCtx.Config, middleware.Recovery(middleware.RequestLogger(mux))))
 }
@@ -112,6 +121,8 @@ func rootHandler(
 	codexInspectionHandler *codexinspectioncontroller.Handler,
 	dashboardHandler *dashboardcontroller.Handler,
 	monitoringHandler *monitoringcontroller.Handler,
+	quotaSnapshotHandler *quotasnapshotcontroller.Handler,
+	managerConfigHandler *managerconfigcontroller.Handler,
 	proxyHandler *proxycontroller.Handler,
 	includePanel bool,
 ) http.HandlerFunc {
@@ -169,9 +180,19 @@ func rootHandler(
 			middleware.WithCORS(appCtx.Config, monitoringHandler.Handle)(w, r)
 			return
 		}
+		cleanQuotaSnapshotPath := strings.TrimRight(r.URL.Path, "/")
+		if cleanQuotaSnapshotPath == "/v0/management/quota-snapshots" ||
+			cleanQuotaSnapshotPath == "/v0/management/quota-snapshots/query" {
+			middleware.WithCORS(appCtx.Config, quotaSnapshotHandler.Handle)(w, r)
+			return
+		}
 		cleanUsagePath := strings.TrimRight(r.URL.Path, "/")
 		if cleanUsagePath == "/v0/management/usage" || strings.HasPrefix(cleanUsagePath, "/v0/management/usage/") {
 			middleware.WithCORS(appCtx.Config, usageHandler.Handle)(w, r)
+			return
+		}
+		if r.URL.Path == "/v0/management/cpa-connection/validate" {
+			middleware.WithCORS(appCtx.Config, managerConfigHandler.ValidateCPAConnection)(w, r)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v0/management/playground/") {
@@ -189,6 +210,10 @@ func rootHandler(
 		}
 		if proxysvc.IsCPAPluginResourcePath(r.URL.Path) {
 			middleware.WithCORS(appCtx.Config, proxyHandler.CPAResource)(w, r)
+			return
+		}
+		if proxysvc.IsCPAV8APIKeysConfigPath(r.URL.Path) {
+			middleware.WithCORS(appCtx.Config, proxyHandler.V8APIKeysConfig)(w, r)
 			return
 		}
 		if includePanel && r.URL.Path == "/" {

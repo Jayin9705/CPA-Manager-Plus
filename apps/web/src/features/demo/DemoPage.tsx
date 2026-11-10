@@ -4,14 +4,23 @@ import i18n from '@/i18n';
 import { apiClient } from '@/services/api/client';
 import { normalizeConfigResponse } from '@/services/api/transformers';
 import { resetDemoCodexInspectionRunState } from '@/services/api/usageService';
-import { useAuthStore, useConfigStore, useModelsStore, useUsageServiceStore } from '@/stores';
+import {
+  useAuthStore,
+  useConfigStore,
+  useModelsStore,
+  useQuotaStore,
+  useUsageServiceStore,
+} from '@/stores';
 import { DemoRouteAdapter } from './DemoRouteAdapter';
 import {
   getDemoCodexInspectionLocalLogs,
   getDemoCodexInspectionLocalRun,
   getDemoProviderModels,
+  getDemoQuotaStoreState,
   getDemoRawConfig,
   resetDemoCredentialRefresh,
+  resetDemoEvidenceEpoch,
+  resetDemoUsageArchiveState,
 } from '@/features/demo/demoFixtures';
 import {
   CODEX_INSPECTION_LAST_RUN_STORAGE_KEY,
@@ -26,15 +35,18 @@ import {
   DEMO_API_BASE,
   DEMO_MANAGEMENT_KEY,
   DEMO_ROUTE_BASE,
+  DEMO_SERVER_COMMIT,
   DEMO_SERVER_VERSION,
   getDemoServerBuildDate,
   setDemoMode,
 } from './demoMode';
 import { enableDemoPersistIsolation } from './demoPersistIsolation';
+import { resetDemoAuthFileConfiguration } from './demoApi';
 
 type AuthStoreState = ReturnType<typeof useAuthStore.getState>;
 type ConfigStoreState = ReturnType<typeof useConfigStore.getState>;
 type ModelsStoreState = ReturnType<typeof useModelsStore.getState>;
+type QuotaStoreState = ReturnType<typeof useQuotaStore.getState>;
 type UsageServiceStoreState = ReturnType<typeof useUsageServiceStore.getState>;
 
 const createDemoConfigCache = (config: ReturnType<typeof normalizeConfigResponse>) => {
@@ -102,6 +114,7 @@ const captureAuthSnapshot = (state: AuthStoreState) => ({
   managementKey: state.managementKey,
   rememberPassword: state.rememberPassword,
   serverVersion: state.serverVersion,
+  serverCommit: state.serverCommit,
   serverBuildDate: state.serverBuildDate,
   supportsPlugin: state.supportsPlugin,
   sessionMode: state.sessionMode,
@@ -124,6 +137,14 @@ const captureModelsSnapshot = (state: ModelsStoreState) => ({
   cache: state.cache,
 });
 
+const captureQuotaSnapshot = (state: QuotaStoreState) => ({
+  antigravityQuota: state.antigravityQuota,
+  claudeQuota: state.claudeQuota,
+  codexQuota: state.codexQuota,
+  kimiQuota: state.kimiQuota,
+  xaiQuota: state.xaiQuota,
+});
+
 const captureUsageServiceSnapshot = (state: UsageServiceStoreState) => ({
   enabled: state.enabled,
   serviceBase: state.serviceBase,
@@ -137,6 +158,7 @@ export function DemoPage() {
     const authSnapshot = captureAuthSnapshot(useAuthStore.getState());
     const configSnapshot = captureConfigSnapshot(useConfigStore.getState());
     const modelsSnapshot = captureModelsSnapshot(useModelsStore.getState());
+    const quotaSnapshot = captureQuotaSnapshot(useQuotaStore.getState());
     const usageServiceSnapshot = captureUsageServiceSnapshot(useUsageServiceStore.getState());
     const loggedInSnapshot =
       typeof window !== 'undefined' ? window.localStorage.getItem('isLoggedIn') : null;
@@ -148,7 +170,10 @@ export function DemoPage() {
     const restoreDemoPersistIsolation = enableDemoPersistIsolation();
     const restoreDemoInspectionState = installDemoInspectionState();
 
+    resetDemoEvidenceEpoch();
     resetDemoCredentialRefresh();
+    resetDemoUsageArchiveState();
+    resetDemoAuthFileConfiguration();
     resetDemoCodexInspectionRunState();
     setDemoMode(true);
     apiClient.setConfig({
@@ -161,6 +186,7 @@ export function DemoPage() {
       managementKey: DEMO_MANAGEMENT_KEY,
       rememberPassword: false,
       serverVersion: DEMO_SERVER_VERSION,
+      serverCommit: DEMO_SERVER_COMMIT,
       serverBuildDate: getDemoServerBuildDate(),
       supportsPlugin: true,
       sessionMode: 'manager_embedded',
@@ -185,6 +211,7 @@ export function DemoPage() {
         apiKey: '',
       },
     });
+    useQuotaStore.setState(getDemoQuotaStoreState());
     useUsageServiceStore.setState((state) => ({
       enabled: true,
       serviceBase: DEMO_API_BASE,
@@ -194,12 +221,16 @@ export function DemoPage() {
     }));
 
     return () => {
+      resetDemoEvidenceEpoch();
       resetDemoCredentialRefresh();
+      resetDemoUsageArchiveState();
+      resetDemoAuthFileConfiguration();
       resetDemoCodexInspectionRunState();
       setDemoMode(false);
       useAuthStore.setState(authSnapshot);
       useConfigStore.setState(configSnapshot);
       useModelsStore.setState(modelsSnapshot);
+      useQuotaStore.setState(quotaSnapshot);
       useUsageServiceStore.setState(usageServiceSnapshot);
       apiClient.setConfig({
         apiBase: authSnapshot.apiBase,

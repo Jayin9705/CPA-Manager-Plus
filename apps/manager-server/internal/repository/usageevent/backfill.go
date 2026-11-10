@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/repository/usageprojection"
 	"github.com/seakee/cpa-manager-plus/apps/manager-server/internal/usage"
 )
 
@@ -86,17 +87,20 @@ where
 order by id
 limit ?`
 
-func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit int) (int, error) {
-	if batchLimit <= 0 {
-		batchLimit = defaultResponseMetadataBackfillBatch
+func (r *repository) collectResponseMetadataBackfillUpdates(ctx context.Context, maxUpdates int, pageLimit int) ([]responseMetadataBackfillUpdate, error) {
+	if maxUpdates <= 0 {
+		return nil, nil
+	}
+	if pageLimit <= 0 {
+		pageLimit = defaultResponseMetadataBackfillBatch
 	}
 
-	updates := make([]responseMetadataBackfillUpdate, 0, batchLimit)
+	updates := make([]responseMetadataBackfillUpdate, 0, maxUpdates)
 	lastID := int64(0)
-	for len(updates) < batchLimit {
-		items, err := r.responseMetadataBackfillPage(ctx, lastID, batchLimit)
+	for len(updates) < maxUpdates {
+		items, err := r.responseMetadataBackfillPage(ctx, lastID, pageLimit)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		if len(items) == 0 {
 			break
@@ -119,7 +123,7 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 						PreviousMetadataJSON: item.ResponseMetadataJSON,
 						Derived:              usage.ResponseHeaderDerived{MetadataJSON: "{}"},
 					})
-					if len(updates) == batchLimit {
+					if len(updates) == maxUpdates {
 						break
 					}
 				}
@@ -133,13 +137,33 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 				PreviousMetadataJSON: item.ResponseMetadataJSON,
 				Derived:              derived,
 			})
-			if len(updates) == batchLimit {
+			if len(updates) == maxUpdates {
 				break
 			}
 		}
-		if len(items) < batchLimit {
+		if len(items) < pageLimit {
 			break
 		}
+	}
+	return updates, nil
+}
+
+func (r *repository) ResponseMetadataBackfillPending(ctx context.Context) (bool, error) {
+	updates, err := r.collectResponseMetadataBackfillUpdates(ctx, 1, defaultResponseMetadataBackfillBatch)
+	if err != nil {
+		return false, err
+	}
+	return len(updates) > 0, nil
+}
+
+func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit int) (int, error) {
+	if batchLimit <= 0 {
+		batchLimit = defaultResponseMetadataBackfillBatch
+	}
+
+	updates, err := r.collectResponseMetadataBackfillUpdates(ctx, batchLimit, batchLimit)
+	if err != nil {
+		return 0, err
 	}
 	if len(updates) == 0 {
 		return 0, nil
@@ -166,7 +190,7 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 	}
 	defer stmt.Close()
 
-	updated := 0
+	updatedIDs := make([]int64, 0, len(updates))
 	for _, update := range updates {
 		derived := update.Derived
 		res, err := stmt.ExecContext(
@@ -182,18 +206,30 @@ func (r *repository) BackfillResponseMetadata(ctx context.Context, batchLimit in
 			update.PreviousMetadataJSON,
 		)
 		if err != nil {
-			return updated, err
+			return 0, err
 		}
 		affected, err := res.RowsAffected()
 		if err != nil {
-			return updated, err
+			return 0, err
 		}
-		updated += int(affected)
+		if affected == 1 {
+			updatedIDs = append(updatedIDs, update.ID)
+		}
+	}
+	if len(updatedIDs) == 0 {
+		return 0, nil
+	}
+	nowMS := time.Now().UnixMilli()
+	if err := usageprojection.UpsertEventIDs(ctx, tx, updatedIDs, nowMS); err != nil {
+		return 0, err
+	}
+	if err := usageprojection.UpsertHeaderIDs(ctx, tx, updatedIDs, nowMS); err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
-		return updated, err
+		return 0, err
 	}
-	return updated, nil
+	return len(updatedIDs), nil
 }
 
 func (r *repository) responseMetadataBackfillPage(ctx context.Context, afterID int64, limit int) ([]responseMetadataBackfillRow, error) {

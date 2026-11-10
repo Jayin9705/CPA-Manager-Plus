@@ -29,7 +29,7 @@ Browser
 - CPA / CLIProxyAPI is already running.
 - You prefer a different interface or clearer information hierarchy than the official panel.
 - You want to keep a single CPA process and management port.
-- Your main tasks are providers, auth files, OAuth, API keys, quota, logs, plugins, and configuration.
+- Your main tasks are providers, credentials and account health, OAuth, API keys, logs, plugins, and configuration.
 - You do not currently need persistent request history, cost analytics, or server-side automation.
 
 ## Requirements
@@ -73,9 +73,11 @@ http://<cpa-host>:8317/management.html
 ```
 
 3. Log in with the CPA Management Key.
-4. Confirm that Dashboard, Configuration, Providers, Auth Files, OAuth, Quota, and Logs load correctly.
+4. Confirm that Dashboard, Configuration, Providers, Accounts, OAuth, and Logs load correctly.
 
 On first access, CPA checks the latest Release in the configured GitHub repository for an asset named `management.html` and caches it in the CPA working directory.
+
+`management.html` remains a single-file distribution. It starts with conventional root icon URLs and keeps them only when the response is identified as a CPAMP Manager Server icon resource. Otherwise current browsers switch to the same ICO and Apple Touch Icon embedded as Data URLs. This keeps Safari 26+ and current iOS self-contained without requiring CPA to download companion files. Safari 18 and earlier do not reliably support Data URL icons, so the lightweight panel does not guarantee a custom Home Screen icon on those legacy versions. Full Mode continues to provide the conventional root icon resources directly.
 
 ## Updates And Cache
 
@@ -97,7 +99,7 @@ With `disable-auto-update-panel: true`, CPA downloads the panel only when the ca
 
 | Capability                                                   | CPAMP Lightweight Panel                             |
 | ------------------------------------------------------------ | --------------------------------------------------- |
-| CPA config, providers, auth files, OAuth, quota, and logs    | Supported                                           |
+| CPA config, providers, Accounts, OAuth, and logs             | Supported                                           |
 | API keys, model aliases, priorities, and plugin management   | Supported when exposed by CPA APIs and plugin paths |
 | Browser-local account checks                                 | Supported where the page provides a local workflow  |
 | SQLite request history and request monitoring                | Not supported                                       |

@@ -5,13 +5,13 @@
 import axios from 'axios';
 import { normalizeModelList } from '@/utils/models';
 import { normalizeApiBase } from '@/utils/connection';
+import { buildClaudeRequestHeaders } from '@/utils/claudeAuth';
 import { getDemoProviderModels } from '@/features/demo/demoFixtures';
 import { isDemoMode } from '@/features/demo/demoMode';
 import { apiCallApi, getApiCallErrorMessage } from './apiCall';
 
 const DEFAULT_CLAUDE_BASE_URL = 'https://api.anthropic.com';
 const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
-const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
 const CLAUDE_MODELS_IN_FLIGHT = new Map<string, Promise<ReturnType<typeof normalizeModelList>>>();
 const GEMINI_MODELS_IN_FLIGHT = new Map<string, Promise<ReturnType<typeof normalizeModelList>>>();
 
@@ -21,13 +21,14 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const buildRequestSignature = (
   url: string,
   headers: Record<string, string>,
-  authIndex?: string
+  authIndex?: string,
+  proxyUrl?: string
 ) => {
   const headerSignature = Object.entries(headers)
     .sort(([a], [b]) => a.toLowerCase().localeCompare(b.toLowerCase()))
     .map(([key, value]) => `${key}:${value}`)
     .join('|');
-  return `${url}||${headerSignature}||auth=${authIndex ?? ''}`;
+  return `${url}||${headerSignature}||auth=${authIndex ?? ''}||proxy=${proxyUrl ?? ''}`;
 };
 
 const buildModelsEndpoint = (baseUrl: string): string => {
@@ -76,15 +77,6 @@ const hasHeader = (headers: Record<string, string>, name: string) => {
   return Object.keys(headers).some((key) => key.toLowerCase() === target);
 };
 
-const resolveBearerTokenFromAuthorization = (headers: Record<string, string>): string => {
-  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === 'authorization');
-  if (!entry) return '';
-  const value = String(entry[1] ?? '').trim();
-  if (!value) return '';
-  const match = value.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || '';
-};
-
 export const modelsApi = {
   /**
    * Fetch available models from /v1/models endpoint (for system info page)
@@ -119,7 +111,8 @@ export const modelsApi = {
     baseUrl: string,
     apiKey?: string,
     headers: Record<string, string> = {},
-    authIndex?: string
+    authIndex?: string,
+    proxyUrl?: string
   ) {
     const endpoint = buildV1ModelsEndpoint(baseUrl);
     if (!endpoint) {
@@ -127,6 +120,7 @@ export const modelsApi = {
     }
 
     const trimmedAuthIndex = authIndex?.trim() || undefined;
+    const trimmedProxyUrl = proxyUrl?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     if (apiKey && !hasHeader(resolvedHeaders, 'authorization')) {
       resolvedHeaders.Authorization = `Bearer ${apiKey}`;
@@ -136,6 +130,7 @@ export const modelsApi = {
 
     const result = await apiCallApi.request({
       authIndex: trimmedAuthIndex,
+      proxyUrl: trimmedProxyUrl,
       method: 'GET',
       url: endpoint,
       header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
@@ -156,7 +151,9 @@ export const modelsApi = {
     baseUrl: string,
     apiKey?: string,
     headers: Record<string, string> = {},
-    authIndex?: string
+    authIndex?: string,
+    proxyUrl?: string,
+    keyless = false
   ) {
     const endpoint = buildModelsEndpoint(baseUrl);
     if (!endpoint) {
@@ -164,15 +161,17 @@ export const modelsApi = {
     }
 
     const trimmedAuthIndex = authIndex?.trim() || undefined;
+    const trimmedProxyUrl = proxyUrl?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     if (apiKey && !hasHeader(resolvedHeaders, 'authorization')) {
       resolvedHeaders.Authorization = `Bearer ${apiKey}`;
-    } else if (trimmedAuthIndex && !hasHeader(resolvedHeaders, 'authorization')) {
+    } else if (trimmedAuthIndex && !keyless && !hasHeader(resolvedHeaders, 'authorization')) {
       resolvedHeaders.Authorization = 'Bearer $TOKEN$';
     }
 
     const result = await apiCallApi.request({
       authIndex: trimmedAuthIndex,
+      proxyUrl: trimmedProxyUrl,
       method: 'GET',
       url: endpoint,
       header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
@@ -200,13 +199,14 @@ export const modelsApi = {
 
   /**
    * Fetch Claude models from /v1/models via api-call.
-   * Anthropic requires `x-api-key` and `anthropic-version` headers.
+   * Match CPA Claude runtime authentication for Anthropic and custom upstreams.
    */
   async fetchClaudeModelsViaApiCall(
     baseUrl: string,
     apiKey?: string,
     headers: Record<string, string> = {},
-    authIndex?: string
+    authIndex?: string,
+    proxyUrl?: string
   ) {
     const endpoint = buildClaudeModelsEndpoint(baseUrl);
     if (!endpoint) {
@@ -214,28 +214,27 @@ export const modelsApi = {
     }
 
     const trimmedAuthIndex = authIndex?.trim() || undefined;
-    const resolvedHeaders = { ...headers };
-    let resolvedApiKey = String(apiKey ?? '').trim();
-    if (!resolvedApiKey && !hasHeader(resolvedHeaders, 'x-api-key')) {
-      resolvedApiKey = resolveBearerTokenFromAuthorization(resolvedHeaders);
-    }
+    const trimmedProxyUrl = proxyUrl?.trim() || undefined;
+    const resolvedHeaders = buildClaudeRequestHeaders({
+      url: endpoint,
+      apiKey,
+      authIndex: trimmedAuthIndex,
+      customHeaders: headers,
+    }).headers;
 
-    if (resolvedApiKey && !hasHeader(resolvedHeaders, 'x-api-key')) {
-      resolvedHeaders['x-api-key'] = resolvedApiKey;
-    } else if (trimmedAuthIndex && !hasHeader(resolvedHeaders, 'x-api-key')) {
-      resolvedHeaders['x-api-key'] = '$TOKEN$';
-    }
-    if (!hasHeader(resolvedHeaders, 'anthropic-version')) {
-      resolvedHeaders['anthropic-version'] = DEFAULT_ANTHROPIC_VERSION;
-    }
-
-    const signature = buildRequestSignature(endpoint, resolvedHeaders, trimmedAuthIndex);
+    const signature = buildRequestSignature(
+      endpoint,
+      resolvedHeaders,
+      trimmedAuthIndex,
+      trimmedProxyUrl
+    );
     const existing = CLAUDE_MODELS_IN_FLIGHT.get(signature);
     if (existing) return existing;
 
     const request = (async () => {
       const result = await apiCallApi.request({
         authIndex: trimmedAuthIndex,
+        proxyUrl: trimmedProxyUrl,
         method: 'GET',
         url: endpoint,
         header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
@@ -265,7 +264,8 @@ export const modelsApi = {
     baseUrl: string,
     apiKey?: string,
     headers: Record<string, string> = {},
-    authIndex?: string
+    authIndex?: string,
+    proxyUrl?: string
   ) {
     const endpoint = buildGeminiModelsEndpoint(baseUrl);
     if (!endpoint) {
@@ -273,6 +273,7 @@ export const modelsApi = {
     }
 
     const trimmedAuthIndex = authIndex?.trim() || undefined;
+    const trimmedProxyUrl = proxyUrl?.trim() || undefined;
     const resolvedHeaders = { ...headers };
     const resolvedApiKey = String(apiKey ?? '').trim();
     if (resolvedApiKey && !hasHeader(resolvedHeaders, 'x-goog-api-key')) {
@@ -281,7 +282,12 @@ export const modelsApi = {
       resolvedHeaders['x-goog-api-key'] = '$TOKEN$';
     }
 
-    const signature = buildRequestSignature(endpoint, resolvedHeaders, trimmedAuthIndex);
+    const signature = buildRequestSignature(
+      endpoint,
+      resolvedHeaders,
+      trimmedAuthIndex,
+      trimmedProxyUrl
+    );
     const existing = GEMINI_MODELS_IN_FLIGHT.get(signature);
     if (existing) return existing;
 
@@ -298,6 +304,7 @@ export const modelsApi = {
 
         const result = await apiCallApi.request({
           authIndex: trimmedAuthIndex,
+          proxyUrl: trimmedProxyUrl,
           method: 'GET',
           url: url.toString(),
           header: Object.keys(resolvedHeaders).length ? resolvedHeaders : undefined
@@ -317,6 +324,9 @@ export const modelsApi = {
           const resolved = { ...model, name };
           if (resolved.alias && resolved.alias.trim() === name) {
             resolved.alias = undefined;
+          }
+          if (resolved.displayName && resolved.displayName.trim() === name) {
+            resolved.displayName = undefined;
           }
           collected.push(resolved);
         });

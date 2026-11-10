@@ -1,4 +1,5 @@
 import type { TFunction } from 'i18next';
+import { formatCompactUsd } from '@/utils/usage';
 import {
   computeCacheHitRate,
   computeRowCacheHitRate,
@@ -35,10 +36,12 @@ export type UsageSummaryCardTone = 'bad' | 'good' | 'warn';
 
 export type UsageSummaryCard = {
   accent?: UsageSummaryCardAccent;
+  dataAttributes?: Record<`data-${string}`, string>;
   fullLabel?: string;
   icon?: UsageSummaryCardIcon;
   label: string;
   meta: string;
+  showModelPriceAttention?: boolean;
   tone?: UsageSummaryCardTone;
   value: string;
   valueTitle?: string;
@@ -208,7 +211,9 @@ export const buildUsageOverviewSummaryCards = ({
       icon: 'cost',
       label: t('usage_analytics.metric_estimated_cost'),
       meta: deltaMeta(summaryDelta, 'estimatedCost', t, t('usage_analytics.summary_cost_meta')),
-      value: formatMetricValue('estimatedCost', summary.estimatedCost),
+      showModelPriceAttention: true,
+      value: formatCompactUsd(summary.estimatedCost),
+      valueTitle: formatMetricValue('estimatedCost', summary.estimatedCost),
     },
     {
       accent: 'teal',
@@ -310,6 +315,7 @@ export const buildUsageTrendSummaryCards = ({
       icon: 'cost',
       label: t('usage_analytics.trend_cost_change'),
       meta: t('usage_analytics.summary_vs_previous'),
+      showModelPriceAttention: true,
       value: summaryDelta.hasComparison ? formatDelta(summaryDelta.estimatedCost) : '-',
     },
     {
@@ -371,6 +377,7 @@ export const buildUsageEntitySummaryCards = ({
     icon: 'cost',
     label: t('usage_analytics.metric_estimated_cost'),
     meta: t('usage_analytics.summary_cost_meta'),
+    showModelPriceAttention: true,
     value: formatMetricValue('estimatedCost', summary.estimatedCost),
   },
   {
@@ -451,6 +458,7 @@ export const buildUsageModelSummaryCards = ({
       icon: 'cost',
       label: t('usage_analytics.metric_estimated_cost'),
       meta: t('usage_analytics.summary_cost_meta'),
+      showModelPriceAttention: true,
       value: formatMetricValue('estimatedCost', summary.estimatedCost),
     },
   ];
@@ -511,6 +519,7 @@ export const buildUsageApiKeySummaryCards = ({
       icon: 'cost',
       label: t('usage_analytics.metric_average_cost_per_call'),
       meta: t('usage_analytics.summary_cost_meta'),
+      showModelPriceAttention: true,
       value: formatMetricValue('estimatedCost', summary.averageCostPerCall),
     },
     {
@@ -550,6 +559,7 @@ export const buildUsageHeatmapSummaryCards = ({
     icon: 'cost',
     label: t('usage_analytics.metric_estimated_cost'),
     meta: t('usage_analytics.summary_cost_meta'),
+    showModelPriceAttention: true,
     value: formatMetricValue('estimatedCost', summary.estimatedCost),
   },
   {
@@ -597,6 +607,7 @@ export const buildCredentialDetailCards = ({
       icon: 'cost',
       label: t('usage_analytics.average_cost'),
       meta: `${t('usage_analytics.metric_estimated_cost')} ${formatMetricValue('estimatedCost', row.estimatedCost)}`,
+      showModelPriceAttention: true,
       value: formatMetricValue('estimatedCost', averageCost),
     },
     {

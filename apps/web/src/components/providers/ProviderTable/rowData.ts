@@ -2,6 +2,11 @@ import type { GeminiKeyConfig, OpenAIProviderConfig, ProviderKeyConfig } from '@
 import { maskApiKey } from '@/utils/format';
 import type { StatusBarData } from '@/utils/recentRequests';
 import {
+  getOpenAIKeyCount,
+  getOpenAIUsageStatsCoverage,
+  type OpenAIUsageStatsCoverage,
+} from '@/utils/openAIKeyEntries';
+import {
   getOpenAIProviderKey,
   getOpenAIProviderRecentStatusData,
   getOpenAIProviderRecentWindowStats,
@@ -19,6 +24,7 @@ export type ProviderKind =
   | 'interactions'
   | 'codex'
   | 'xai'
+  | 'meta'
   | 'claude'
   | 'vertex'
   | 'openai';
@@ -28,6 +34,7 @@ export const PROVIDER_KINDS: readonly ProviderKind[] = [
   'interactions',
   'codex',
   'xai',
+  'meta',
   'claude',
   'vertex',
   'openai',
@@ -47,10 +54,12 @@ interface ProviderRowBase {
   priority?: number;
   modelNames: string[];
   modelCount: number;
-  /** OpenAI 为密钥条目数，其余固定为 1 */
+  /** OpenAI 为实际非空 API 密钥数，其余固定为 1 */
   keyCount: number;
   enabled: boolean;
   stats: { success: number; failure: number };
+  /** OpenAI keyless 请求无法由 CPA 的 api-key-usage 覆盖。 */
+  usageStatsCoverage: OpenAIUsageStatsCoverage;
   /** 最近窗口内成功数，供 recent-success 排序使用 */
   recentSuccess: number;
   statusData: StatusBarData;
@@ -61,7 +70,7 @@ interface ProviderRowBase {
 export type ProviderRow =
   | (ProviderRowBase & { kind: 'gemini'; raw: GeminiKeyConfig })
   | (ProviderRowBase & { kind: 'interactions'; raw: GeminiKeyConfig })
-  | (ProviderRowBase & { kind: 'codex' | 'xai' | 'claude' | 'vertex'; raw: ProviderKeyConfig })
+  | (ProviderRowBase & { kind: 'codex' | 'xai' | 'meta' | 'claude' | 'vertex'; raw: ProviderKeyConfig })
   | (ProviderRowBase & { kind: 'openai'; raw: OpenAIProviderConfig });
 
 export interface BuildProviderRowsInput {
@@ -69,6 +78,7 @@ export interface BuildProviderRowsInput {
   interactions?: GeminiKeyConfig[];
   codex: ProviderKeyConfig[];
   xai?: ProviderKeyConfig[];
+  meta?: ProviderKeyConfig[];
   claude: ProviderKeyConfig[];
   vertex: ProviderKeyConfig[];
   openai: OpenAIProviderConfig[];
@@ -94,7 +104,7 @@ const getKeyConfigSortName = (config: GeminiKeyConfig | ProviderKeyConfig): stri
     .find(Boolean) ?? '';
 
 function buildKeyConfigRow(
-  kind: 'gemini' | 'interactions' | 'codex' | 'xai' | 'claude' | 'vertex',
+  kind: 'gemini' | 'interactions' | 'codex' | 'xai' | 'meta' | 'claude' | 'vertex',
   config: GeminiKeyConfig | ProviderKeyConfig,
   originalIndex: number,
   usageByProvider: ProviderRecentUsageMap
@@ -113,6 +123,7 @@ function buildKeyConfigRow(
     keyCount: 1,
     enabled: !hasDisableAllModelsRule(config.excludedModels),
     stats: getProviderTotalStats(usageByProvider, kind, config.apiKey, config.baseUrl),
+    usageStatsCoverage: 'full',
     recentSuccess: getProviderRecentWindowStats(
       usageByProvider,
       kind,
@@ -148,9 +159,10 @@ function buildOpenAIRow(
     priority: provider.priority,
     modelNames,
     modelCount: modelNames.length,
-    keyCount: apiKeyEntries.length,
+    keyCount: getOpenAIKeyCount(apiKeyEntries),
     enabled: provider.disabled !== true,
     stats: getOpenAIProviderTotalStats(provider, usageByProvider),
+    usageStatsCoverage: getOpenAIUsageStatsCoverage(apiKeyEntries),
     recentSuccess: getOpenAIProviderRecentWindowStats(provider, usageByProvider).success,
     statusData: getOpenAIProviderRecentStatusData(provider, usageByProvider),
     haystack: buildHaystack([
@@ -169,6 +181,7 @@ export function buildProviderRows({
   interactions = [],
   codex,
   xai = [],
+  meta = [],
   claude,
   vertex,
   openai,
@@ -181,6 +194,7 @@ export function buildProviderRows({
     ),
     ...codex.map((config, index) => buildKeyConfigRow('codex', config, index, usageByProvider)),
     ...xai.map((config, index) => buildKeyConfigRow('xai', config, index, usageByProvider)),
+    ...meta.map((config, index) => buildKeyConfigRow('meta', config, index, usageByProvider)),
     ...claude.map((config, index) => buildKeyConfigRow('claude', config, index, usageByProvider)),
     ...vertex.map((config, index) => buildKeyConfigRow('vertex', config, index, usageByProvider)),
     ...openai.map((provider, index) => buildOpenAIRow(provider, index, usageByProvider)),

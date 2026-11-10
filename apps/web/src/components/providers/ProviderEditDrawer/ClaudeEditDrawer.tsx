@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useAuthStore as useDiscoveryAuthStore } from '@/stores/useAuthStore';
+import { useLayoutEffect, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Drawer } from '@/components/ui/Drawer';
@@ -9,11 +10,25 @@ import { ModelInputList } from '@/components/ui/ModelInputList';
 import { Modal } from '@/components/ui/Modal';
 import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
 import { ToggleSwitch } from '@/components/ui/ToggleSwitch';
-import { apiCallApi, getApiCallErrorMessage, modelsApi, providersApi } from '@/services/api';
+import { CoolingPolicySelect } from '@/components/providers/CoolingPolicySelect';
+import {
+  apiCallApi,
+  getApiCallErrorMessage,
+  modelsApi,
+  providersApi,
+  readBackClaudeConfigAfterSave,
+  verifyClaudeFingerprintInRawConfig,
+} from '@/services/api';
 import { useConfigStore, useNotificationStore } from '@/stores';
-import type { ProviderKeyConfig } from '@/types';
+import {
+  coolingPolicyFromOverride,
+  coolingPolicyToOverride,
+  type NotificationType,
+  type ProviderKeyConfig,
+} from '@/types';
 import { buildHeaderObject, headersToEntries, normalizeHeaderEntries } from '@/utils/headers';
 import { normalizeAuthIndex } from '@/utils/authIndex';
+import { buildClaudeRequestHeaders, formatClaudeAuthDiagnostic } from '@/utils/claudeAuth';
 import {
   areKeyValueEntriesEqual,
   areModelEntriesEqual,
@@ -24,10 +39,17 @@ import {
   parseExcludedModels,
   buildClaudeMessagesEndpoint,
   parseTextList,
+  resolveClaudeFingerprintSelection,
 } from '@/components/providers/utils';
 import { modelsToEntries } from '@/components/ui/modelInputListUtils';
 import type { ProviderFormState } from '@/components/providers';
-import type { ModelInfo } from '@/utils/models';
+import { CredentialWeightInput } from '../CredentialWeightInput';
+import {
+  getCredentialWeightComparisonValue,
+  getCredentialWeightError,
+  normalizeCredentialWeight,
+} from '@/utils/credentialWeight';
+import { modelDisplayLabel, type ModelInfo } from '@/utils/models';
 import styles from '@/features/aiProviders/AiProvidersPage.module.scss';
 
 interface ClaudeEditDrawerProps {
@@ -41,12 +63,12 @@ interface ClaudeEditDrawerProps {
 type ClaudeFormBaseline = ReturnType<typeof buildClaudeBaseline>;
 
 const CLAUDE_TEST_TIMEOUT_MS = 30_000;
-const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
 
 const buildEmptyForm = (): ProviderFormState => ({
   apiKey: '',
   authIndex: '',
   priority: undefined,
+  weight: undefined,
   prefix: '',
   baseUrl: '',
   proxyUrl: '',
@@ -55,6 +77,7 @@ const buildEmptyForm = (): ProviderFormState => ({
   excludedModels: [],
   modelEntries: [{ name: '', alias: '' }],
   excludedText: '',
+  disableCooling: 'inherit',
 });
 
 const normalizeClaudeModelEntries = (entries: ProviderFormState['modelEntries']) =>
@@ -99,10 +122,13 @@ const buildClaudeBaseline = (form: ProviderFormState) => ({
     form.priority !== undefined && Number.isFinite(form.priority)
       ? Math.trunc(form.priority)
       : null,
+  weight: normalizeCredentialWeight(form.weight) ?? null,
   prefix: String(form.prefix ?? '').trim(),
   baseUrl: String(form.baseUrl ?? '').trim(),
   proxyUrl: String(form.proxyUrl ?? '').trim(),
-  disableCooling: Boolean(form.disableCooling),
+  disableCooling: form.disableCooling,
+  fingerprintProfile:
+    typeof form.fingerprintProfile === 'string' ? form.fingerprintProfile : undefined,
   rebuildMidSystemMessage: Boolean(form.rebuildMidSystemMessage),
   headers: normalizeHeaderEntries(form.headers),
   models: normalizeClaudeModelEntries(form.modelEntries),
@@ -114,20 +140,6 @@ const getErrorMessage = (err: unknown) => {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   return '';
-};
-
-const hasHeader = (headers: Record<string, string>, name: string) => {
-  const target = name.toLowerCase();
-  return Object.keys(headers).some((key) => key.toLowerCase() === target);
-};
-
-const resolveBearerTokenFromAuthorization = (headers: Record<string, string>): string => {
-  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === 'authorization');
-  if (!entry) return '';
-  const value = String(entry[1] ?? '').trim();
-  if (!value) return '';
-  const match = value.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || '';
 };
 
 export function ClaudeEditDrawer({
@@ -159,6 +171,7 @@ export function ClaudeEditDrawer({
   const [modelDiscoveryFetching, setModelDiscoveryFetching] = useState(false);
   const [modelDiscoveryError, setModelDiscoveryError] = useState('');
   const [discoveredModels, setDiscoveredModels] = useState<ModelInfo[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelDiscoverySearch, setModelDiscoverySearch] = useState('');
   const [modelDiscoverySelected, setModelDiscoverySelected] = useState<Set<string>>(new Set());
   const lastCloakConfigRef = useRef<typeof form.cloak>(null);
@@ -207,6 +220,7 @@ export function ClaudeEditDrawer({
     if (initialData) {
       const seededForm: ProviderFormState = {
         ...initialData,
+        disableCooling: coolingPolicyFromOverride(initialData.disableCooling),
         headers: headersToEntries(initialData.headers),
         modelEntries: modelsToEntries(initialData.models),
         excludedText: excludedModelsToText(initialData.excludedModels),
@@ -230,21 +244,30 @@ export function ClaudeEditDrawer({
     lastCloakConfigRef.current = form.cloak;
   }, [form.cloak]);
 
-  const canSave = !disabled && !loading && !saving && !invalidIndex && !isTesting;
+  const canSave =
+    !disabled &&
+    !loading &&
+    !saving &&
+    !invalidIndex &&
+    !isTesting &&
+    !getCredentialWeightError(form.weight);
 
   const isDirty = useMemo(() => {
     const normalizedPriority =
       form.priority !== undefined && Number.isFinite(form.priority)
         ? Math.trunc(form.priority)
         : null;
+    const comparableWeight = getCredentialWeightComparisonValue(form.weight);
     return (
       baseline.apiKey !== form.apiKey.trim() ||
       baseline.authIndex !== (normalizeAuthIndex(form.authIndex) ?? '') ||
       baseline.priority !== normalizedPriority ||
+      baseline.weight !== comparableWeight ||
       baseline.prefix !== String(form.prefix ?? '').trim() ||
       baseline.baseUrl !== String(form.baseUrl ?? '').trim() ||
       baseline.proxyUrl !== String(form.proxyUrl ?? '').trim() ||
-      baseline.disableCooling !== Boolean(form.disableCooling) ||
+      baseline.disableCooling !== form.disableCooling ||
+      baseline.fingerprintProfile !== form.fingerprintProfile ||
       baseline.rebuildMidSystemMessage !== Boolean(form.rebuildMidSystemMessage) ||
       !areKeyValueEntriesEqual(baseline.headers, normalizeHeaderEntries(form.headers)) ||
       !areModelEntriesEqual(baseline.models, normalizeClaudeModelEntries(form.modelEntries)) ||
@@ -278,9 +301,9 @@ export function ClaudeEditDrawer({
     if (!filter) return discoveredModels;
     return discoveredModels.filter((model) => {
       const name = (model.name || '').toLowerCase();
-      const alias = (model.alias || '').toLowerCase();
+      const label = modelDisplayLabel(model).toLowerCase();
       const description = (model.description || '').toLowerCase();
-      return name.includes(filter) || alias.includes(filter) || description.includes(filter);
+      return name.includes(filter) || label.includes(filter) || description.includes(filter);
     });
   }, [discoveredModels, modelDiscoverySearch]);
 
@@ -314,6 +337,17 @@ export function ClaudeEditDrawer({
       { value: 'auto', label: t('ai_providers.claude_cloak_mode_auto') },
       { value: 'always', label: t('ai_providers.claude_cloak_mode_always') },
       { value: 'never', label: t('ai_providers.claude_cloak_mode_never') },
+    ],
+    [t]
+  );
+
+  const fingerprintOptions = useMemo(
+    () => [
+      { value: '', label: t('ai_providers.claude_request_fingerprint_default') },
+      {
+        value: 'claude-code-cli',
+        label: t('ai_providers.claude_request_fingerprint_claude_code_cli'),
+      },
     ],
     [t]
   );
@@ -365,46 +399,80 @@ export function ClaudeEditDrawer({
     [showNotification, t]
   );
 
+  const discoveryConnection = useDiscoveryAuthStore((state) =>
+    JSON.stringify([state.apiBase, state.managementKey])
+  );
+  const discoveryScope = JSON.stringify([
+    discoveryConnection,
+    open,
+    editIndex,
+    form.baseUrl,
+    form.apiKey,
+    form.authIndex,
+    form.proxyUrl,
+    buildHeaderObject(form.headers),
+  ]);
+  const activeDiscoveryScopeRef = useRef(discoveryScope);
+  activeDiscoveryScopeRef.current = discoveryScope;
+  const modelDiscoveryRequestIdRef = useRef(0);
+  useLayoutEffect(() => {
+    modelDiscoveryRequestIdRef.current += 1;
+    setDiscoveredModels([]);
+    setModelsLoaded(false);
+    setModelDiscoveryError('');
+    setModelDiscoveryFetching(false);
+    return () => {
+      modelDiscoveryRequestIdRef.current += 1;
+    };
+  }, [discoveryScope]);
+
   const fetchClaudeModelDiscovery = useCallback(async () => {
+    const requestId = ++modelDiscoveryRequestIdRef.current;
+    const requestScope = discoveryScope;
+    const isCurrentDiscovery = () =>
+      modelDiscoveryRequestIdRef.current === requestId &&
+      activeDiscoveryScopeRef.current === requestScope;
     setModelDiscoveryFetching(true);
     setModelDiscoveryError('');
     const headerObject = buildHeaderObject(form.headers);
+    const authIndex = normalizeAuthIndex(form.authIndex) ?? undefined;
 
     try {
       const list = await modelsApi.fetchClaudeModelsViaApiCall(
         form.baseUrl ?? '',
         form.apiKey.trim() || undefined,
         headerObject,
-        normalizeAuthIndex(form.authIndex) ?? undefined
+        authIndex,
+        form.proxyUrl
       );
+      if (!isCurrentDiscovery()) return;
       setDiscoveredModels(list);
+      setModelsLoaded(true);
     } catch (err: unknown) {
-      setDiscoveredModels([]);
+      if (!isCurrentDiscovery()) return;
+
       const message = getErrorMessage(err);
-      const hasCustomXApiKey = Object.keys(headerObject).some(
-        (key) => key.toLowerCase() === 'x-api-key'
-      );
-      const hasAuthorization = Object.keys(headerObject).some(
-        (key) => key.toLowerCase() === 'authorization'
-      );
+      const authResolution = buildClaudeRequestHeaders({
+        url: modelsApi.buildClaudeModelsEndpoint(form.baseUrl ?? ''),
+        apiKey: form.apiKey.trim() || undefined,
+        authIndex,
+        customHeaders: headerObject,
+      });
       const shouldAttachDiag =
         message.toLowerCase().includes('x-api-key') || message.includes('401');
       const diag = shouldAttachDiag
-        ? ` [diag: apiKeyField=${form.apiKey.trim() ? 'yes' : 'no'}, customXApiKey=${
-            hasCustomXApiKey ? 'yes' : 'no'
-          }, customAuthorization=${hasAuthorization ? 'yes' : 'no'}]`
+        ? ` ${formatClaudeAuthDiagnostic(authResolution, form.apiKey, authIndex)}`
         : '';
       setModelDiscoveryError(
         `${t('ai_providers.claude_models_fetch_error')}: ${message}${diag}`
       );
     } finally {
-      setModelDiscoveryFetching(false);
+      if (isCurrentDiscovery()) setModelDiscoveryFetching(false);
     }
-  }, [form.apiKey, form.authIndex, form.baseUrl, form.headers, t]);
+  }, [discoveryScope, form.apiKey, form.authIndex, form.baseUrl, form.headers, form.proxyUrl, t]);
 
   useEffect(() => {
     if (!modelDiscoveryOpen) return;
-    setDiscoveredModels([]);
     setModelDiscoverySearch('');
     setModelDiscoverySelected(new Set());
     setModelDiscoveryError('');
@@ -463,30 +531,23 @@ export function ClaudeEditDrawer({
     const customHeaders = buildHeaderObject(form.headers);
     const apiKey = form.apiKey.trim();
     const keyAuthIndex = normalizeAuthIndex(form.authIndex) ?? undefined;
-    const hasApiKeyHeader = hasHeader(customHeaders, 'x-api-key');
-    const apiKeyFromAuthorization = resolveBearerTokenFromAuthorization(customHeaders);
-    const resolvedApiKey = apiKey || apiKeyFromAuthorization;
-    if (!resolvedApiKey && !hasApiKeyHeader && !keyAuthIndex) {
-      showNotification(t('ai_providers.claude_test_key_required'), 'error');
-      return;
-    }
     const endpoint = buildClaudeMessagesEndpoint(form.baseUrl ?? '');
     if (!endpoint) {
       showNotification(t('ai_providers.claude_test_endpoint_invalid'), 'error');
       return;
     }
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...customHeaders,
-    };
-    if (!hasHeader(headers, 'anthropic-version'))
-      headers['anthropic-version'] = DEFAULT_ANTHROPIC_VERSION;
-    if (!Object.prototype.hasOwnProperty.call(headers, 'Anthropic-Version'))
-      headers['Anthropic-Version'] = headers['anthropic-version'] ?? DEFAULT_ANTHROPIC_VERSION;
-    const tokenValue = resolvedApiKey || (keyAuthIndex ? '$TOKEN$' : '');
-    if (!hasApiKeyHeader && tokenValue) headers['x-api-key'] = tokenValue;
-    if (!Object.prototype.hasOwnProperty.call(headers, 'X-Api-Key') && tokenValue)
-      headers['X-Api-Key'] = tokenValue;
+    const authResolution = buildClaudeRequestHeaders({
+      url: endpoint,
+      apiKey: apiKey || undefined,
+      authIndex: keyAuthIndex,
+      customHeaders,
+      contentType: 'application/json',
+    });
+    if (!authResolution.effectiveXApiKey && !authResolution.effectiveAuthorization) {
+      showNotification(t('ai_providers.claude_test_key_required'), 'error');
+      return;
+    }
+    const headers = authResolution.headers;
 
     setIsTesting(true);
     setTestStatus('loading');
@@ -496,6 +557,7 @@ export function ClaudeEditDrawer({
         {
           method: 'POST',
           authIndex: keyAuthIndex,
+          proxyUrl: form.proxyUrl,
           url: endpoint,
           header: headers,
           data: JSON.stringify({
@@ -534,6 +596,7 @@ export function ClaudeEditDrawer({
     form.authIndex,
     form.baseUrl,
     form.headers,
+    form.proxyUrl,
     isTesting,
     showNotification,
     t,
@@ -565,6 +628,7 @@ export function ClaudeEditDrawer({
       const payload: ProviderKeyConfig = {
         apiKey: form.apiKey.trim(),
         priority: form.priority !== undefined ? Math.trunc(form.priority) : undefined,
+        weight: normalizeCredentialWeight(form.weight),
         prefix: form.prefix?.trim() || undefined,
         baseUrl: (form.baseUrl ?? '').trim() || undefined,
         proxyUrl: form.proxyUrl?.trim() || undefined,
@@ -580,28 +644,62 @@ export function ClaudeEditDrawer({
         excludedModels: parseExcludedModels(form.excludedText),
         cloak: form.cloak,
         authIndex: normalizeAuthIndex(form.authIndex) ?? undefined,
-        disableCooling: form.disableCooling,
-        experimentalCchSigning: form.experimentalCchSigning,
+        disableCooling: coolingPolicyToOverride(form.disableCooling),
+        fingerprintProfile: form.fingerprintProfile,
         rebuildMidSystemMessage: form.rebuildMidSystemMessage,
       };
+      const fingerprintExplicitlyChanged =
+        editIndex !== null
+          ? configs[editIndex].fingerprintProfile !== payload.fingerprintProfile
+          : payload.fingerprintProfile !== undefined;
+
       if (editIndex !== null) {
         await providersApi.updateClaudeConfig(configs[editIndex], payload);
       } else {
         await providersApi.createClaudeConfig(payload);
       }
-      const syncedList = await providersApi.getClaudeConfigs().catch(() =>
-        editIndex !== null
-          ? configs.map((item, index) => (index === editIndex ? payload : item))
-          : [...configs, payload]
-      );
-      updateConfigValue('claude-api-key', syncedList);
+
+      // The PUT succeeded: the config write is committed no matter what the
+      // fingerprint verification below concludes. Verification reads the
+      // persisted /config (never the runtime /claude-api-key endpoint, whose
+      // auth-index is derived and absent from /config) and only decides which
+      // notification the user gets.
+      let readBack: Awaited<ReturnType<typeof readBackClaudeConfigAfterSave>> | null = null;
+      try {
+        readBack = await readBackClaudeConfigAfterSave();
+      } catch {
+        readBack = null;
+      }
+      if (readBack) {
+        setConfigs(readBack.claudeApiKeys);
+        updateConfigValue('claude-api-key', readBack.claudeApiKeys);
+      }
       clearCache('claude-api-key');
-      showNotification(
+
+      let notificationKey =
         editIndex !== null
-          ? t('notification.claude_config_updated')
-          : t('notification.claude_config_added'),
-        'success'
-      );
+          ? 'notification.claude_config_updated'
+          : 'notification.claude_config_added';
+      let notificationType: NotificationType = 'success';
+      if (!readBack) {
+        if (fingerprintExplicitlyChanged) {
+          notificationKey = 'notification.claude_fingerprint_verify_unavailable';
+          notificationType = 'warning';
+        }
+      } else if (fingerprintExplicitlyChanged) {
+        const verification = verifyClaudeFingerprintInRawConfig(
+          readBack.rawRecords,
+          payload.fingerprintProfile,
+          editIndex !== null
+            ? { mode: 'edit', index: editIndex, apiKey: payload.apiKey, baseUrl: payload.baseUrl }
+            : { mode: 'create', apiKey: payload.apiKey, baseUrl: payload.baseUrl }
+        );
+        if (verification !== 'confirmed') {
+          notificationKey = 'notification.claude_fingerprint_not_applied';
+          notificationType = 'warning';
+        }
+      }
+      showNotification(t(notificationKey), notificationType);
       onSaved();
       onClose();
     } catch (err: unknown) {
@@ -679,6 +777,11 @@ export function ClaudeEditDrawer({
               }}
               disabled={saving || disabled || isTesting}
             />
+            <CredentialWeightInput
+              value={form.weight}
+              onChange={(weight) => setForm((prev) => ({ ...prev, weight }))}
+              disabled={saving || disabled || isTesting}
+            />
             <Input
               label={t('ai_providers.prefix_label')}
               placeholder={t('ai_providers.prefix_placeholder')}
@@ -691,18 +794,15 @@ export function ClaudeEditDrawer({
               label={t('ai_providers.claude_add_modal_proxy_label')}
               value={form.proxyUrl ?? ''}
               onChange={(e) => setForm((prev) => ({ ...prev, proxyUrl: e.target.value }))}
+              hint={t('ai_providers.model_discovery_proxy_version_hint')}
               disabled={saving || disabled || isTesting}
             />
-            <div className="form-group">
-              <label>{t('ai_providers.disable_cooling_label')}</label>
-              <ToggleSwitch
-                checked={Boolean(form.disableCooling)}
-                onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
-                disabled={saving || disabled || isTesting}
-                ariaLabel={t('ai_providers.disable_cooling_label')}
-              />
-              <div className="hint">{t('ai_providers.disable_cooling_hint')}</div>
-            </div>
+            <CoolingPolicySelect
+              value={form.disableCooling}
+              onChange={(value) => setForm((prev) => ({ ...prev, disableCooling: value }))}
+              disabled={saving || disabled || isTesting}
+              id="claude-drawer-cooling-policy"
+            />
             <div className="form-group">
               <label>{t('ai_providers.rebuild_mid_system_message_label')}</label>
               <ToggleSwitch
@@ -716,6 +816,26 @@ export function ClaudeEditDrawer({
               <div className="hint">
                 {t('ai_providers.rebuild_mid_system_message_hint')}
               </div>
+            </div>
+
+            <div className="form-group">
+              <label>{t('ai_providers.claude_request_fingerprint_label')}</label>
+              <Select
+                value={form.fingerprintProfile ?? ''}
+                options={fingerprintOptions}
+                onChange={(value) =>
+                  setForm((prev) => ({
+                    ...prev,
+                    fingerprintProfile: resolveClaudeFingerprintSelection(
+                      prev.fingerprintProfile,
+                      value
+                    ),
+                  }))
+                }
+                ariaLabel={t('ai_providers.claude_request_fingerprint_label')}
+                disabled={saving || disabled || isTesting}
+              />
+              <div className="hint">{t('ai_providers.claude_request_fingerprint_hint')}</div>
             </div>
             <HeaderInputList
               entries={form.headers}
@@ -948,11 +1068,11 @@ export function ClaudeEditDrawer({
                   </div>
                 )}
                 {modelDiscoveryError && <div className="error-box">{modelDiscoveryError}</div>}
-                {modelDiscoveryFetching ? (
+                {modelDiscoveryFetching && !modelsLoaded ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.claude_models_fetch_loading')}
                   </div>
-                ) : discoveredModels.length === 0 ? (
+                ) : !modelsLoaded ? null : discoveredModels.length === 0 ? (
                   <div className={styles.sectionHint}>
                     {t('ai_providers.claude_models_fetch_empty')}
                   </div>
@@ -964,6 +1084,7 @@ export function ClaudeEditDrawer({
                   <div className={styles.modelDiscoveryList}>
                     {discoveredModelsFiltered.map((model) => {
                       const checked = modelDiscoverySelected.has(model.name);
+                      const discoveryLabel = modelDisplayLabel(model);
                       const alreadyConfigured = configuredModelNames.has(
                         model.name.trim().toLowerCase()
                       );
@@ -985,9 +1106,9 @@ export function ClaudeEditDrawer({
                               <div className={styles.modelDiscoveryName}>
                                 <div className={styles.modelDiscoveryNameText}>
                                   {model.name}
-                                  {model.alias && (
+                                  {discoveryLabel && (
                                     <span className={styles.modelDiscoveryAlias}>
-                                      {model.alias}
+                                      {discoveryLabel}
                                     </span>
                                   )}
                                 </div>

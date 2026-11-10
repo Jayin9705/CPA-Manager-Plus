@@ -8,7 +8,10 @@ import type {
   AntigravityQuotaState,
   ClaudeQuotaState,
   CodexQuotaState,
+  CredentialScopedQuotaState,
+  DevinQuotaState,
   KimiQuotaState,
+  MetaQuotaState,
   XaiQuotaState,
 } from '@/types';
 import { obfuscatedStorage } from '@/services/storage/secureStorage';
@@ -22,18 +25,22 @@ interface QuotaStoreState {
   antigravityQuota: Record<string, AntigravityQuotaState>;
   claudeQuota: Record<string, ClaudeQuotaState>;
   codexQuota: Record<string, CodexQuotaState>;
+  devinQuota: Record<string, DevinQuotaState>;
   kimiQuota: Record<string, KimiQuotaState>;
+  metaQuota: Record<string, MetaQuotaState>;
   xaiQuota: Record<string, XaiQuotaState>;
   setAntigravityQuota: (updater: QuotaUpdater<Record<string, AntigravityQuotaState>>) => void;
   setClaudeQuota: (updater: QuotaUpdater<Record<string, ClaudeQuotaState>>) => void;
   setCodexQuota: (updater: QuotaUpdater<Record<string, CodexQuotaState>>) => void;
+  setDevinQuota: (updater: QuotaUpdater<Record<string, DevinQuotaState>>) => void;
   setKimiQuota: (updater: QuotaUpdater<Record<string, KimiQuotaState>>) => void;
+  setMetaQuota: (updater: QuotaUpdater<Record<string, MetaQuotaState>>) => void;
   setXaiQuota: (updater: QuotaUpdater<Record<string, XaiQuotaState>>) => void;
   activateQuotaCacheScope: (scope: string) => void;
   clearQuotaCache: () => void;
 }
 
-const resolveUpdater = <T,>(updater: QuotaUpdater<T>, prev: T): T => {
+const resolveUpdater = <T>(updater: QuotaUpdater<T>, prev: T): T => {
   if (typeof updater === 'function') {
     return (updater as (value: T) => T)(prev);
   }
@@ -44,8 +51,36 @@ const emptyQuotaState = {
   antigravityQuota: {},
   claudeQuota: {},
   codexQuota: {},
+  devinQuota: {},
   kimiQuota: {},
+  metaQuota: {},
   xaiQuota: {},
+};
+
+type PersistableQuotaState = CredentialScopedQuotaState & {
+  status?: string;
+  observedFromUsageHeaders?: boolean;
+};
+
+const isPersistableQuotaState = (
+  item: PersistableQuotaState | undefined
+): item is PersistableQuotaState & { authFileKey: string } =>
+  Boolean(
+    item?.authFileKey?.trim() &&
+      item.authFileIdentityVerified === true &&
+      (item.status === 'success' || item.status === 'error')
+  );
+
+const filterPersistableQuotaStates = <TState extends PersistableQuotaState>(
+  quota: Record<string, TState> | undefined
+): Record<string, TState> => {
+  if (!quota) return {};
+
+  return Object.fromEntries(
+    Object.values(quota)
+      .filter(isPersistableQuotaState)
+      .map((item) => [item.authFileKey, item])
+  );
 };
 
 const quotaStateForScope = (cacheScope: string, cacheGeneration: number) => ({
@@ -54,15 +89,53 @@ const quotaStateForScope = (cacheScope: string, cacheGeneration: number) => ({
   ...emptyQuotaState,
 });
 
+const normalizePersistedCodexQuotaState = (
+  item: CodexQuotaState & { authFileKey: string }
+): CodexQuotaState & { authFileKey: string } => {
+  const rawLimit = (
+    item as unknown as {
+      spendControlIndividualLimit?: unknown;
+    }
+  ).spendControlIndividualLimit;
+  if (typeof rawLimit !== 'number' && typeof rawLimit !== 'string') return item;
+
+  const limit = String(rawLimit).trim();
+  if (!limit || !Number.isFinite(Number(limit))) {
+    return { ...item, spendControlIndividualLimit: null };
+  }
+
+  return {
+    ...item,
+    spendControlIndividualLimit: {
+      source: null,
+      unit: null,
+      limit,
+      used: null,
+      remaining: null,
+      usedPercent: null,
+      remainingPercent: null,
+      resetAfterSeconds: null,
+      resetAtMs: null,
+    },
+  };
+};
+
 const filterPersistableCodexQuota = (
   quota: Record<string, CodexQuotaState> | undefined
 ): Record<string, CodexQuotaState> => {
   if (!quota) return {};
 
   return Object.fromEntries(
-    Object.entries(quota).filter(([, item]) => {
-      return item?.status === 'success' && item.observedFromUsageHeaders !== true;
-    })
+    Object.values(quota)
+      .filter(
+        (item): item is CodexQuotaState & { authFileKey: string } =>
+          isPersistableQuotaState(item) &&
+          (item.status !== 'success' || item.observedFromUsageHeaders !== true)
+      )
+      .map((item) => {
+        const normalized = normalizePersistedCodexQuotaState(item);
+        return [normalized.authFileKey, normalized];
+      })
   );
 };
 
@@ -84,9 +157,17 @@ export const useQuotaStore = create<QuotaStoreState>()(
         set((state) => ({
           codexQuota: resolveUpdater(updater, state.codexQuota),
         })),
+      setDevinQuota: (updater) =>
+        set((state) => ({
+          devinQuota: resolveUpdater(updater, state.devinQuota),
+        })),
       setKimiQuota: (updater) =>
         set((state) => ({
           kimiQuota: resolveUpdater(updater, state.kimiQuota),
+        })),
+      setMetaQuota: (updater) =>
+        set((state) => ({
+          metaQuota: resolveUpdater(updater, state.metaQuota),
         })),
       setXaiQuota: (updater) =>
         set((state) => ({
@@ -98,8 +179,7 @@ export const useQuotaStore = create<QuotaStoreState>()(
           if (state.cacheScope === nextScope) return state;
           return quotaStateForScope(nextScope, state.cacheGeneration + 1);
         }),
-      clearQuotaCache: () =>
-        set((state) => quotaStateForScope('', state.cacheGeneration + 1)),
+      clearQuotaCache: () => set((state) => quotaStateForScope('', state.cacheGeneration + 1)),
     }),
     {
       name: STORAGE_KEY_QUOTA_CACHE,
@@ -120,27 +200,38 @@ export const useQuotaStore = create<QuotaStoreState>()(
       })),
       partialize: (state) => ({
         cacheScope: state.cacheScope,
+        antigravityQuota: filterPersistableQuotaStates(state.antigravityQuota),
+        claudeQuota: filterPersistableQuotaStates(state.claudeQuota),
         codexQuota: filterPersistableCodexQuota(state.codexQuota),
+        devinQuota: filterPersistableQuotaStates(state.devinQuota),
+        kimiQuota: filterPersistableQuotaStates(state.kimiQuota),
+        metaQuota: filterPersistableQuotaStates(state.metaQuota),
+        xaiQuota: filterPersistableQuotaStates(state.xaiQuota),
       }),
       merge: (persistedState, currentState) => {
         const persisted = persistedState as Partial<QuotaStoreState> | undefined;
         return {
           ...currentState,
           cacheScope: typeof persisted?.cacheScope === 'string' ? persisted.cacheScope : '',
+          antigravityQuota: filterPersistableQuotaStates(persisted?.antigravityQuota),
+          claudeQuota: filterPersistableQuotaStates(persisted?.claudeQuota),
           codexQuota: filterPersistableCodexQuota(persisted?.codexQuota),
+          devinQuota: filterPersistableQuotaStates(persisted?.devinQuota),
+          kimiQuota: filterPersistableQuotaStates(persisted?.kimiQuota),
+          metaQuota: filterPersistableQuotaStates(persisted?.metaQuota),
+          xaiQuota: filterPersistableQuotaStates(persisted?.xaiQuota),
         };
       },
     }
   )
 );
 
-export const captureQuotaCacheGeneration = (): number =>
-  useQuotaStore.getState().cacheGeneration;
+export const captureQuotaCacheGeneration = (): number => useQuotaStore.getState().cacheGeneration;
 
-export const commitIfQuotaCacheCurrent = (
-  generation: number,
-  commit: () => void
-): boolean => {
+export const isQuotaCacheGenerationCurrent = (generation: number): boolean =>
+  useQuotaStore.getState().cacheGeneration === generation;
+
+export const commitIfQuotaCacheCurrent = (generation: number, commit: () => void): boolean => {
   if (useQuotaStore.getState().cacheGeneration !== generation) return false;
   commit();
   return true;

@@ -50,7 +50,7 @@ func WriteCORS(cfg config.Config, w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-CPA-API-Key, X-CSRF-Token, X-Request-ID, Idempotency-Key, Content-Range, If-Match")
 	w.Header().Set("Access-Control-Expose-Headers", exposedMetadataHeaders)
 	if len(cfg.ConsoleOrigins) > 0 {

@@ -13,7 +13,12 @@ export { useUsageServiceStore } from './useUsageServiceStore';
 export {
   captureQuotaCacheGeneration,
   commitIfQuotaCacheCurrent,
+  isQuotaCacheGenerationCurrent,
   useQuotaStore,
 } from './useQuotaStore';
 export { useOpenAIEditDraftStore } from './useOpenAIEditDraftStore';
 export { useClaudeEditDraftStore } from './useClaudeEditDraftStore';
+export {
+  publishAccountCredentialMutationRevision,
+  useAccountCredentialMutationRevisionStore,
+} from './useAccountCredentialMutationRevisionStore';
